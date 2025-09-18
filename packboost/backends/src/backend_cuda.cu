@@ -8,6 +8,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace py = pybind11;
 
@@ -178,6 +179,48 @@ HistogramBuffers build_histograms_cuda(
     return buffers;
 }
 
+FrontierEvalResult evaluate_frontier_cuda(
+    const uint8_t* bins,
+    const int32_t* node_indices,
+    const int32_t* node_offsets,
+    const int32_t* feature_subset,
+    const float* gradients,
+    const float* hessians,
+    const int16_t* era_inverse,
+    std::size_t n_rows,
+    std::size_t n_features_total,
+    std::size_t n_nodes,
+    std::size_t n_features_subset,
+    int max_bins,
+    int n_eras,
+    double lambda_l2,
+    double lambda_dro,
+    int min_samples_leaf,
+    double direction_weight) {
+
+    // TODO: implement full CUDA frontier evaluation once kernels are available.
+    // For now, fall back to the tuned CPU implementation so the interface stays
+    // functional when only the CUDA extension is built.
+    return evaluate_frontier_cpu(
+        bins,
+        node_indices,
+        node_offsets,
+        feature_subset,
+        gradients,
+        hessians,
+        era_inverse,
+        n_rows,
+        n_features_total,
+        n_nodes,
+        n_features_subset,
+        max_bins,
+        n_eras,
+        lambda_l2,
+        lambda_dro,
+        min_samples_leaf,
+        direction_weight);
+}
+
 }  // namespace packboost
 
 py::tuple cuda_histogram_binding(
@@ -204,7 +247,7 @@ py::tuple cuda_histogram_binding(
         static_cast<uint8_t*>(bins_info.ptr),
         static_cast<float*>(grad_info.ptr),
         static_cast<float*>(hess_info.ptr),
-        static_cast<int32_t*>(era_info.ptr),
+        static_cast<int16_t*>(era_info.ptr),
         n_rows,
         n_features,
         max_bins,
@@ -223,4 +266,103 @@ py::tuple cuda_histogram_binding(
     std::memcpy(count_arr.mutable_data(), buffers.count.data(), buffers.count.size() * sizeof(int32_t));
 
     return py::make_tuple(std::move(grad_arr), std::move(hess_arr), std::move(count_arr));
+}
+
+py::tuple cuda_frontier_evaluate_binding(
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast> bins,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> node_indices,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> node_offsets,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> feature_subset,
+    py::array_t<float, py::array::c_style | py::array::forcecast> gradients,
+    py::array_t<float, py::array::c_style | py::array::forcecast> hessians,
+    py::array_t<int16_t, py::array::c_style | py::array::forcecast> era_inverse,
+    int max_bins,
+    int n_eras,
+    double lambda_l2,
+    double lambda_dro,
+    int min_samples_leaf,
+    double direction_weight) {
+
+    py::buffer_info bins_info = bins.request();
+    py::buffer_info idx_info = node_indices.request();
+    py::buffer_info offsets_info = node_offsets.request();
+    py::buffer_info feat_info = feature_subset.request();
+    py::buffer_info grad_info = gradients.request();
+    py::buffer_info hess_info = hessians.request();
+    py::buffer_info era_info = era_inverse.request();
+
+    if (bins_info.ndim != 2) {
+        throw std::invalid_argument("bins must be 2D");
+    }
+
+    const std::size_t n_rows = static_cast<std::size_t>(bins_info.shape[0]);
+    const std::size_t n_features_total = static_cast<std::size_t>(bins_info.shape[1]);
+    const std::size_t n_nodes = static_cast<std::size_t>(offsets_info.shape[0] - 1);
+    const std::size_t n_features_subset = static_cast<std::size_t>(feat_info.shape[0]);
+
+    auto result = packboost::evaluate_frontier_cuda(
+        static_cast<uint8_t*>(bins_info.ptr),
+        static_cast<int32_t*>(idx_info.ptr),
+        static_cast<int32_t*>(offsets_info.ptr),
+        static_cast<int32_t*>(feat_info.ptr),
+        static_cast<float*>(grad_info.ptr),
+        static_cast<float*>(hess_info.ptr),
+        static_cast<int16_t*>(era_info.ptr),
+        n_rows,
+        n_features_total,
+        n_nodes,
+        n_features_subset,
+        max_bins,
+        n_eras,
+        lambda_l2,
+        lambda_dro,
+        min_samples_leaf,
+        direction_weight);
+
+    std::vector<py::ssize_t> vec_shape = {static_cast<py::ssize_t>(n_nodes)};
+    py::array_t<int32_t> feature_arr(vec_shape);
+    py::array_t<int32_t> threshold_arr(vec_shape);
+    py::array_t<float> score_arr(vec_shape);
+    py::array_t<float> agreement_arr(vec_shape);
+    py::array_t<float> left_value_arr(vec_shape);
+    py::array_t<float> right_value_arr(vec_shape);
+    py::array_t<float> base_value_arr(vec_shape);
+
+    std::vector<py::ssize_t> offset_shape = {static_cast<py::ssize_t>(n_nodes + 1)};
+    py::array_t<int32_t> left_offsets_arr(offset_shape);
+    py::array_t<int32_t> right_offsets_arr(offset_shape);
+
+    std::vector<py::ssize_t> left_idx_shape = {static_cast<py::ssize_t>(result.left_indices.size())};
+    std::vector<py::ssize_t> right_idx_shape = {static_cast<py::ssize_t>(result.right_indices.size())};
+    py::array_t<int32_t> left_indices_arr(left_idx_shape);
+    py::array_t<int32_t> right_indices_arr(right_idx_shape);
+
+    std::memcpy(feature_arr.mutable_data(), result.best_feature.data(), n_nodes * sizeof(int32_t));
+    std::memcpy(threshold_arr.mutable_data(), result.best_threshold.data(), n_nodes * sizeof(int32_t));
+    std::memcpy(score_arr.mutable_data(), result.score.data(), n_nodes * sizeof(float));
+    std::memcpy(agreement_arr.mutable_data(), result.agreement.data(), n_nodes * sizeof(float));
+    std::memcpy(left_value_arr.mutable_data(), result.left_value.data(), n_nodes * sizeof(float));
+    std::memcpy(right_value_arr.mutable_data(), result.right_value.data(), n_nodes * sizeof(float));
+    std::memcpy(base_value_arr.mutable_data(), result.base_value.data(), n_nodes * sizeof(float));
+    std::memcpy(left_offsets_arr.mutable_data(), result.left_offsets.data(), (n_nodes + 1) * sizeof(int32_t));
+    std::memcpy(right_offsets_arr.mutable_data(), result.right_offsets.data(), (n_nodes + 1) * sizeof(int32_t));
+    if (!result.left_indices.empty()) {
+        std::memcpy(left_indices_arr.mutable_data(), result.left_indices.data(), result.left_indices.size() * sizeof(int32_t));
+    }
+    if (!result.right_indices.empty()) {
+        std::memcpy(right_indices_arr.mutable_data(), result.right_indices.data(), result.right_indices.size() * sizeof(int32_t));
+    }
+
+    return py::make_tuple(
+        feature_arr,
+        threshold_arr,
+        score_arr,
+        agreement_arr,
+        left_value_arr,
+        right_value_arr,
+        base_value_arr,
+        left_offsets_arr,
+        right_offsets_arr,
+        left_indices_arr,
+        right_indices_arr);
 }

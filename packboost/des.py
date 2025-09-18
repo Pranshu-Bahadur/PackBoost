@@ -8,7 +8,7 @@ from typing import Iterable, Optional
 import numpy as np
 
 from .config import PackBoostConfig
-from .backends import cpu_histogram
+from .backends import cpu_histogram, cpu_frontier_histogram
 
 
 @dataclass
@@ -41,8 +41,149 @@ def evaluate_node_split(
     config: PackBoostConfig,
 ) -> SplitDecision:
     """Return the DES-optimal split for ``node_indices`` using the CPU backend."""
-    evaluator = _CPUHistogramEvaluator(X_binned, gradients, hessians, era_ids, config)
-    return evaluator.evaluate(node_indices=node_indices, features=features)
+    decisions = evaluate_frontier(
+        X_binned=X_binned,
+        gradients=gradients,
+        hessians=hessians,
+        era_ids=era_ids,
+        node_indices_list=[node_indices],
+        features=features,
+        config=config,
+    )
+    return decisions[0]
+
+
+def evaluate_frontier(
+    *,
+    X_binned: np.ndarray,
+    gradients: np.ndarray,
+    hessians: np.ndarray,
+    era_ids: np.ndarray,
+    node_indices_list: Iterable[np.ndarray],
+    features: Iterable[int],
+    config: PackBoostConfig,
+) -> list[SplitDecision]:
+    """Evaluate a batch of frontier nodes and return split decisions."""
+    node_indices_list = [np.asarray(idx, dtype=np.int32) for idx in node_indices_list]
+    if not node_indices_list:
+        return []
+
+    features_arr = np.asarray(list(features), dtype=np.int32)
+    if features_arr.size == 0:
+        # No features to split on: all nodes become leaves
+        decisions: list[SplitDecision] = []
+        for idx in node_indices_list:
+            base_val = float(-(gradients[idx].sum()) / (hessians[idx].sum() + config.lambda_l2)) if idx.size else 0.0
+            decisions.append(
+                SplitDecision(
+                    feature=None,
+                    threshold=None,
+                    score=float("-inf"),
+                    direction_agreement=0.0,
+                    left_value=base_val,
+                    right_value=base_val,
+                    left_indices=idx,
+                    right_indices=np.empty(0, dtype=np.int32),
+                )
+            )
+        return decisions
+
+    if cpu_frontier_histogram is not None:
+        offsets = np.zeros(len(node_indices_list) + 1, dtype=np.int32)
+        for i, idx in enumerate(node_indices_list, start=1):
+            offsets[i] = offsets[i - 1] + idx.size
+        concatenated = np.concatenate(node_indices_list) if offsets[-1] > 0 else np.empty(0, dtype=np.int32)
+        hist_grad, hist_hess, hist_count = cpu_frontier_histogram(
+            X_binned,
+            concatenated,
+            offsets,
+            features_arr,
+            gradients,
+            hessians,
+            era_ids,
+            config.max_bins,
+            int(era_ids.max() + 1),
+        )
+        scores = _score_from_histograms(
+            hist_grad=hist_grad,
+            hist_hess=hist_hess,
+            hist_count=hist_count,
+            config=config,
+            lambda_l2=config.lambda_l2,
+            min_leaf=config.min_samples_leaf,
+        )
+
+        decisions: list[SplitDecision] = []
+        node_idx = 0
+        for samples in node_indices_list:
+            best_feature = int(scores["feature"][node_idx])
+            threshold = int(scores["threshold"][node_idx])
+            score = float(scores["score"][node_idx])
+            agreement = float(scores["agreement"][node_idx])
+            left_value = float(scores["left_value"][node_idx])
+            right_value = float(scores["right_value"][node_idx])
+            base_value = float(scores["base_value"][node_idx])
+
+            if best_feature < 0 or score <= 0 or samples.size == 0:
+                decisions.append(
+                    SplitDecision(
+                        feature=None,
+                        threshold=None,
+                        score=score,
+                        direction_agreement=0.0,
+                        left_value=base_value,
+                        right_value=base_value,
+                        left_indices=samples,
+                        right_indices=np.empty(0, dtype=np.int32),
+                    )
+                )
+            else:
+                feature_idx = features_arr[best_feature]
+                node_bins = X_binned[samples, feature_idx]
+                left_mask = node_bins <= threshold
+                left_indices = samples[left_mask]
+                right_indices = samples[~left_mask]
+
+                if left_indices.size < config.min_samples_leaf or right_indices.size < config.min_samples_leaf:
+                    decisions.append(
+                        SplitDecision(
+                            feature=None,
+                            threshold=None,
+                            score=score,
+                            direction_agreement=0.0,
+                            left_value=base_value,
+                            right_value=base_value,
+                            left_indices=samples,
+                            right_indices=np.empty(0, dtype=np.int32),
+                        )
+                    )
+                else:
+                    decisions.append(
+                        SplitDecision(
+                            feature=int(feature_idx),
+                            threshold=int(threshold),
+                            score=score,
+                            direction_agreement=agreement,
+                            left_value=left_value,
+                            right_value=right_value,
+                            left_indices=left_indices.astype(np.int32, copy=False),
+                            right_indices=right_indices.astype(np.int32, copy=False),
+                        )
+                    )
+            node_idx += 1
+
+        return decisions
+
+    # Fallback to per-node evaluation if native backend is unavailable
+    fallback = []
+    for samples in node_indices_list:
+        fallback.append(
+            _CPUHistogramEvaluator(X_binned, gradients, hessians, era_ids, config).evaluate(
+                node_indices=samples,
+                features=features,
+            )
+        )
+    return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -65,125 +206,124 @@ def _empty_decision(node_indices: np.ndarray) -> SplitDecision:
 
 def _score_from_histograms(
     *,
-    features: np.ndarray,
-    node_indices: np.ndarray,
-    node_bins: np.ndarray,
-    gradients: np.ndarray,
-    hessians: np.ndarray,
-    config: PackBoostConfig,
     hist_grad: np.ndarray,
     hist_hess: np.ndarray,
     hist_count: np.ndarray,
-) -> SplitDecision:
-    """Select the best split from pre-computed histograms."""
-    if node_indices.size == 0:
-        return _empty_decision(node_indices)
+    config: PackBoostConfig,
+    lambda_l2: float,
+    min_leaf: int,
+):
+    hist_grad = np.asarray(hist_grad, dtype=np.float32)
+    hist_hess = np.asarray(hist_hess, dtype=np.float32)
+    hist_count = np.asarray(hist_count, dtype=np.int32)
 
-    lambda_l2 = config.lambda_l2
-    min_leaf = config.min_samples_leaf
+    if hist_grad.ndim == 3:
+        hist_grad = hist_grad[None, ...]
+        hist_hess = hist_hess[None, ...]
+        hist_count = hist_count[None, ...]
 
-    n_features, max_bins, n_eras = hist_grad.shape
-    if n_eras == 0:
-        return _empty_decision(node_indices)
+    n_nodes, n_features, max_bins, n_eras = hist_grad.shape
+    if max_bins <= 1 or n_eras == 0:
+        return {
+            "feature": np.full(n_nodes, -1, dtype=np.int32),
+            "threshold": np.zeros(n_nodes, dtype=np.int32),
+            "score": np.full(n_nodes, -np.inf, dtype=np.float32),
+            "agreement": np.zeros(n_nodes, dtype=np.float32),
+            "left_value": np.zeros(n_nodes, dtype=np.float32),
+            "right_value": np.zeros(n_nodes, dtype=np.float32),
+            "base_value": np.zeros(n_nodes, dtype=np.float32),
+        }
 
-    # Prefix sums across bins (axis=1) for left child statistics
-    prefix_grad = np.cumsum(hist_grad, axis=1)[:, :-1, :]
-    prefix_hess = np.cumsum(hist_hess, axis=1)[:, :-1, :]
-    prefix_count = np.cumsum(hist_count, axis=1)[:, :-1, :]
+    thresholds = max_bins - 1
 
-    total_grad = hist_grad.sum(axis=1)[:, None, :]  # (n_features, 1, n_eras)
-    total_hess = hist_hess.sum(axis=1)[:, None, :]
-    total_count = hist_count.sum(axis=1)[:, None, :]
+    total_grad = hist_grad.sum(axis=2, keepdims=True)
+    total_hess = hist_hess.sum(axis=2, keepdims=True)
+    parent_grad = total_grad.sum(axis=3).squeeze(2)
+    parent_hess = total_hess.sum(axis=3).squeeze(2)
+    base_value = -parent_grad[:, 0] / (parent_hess[:, 0] + lambda_l2)
 
-    suffix_grad = total_grad - prefix_grad
-    suffix_hess = total_hess - prefix_hess
-    suffix_count = total_count - prefix_count
+    left_grad = np.cumsum(hist_grad, axis=2)[:, :, :-1, :]
+    left_hess = np.cumsum(hist_hess, axis=2)[:, :, :-1, :]
+    left_count = np.cumsum(hist_count, axis=2)[:, :, :-1, :]
 
-    parent_score = 0.5 * (total_grad ** 2) / np.maximum(total_hess + lambda_l2, 1e-12)
+    right_grad = total_grad - left_grad
+    right_hess = total_hess - left_hess
+    total_count = hist_count.sum(axis=2, keepdims=True)
+    right_count = total_count - left_count
 
-    denom_left = np.maximum(prefix_hess + lambda_l2, 1e-12)
-    denom_right = np.maximum(suffix_hess + lambda_l2, 1e-12)
+    safe_left_hess = left_hess + lambda_l2
+    safe_right_hess = right_hess + lambda_l2
+    parent_safe_hess = total_hess + lambda_l2
 
-    gain_left = 0.5 * (prefix_grad ** 2) / denom_left
-    gain_right = 0.5 * (suffix_grad ** 2) / denom_right
-    gains = gain_left + gain_right - parent_score
+    gain_left = 0.5 * (left_grad ** 2) / np.maximum(safe_left_hess, 1e-12)
+    gain_right = 0.5 * (right_grad ** 2) / np.maximum(safe_right_hess, 1e-12)
+    parent_gain = 0.5 * (total_grad ** 2) / np.maximum(parent_safe_hess, 1e-12)
+    gains = gain_left + gain_right - parent_gain
 
-    valid_mask = (prefix_count >= min_leaf) & (suffix_count >= min_leaf)
-    gains = np.where(valid_mask, gains, np.nan)
+    left_total = left_count.sum(axis=3)
+    right_total = right_count.sum(axis=3)
+    valid_mask = (left_total >= min_leaf) & (right_total >= min_leaf)
+    valid_mask_expanded = np.broadcast_to(valid_mask[..., None], gains.shape)
+    gains = np.where(valid_mask_expanded, gains, np.nan)
 
-    valid_counts = np.sum(~np.isnan(gains), axis=2)
-    sum_gain = np.nansum(gains, axis=2)
-    mean_gain = np.divide(
-        sum_gain,
-        valid_counts,
-        out=np.full(sum_gain.shape, np.nan, dtype=np.float32),
-        where=valid_counts > 0,
-    )
-    mean_for_var = np.where(np.isnan(mean_gain), 0.0, mean_gain)
-    sum_sq = np.nansum((gains - mean_for_var[..., None]) ** 2, axis=2)
-    variance = np.divide(
-        sum_sq,
-        valid_counts,
-        out=np.zeros_like(sum_sq),
-        where=valid_counts > 0,
-    )
+    sum_gain = np.nansum(gains, axis=3)
+    counts = valid_mask_expanded.sum(axis=3)
+    mean_gain = np.divide(sum_gain, counts, out=np.zeros_like(sum_gain, dtype=np.float32), where=counts > 0)
+
+    diff = np.where(valid_mask_expanded, gains - mean_gain[..., None], 0.0)
+    sum_sq = np.sum(diff ** 2, axis=3)
+    variance = np.divide(sum_sq, counts, out=np.zeros_like(sum_sq, dtype=np.float32), where=counts > 0)
     std_gain = np.sqrt(variance, dtype=np.float32)
     dro_score = mean_gain - config.lambda_dro * std_gain
 
-    # Directional agreement
-    left_value = -prefix_grad / denom_left
-    right_value = -suffix_grad / denom_right
-    direction = np.where(valid_mask, np.where(left_value >= right_value, 1.0, -1.0), 0.0)
-    direction_counts = np.sum(valid_mask, axis=2)
+    left_pred = -left_grad / np.maximum(safe_left_hess, 1e-12)
+    right_pred = -right_grad / np.maximum(safe_right_hess, 1e-12)
+    direction = np.where(valid_mask_expanded, np.where(left_pred >= right_pred, 1.0, -1.0), 0.0)
+    direction_sum = np.nansum(direction, axis=3)
+    direction_counts = counts
     agreement = np.zeros_like(dro_score)
-    nonzero = direction_counts > 0
-    agreement[nonzero] = (
-        np.abs(np.sum(direction, axis=2)[nonzero]) / direction_counts[nonzero]
-    )
+    mask_counts = direction_counts > 0
+    agreement[mask_counts] = np.abs(direction_sum[mask_counts]) / direction_counts[mask_counts]
 
     final_score = dro_score + config.direction_weight * agreement
     final_score = np.where(np.isnan(final_score), -np.inf, final_score)
+    final_score = np.where(valid_mask, final_score, -np.inf)
 
-    if not np.isfinite(final_score).any():
-        return _empty_decision(node_indices)
+    flat_scores = final_score.reshape(n_nodes, -1)
+    best_flat = np.argmax(flat_scores, axis=1)
+    best_score = flat_scores[np.arange(n_nodes), best_flat]
+    valid_nodes = np.isfinite(best_score)
 
-    best_feature_idx, best_threshold_idx = np.unravel_index(
-        np.nanargmax(final_score), final_score.shape
-    )
-    best_score = final_score[best_feature_idx, best_threshold_idx]
-    best_agreement = agreement[best_feature_idx, best_threshold_idx]
+    best_feature_idx = best_flat // thresholds
+    best_threshold_idx = best_flat % thresholds
 
-    feature = int(features[best_feature_idx])
-    threshold = int(best_threshold_idx)
+    sum_left_grad = left_grad.sum(axis=3)
+    sum_left_hess = left_hess.sum(axis=3)
+    sum_right_grad = right_grad.sum(axis=3)
+    sum_right_hess = right_hess.sum(axis=3)
 
-    feature_bins = node_bins[:, best_feature_idx]
-    left_mask = feature_bins <= threshold
-    right_mask = ~left_mask
+    node_idx = np.arange(n_nodes)
+    best_left_grad = sum_left_grad[node_idx, best_feature_idx, best_threshold_idx]
+    best_left_hess = sum_left_hess[node_idx, best_feature_idx, best_threshold_idx]
+    best_right_grad = sum_right_grad[node_idx, best_feature_idx, best_threshold_idx]
+    best_right_hess = sum_right_hess[node_idx, best_feature_idx, best_threshold_idx]
+    best_agreement = agreement.reshape(n_nodes, -1)[np.arange(n_nodes), best_flat]
 
-    left_indices = node_indices[left_mask]
-    right_indices = node_indices[right_mask]
+    left_value = -best_left_grad / (best_left_hess + lambda_l2)
+    right_value = -best_right_grad / (best_right_hess + lambda_l2)
 
-    if left_indices.size < min_leaf or right_indices.size < min_leaf:
-        return _empty_decision(node_indices)
+    best_feature_idx = np.where(valid_nodes, best_feature_idx, -1)
+    best_threshold_idx = np.where(valid_nodes, best_threshold_idx, 0)
 
-    g_left_total = gradients[left_indices].sum()
-    h_left_total = hessians[left_indices].sum()
-    g_right_total = gradients[right_indices].sum()
-    h_right_total = hessians[right_indices].sum()
-
-    left_value_scalar = -g_left_total / (h_left_total + lambda_l2)
-    right_value_scalar = -g_right_total / (h_right_total + lambda_l2)
-
-    return SplitDecision(
-        feature=feature,
-        threshold=threshold,
-        score=float(best_score),
-        direction_agreement=float(best_agreement),
-        left_value=float(left_value_scalar),
-        right_value=float(right_value_scalar),
-        left_indices=left_indices.astype(np.int32, copy=False),
-        right_indices=right_indices.astype(np.int32, copy=False),
-    )
+    return {
+        "feature": best_feature_idx.astype(np.int32),
+        "threshold": best_threshold_idx.astype(np.int32),
+        "score": best_score.astype(np.float32),
+        "agreement": best_agreement.astype(np.float32),
+        "left_value": left_value.astype(np.float32),
+        "right_value": right_value.astype(np.float32),
+        "base_value": base_value.astype(np.float32),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -261,16 +401,62 @@ class _CPUHistogramEvaluator:
                 hist_hess[feature_idx] = hess_flat.reshape(max_bins, n_eras)
                 hist_count[feature_idx] = count_flat.reshape(max_bins, n_eras)
 
-        return _score_from_histograms(
-            features=features_arr,
-            node_indices=node_indices,
-            node_bins=node_bins,
-            gradients=self.gradients,
-            hessians=self.hessians,
+        scores = _score_from_histograms(
+            hist_grad=hist_grad[None, ...],
+            hist_hess=hist_hess[None, ...],
+            hist_count=hist_count[None, ...],
             config=self.config,
-            hist_grad=hist_grad,
-            hist_hess=hist_hess,
-            hist_count=hist_count,
+            lambda_l2=self.config.lambda_l2,
+            min_leaf=self.config.min_samples_leaf,
+        )
+
+        best_feature = int(scores["feature"][0])
+        threshold = int(scores["threshold"][0])
+        score = float(scores["score"][0])
+        agreement = float(scores["agreement"][0])
+        left_value = float(scores["left_value"][0])
+        right_value = float(scores["right_value"][0])
+        base_value = float(scores["base_value"][0])
+
+        if best_feature < 0 or score <= 0:
+            return SplitDecision(
+                feature=None,
+                threshold=None,
+                score=score,
+                direction_agreement=0.0,
+                left_value=base_value,
+                right_value=base_value,
+                left_indices=node_indices,
+                right_indices=np.empty(0, dtype=np.int32),
+            )
+
+        feature = int(features_arr[best_feature])
+        node_bins_feature = node_bins[:, best_feature]
+        left_mask = node_bins_feature <= threshold
+        left_indices = node_indices[left_mask]
+        right_indices = node_indices[~left_mask]
+
+        if left_indices.size < self.config.min_samples_leaf or right_indices.size < self.config.min_samples_leaf:
+            return SplitDecision(
+                feature=None,
+                threshold=None,
+                score=score,
+                direction_agreement=0.0,
+                left_value=base_value,
+                right_value=base_value,
+                left_indices=node_indices,
+                right_indices=np.empty(0, dtype=np.int32),
+            )
+
+        return SplitDecision(
+            feature=feature,
+            threshold=int(threshold),
+            score=score,
+            direction_agreement=agreement,
+            left_value=left_value,
+            right_value=right_value,
+            left_indices=left_indices.astype(np.int32, copy=False),
+            right_indices=right_indices.astype(np.int32, copy=False),
         )
 
 
@@ -291,17 +477,63 @@ def evaluate_node_split_from_hist(
     hist_hess: np.ndarray,
     hist_count: np.ndarray,
 ) -> SplitDecision:
-    """Expose histogram scoring for GPU backends."""
-    return _score_from_histograms(
-        features=features,
-        node_indices=node_indices,
-        node_bins=node_bins,
-        gradients=gradients,
-        hessians=hessians,
+    """Return the DES-optimal split given pre-computed histograms."""
+    scores = _score_from_histograms(
+        hist_grad=hist_grad[None, ...],
+        hist_hess=hist_hess[None, ...],
+        hist_count=hist_count[None, ...],
         config=config,
-        hist_grad=hist_grad,
-        hist_hess=hist_hess,
-        hist_count=hist_count,
+        lambda_l2=config.lambda_l2,
+        min_leaf=config.min_samples_leaf,
+    )
+
+    best_feature = int(scores["feature"][0])
+    threshold = int(scores["threshold"][0])
+    score = float(scores["score"][0])
+    agreement = float(scores["agreement"][0])
+    left_value = float(scores["left_value"][0])
+    right_value = float(scores["right_value"][0])
+    base_value = float(scores["base_value"][0])
+
+    if best_feature < 0 or score <= 0 or node_indices.size == 0:
+        return SplitDecision(
+            feature=None,
+            threshold=None,
+            score=score,
+            direction_agreement=0.0,
+            left_value=base_value,
+            right_value=base_value,
+            left_indices=node_indices,
+            right_indices=np.empty(0, dtype=np.int32),
+        )
+
+    feature = int(features[best_feature])
+    bins_feature = node_bins[:, best_feature]
+    left_mask = bins_feature <= threshold
+    left_indices = node_indices[left_mask]
+    right_indices = node_indices[~left_mask]
+
+    if left_indices.size < config.min_samples_leaf or right_indices.size < config.min_samples_leaf:
+        return SplitDecision(
+            feature=None,
+            threshold=None,
+            score=score,
+            direction_agreement=0.0,
+            left_value=base_value,
+            right_value=base_value,
+            left_indices=node_indices,
+            right_indices=np.empty(0, dtype=np.int32),
+        )
+
+    return SplitDecision(
+        feature=feature,
+        threshold=threshold,
+        score=score,
+        direction_agreement=agreement,
+        left_value=left_value,
+        right_value=right_value,
+        left_indices=left_indices.astype(np.int32, copy=False),
+        right_indices=right_indices.astype(np.int32, copy=False),
     )
 
 

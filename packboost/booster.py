@@ -7,10 +7,16 @@ from typing import Dict, Iterable, List, Sequence
 import numpy as np
 
 from .config import PackBoostConfig
-from .des import SplitDecision, evaluate_node_split, evaluate_node_split_from_hist
+from .des import SplitDecision, evaluate_frontier, evaluate_node_split, evaluate_node_split_from_hist
 from .model import PackBoostModel, Tree, TreeNode
 from .utils.binning import apply_binning, quantile_binning
-from .backends import cuda_available, cuda_histogram
+from .backends import (
+    cpu_available,
+    cpu_frontier_evaluate,
+    cuda_available,
+    cuda_frontier_evaluate,
+    cuda_histogram,
+)
 
 
 class PackBoost:
@@ -20,6 +26,7 @@ class PackBoost:
         self.config = config
         self._model: PackBoostModel | None = None
         self._use_gpu: bool = False
+        self._num_eras: int | None = None
 
     @property
     def model(self) -> PackBoostModel:
@@ -39,13 +46,17 @@ class PackBoost:
         """Fit PackBoost to the provided data."""
         X = np.asarray(X, dtype=np.float32)
         y = np.asarray(y, dtype=np.float32)
-        era_ids = np.asarray(era_ids, dtype=np.int16)
+        era_ids = np.asarray(era_ids, dtype=np.int64)
 
         if X.shape[0] != y.shape[0] or X.shape[0] != era_ids.shape[0]:
             raise ValueError("X, y, and era_ids must have the same number of rows")
 
         n_samples, n_features = X.shape
         self.config.validate(n_features)
+
+        unique_eras, era_ids = np.unique(era_ids, return_inverse=True)
+        era_ids = era_ids.astype(np.int16)
+        self._num_eras = int(unique_eras.size)
 
         if self.config.device == "cuda" and not self._should_use_gpu():
             raise RuntimeError(
@@ -151,21 +162,45 @@ class PackBoost:
 
         for tree_idx, tree in enumerate(trees):
             node_map = samples[tree_idx]
-            for node_id in frontiers[tree_idx]:
-                node_indices = node_map.pop(node_id, None)
-                if node_indices is None or node_indices.size == 0:
+            frontier_nodes = frontiers[tree_idx]
+            if not frontier_nodes:
+                continue
+
+            node_ids: list[int] = []
+            node_samples: list[np.ndarray] = []
+            for node_id in frontier_nodes:
+                indices = node_map.get(node_id)
+                if indices is None or indices.size == 0:
+                    tree.ensure_leaf(node_id, 0.0)
+                    node_map.pop(node_id, None)
+                    continue
+                node_ids.append(node_id)
+                node_samples.append(indices)
+
+            if not node_samples:
+                continue
+
+            batch = self._prepare_frontier_batch(node_samples)
+            decisions = self._evaluate_frontier_batch(
+                X_binned=X_binned,
+                gradients=gradients,
+                hessians=hessians,
+                era_ids=era_ids,
+                batch=batch,
+                features=feature_subset,
+            )
+
+            for node_id, decision in zip(node_ids, decisions):
+                samples_arr = node_map.pop(node_id, None)
+                if samples_arr is None:
                     continue
 
-                decision = self._evaluate_node(
-                    X_binned=X_binned,
-                    gradients=gradients,
-                    hessians=hessians,
-                    era_ids=era_ids,
-                    node_indices=node_indices,
-                    features=feature_subset,
-                )
-
-                if decision.feature is None or decision.score <= 0:
+                if (
+                    decision.feature is None
+                    or decision.score <= 0
+                    or decision.left_indices.size == 0
+                    or decision.right_indices.size == 0
+                ):
                     tree.ensure_leaf(node_id, decision.left_value)
                     continue
 
@@ -174,12 +209,18 @@ class PackBoost:
                 node.threshold = decision.threshold
                 node.is_leaf = False
 
-                left_id = tree.add_node(
-                    TreeNode(is_leaf=False, prediction=decision.left_value, depth=depth + 1)
+                left_node = TreeNode(
+                    is_leaf=False,
+                    prediction=decision.left_value,
+                    depth=depth + 1,
                 )
-                right_id = tree.add_node(
-                    TreeNode(is_leaf=False, prediction=decision.right_value, depth=depth + 1)
+                right_node = TreeNode(
+                    is_leaf=False,
+                    prediction=decision.right_value,
+                    depth=depth + 1,
                 )
+                left_id = tree.add_node(left_node)
+                right_id = tree.add_node(right_node)
                 node.left = left_id
                 node.right = right_id
 
@@ -196,6 +237,180 @@ class PackBoost:
             for node_id, node in enumerate(tree.nodes):
                 if node.is_leaf or (node.left is None and node.right is None):
                     tree.ensure_leaf(node_id, node.prediction)
+
+    @staticmethod
+    def _prepare_frontier_batch(node_samples: List[np.ndarray]) -> dict[str, np.ndarray | list[np.ndarray]]:
+        offsets = np.zeros(len(node_samples) + 1, dtype=np.int32)
+        for i, indices in enumerate(node_samples, start=1):
+            offsets[i] = offsets[i - 1] + indices.size
+
+        concatenated = np.concatenate(node_samples) if offsets[-1] > 0 else np.empty(0, dtype=np.int32)
+        return {"offsets": offsets, "indices": concatenated, "samples": node_samples}
+
+    def _evaluate_frontier_batch(
+        self,
+        *,
+        X_binned: np.ndarray,
+        gradients: np.ndarray,
+        hessians: np.ndarray,
+        era_ids: np.ndarray,
+        batch: dict[str, np.ndarray | list[np.ndarray]],
+        features: Iterable[int],
+    ) -> List[SplitDecision]:
+        node_samples = batch["samples"]  # type: ignore[index]
+        indices = batch["indices"]  # type: ignore[index]
+        offsets = batch["offsets"]  # type: ignore[index]
+
+        features_arr = np.asarray(list(features), dtype=np.int32)
+        if features_arr.size == 0:
+            return evaluate_frontier(
+                X_binned=X_binned,
+                gradients=gradients,
+                hessians=hessians,
+                era_ids=era_ids,
+                node_indices_list=node_samples,
+                features=features,
+                config=self.config,
+            )
+
+        if self._use_gpu and cuda_frontier_evaluate is not None:
+            (
+                features_native,
+                thresholds,
+                scores,
+                agreements,
+                left_vals,
+                right_vals,
+                base_vals,
+                left_offsets,
+                right_offsets,
+                left_indices_flat,
+                right_indices_flat,
+            ) = cuda_frontier_evaluate(
+                X_binned,
+                indices,
+                offsets,
+                features_arr,
+                gradients,
+                hessians,
+                era_ids,
+                self.config.max_bins,
+                self._num_eras or int(era_ids.max() + 1),
+                self.config.lambda_l2,
+                self.config.lambda_dro,
+                self.config.min_samples_leaf,
+                self.config.direction_weight,
+            )
+        elif cpu_frontier_evaluate is not None:
+            (
+                features_native,
+                thresholds,
+                scores,
+                agreements,
+                left_vals,
+                right_vals,
+                base_vals,
+                left_offsets,
+                right_offsets,
+                left_indices_flat,
+                right_indices_flat,
+            ) = cpu_frontier_evaluate(
+                X_binned,
+                indices,
+                offsets,
+                features_arr,
+                gradients,
+                hessians,
+                era_ids,
+                self.config.max_bins,
+                self._num_eras or int(era_ids.max() + 1),
+                self.config.lambda_l2,
+                self.config.lambda_dro,
+                self.config.min_samples_leaf,
+                self.config.direction_weight,
+            )
+        else:
+            return evaluate_frontier(
+                X_binned=X_binned,
+                gradients=gradients,
+                hessians=hessians,
+                era_ids=era_ids,
+                node_indices_list=node_samples,
+                features=features,
+                config=self.config,
+            )
+
+        features_arr = features_arr.astype(np.int32, copy=False)
+
+        decisions: List[SplitDecision] = []
+        for idx, samples_arr in enumerate(node_samples):
+            best_feature = int(features_native[idx])
+            threshold = int(thresholds[idx])
+            score = float(scores[idx])
+            agreement = float(agreements[idx])
+            left_value = float(left_vals[idx])
+            right_value = float(right_vals[idx])
+            base_value = float(base_vals[idx])
+
+            left_start = int(left_offsets[idx])
+            left_end = int(left_offsets[idx + 1])
+            right_start = int(right_offsets[idx])
+            right_end = int(right_offsets[idx + 1])
+
+            left_indices = left_indices_flat[left_start:left_end].astype(np.int32, copy=False)
+            right_indices = right_indices_flat[right_start:right_end].astype(np.int32, copy=False)
+
+            if (
+                best_feature < 0
+                or score <= 0
+                or left_indices.size == 0
+                or right_indices.size == 0
+            ):
+                decisions.append(
+                    SplitDecision(
+                        feature=None,
+                        threshold=None,
+                        score=score,
+                        direction_agreement=0.0,
+                        left_value=base_value,
+                        right_value=base_value,
+                        left_indices=samples_arr,
+                        right_indices=np.empty(0, dtype=np.int32),
+                    )
+                )
+                continue
+
+            if (
+                left_indices.size < self.config.min_samples_leaf
+                or right_indices.size < self.config.min_samples_leaf
+            ):
+                decisions.append(
+                    SplitDecision(
+                        feature=None,
+                        threshold=None,
+                        score=score,
+                        direction_agreement=0.0,
+                        left_value=base_value,
+                        right_value=base_value,
+                        left_indices=samples_arr,
+                        right_indices=np.empty(0, dtype=np.int32),
+                    )
+                )
+            else:
+                decisions.append(
+                    SplitDecision(
+                        feature=best_feature,
+                        threshold=threshold,
+                        score=score,
+                        direction_agreement=agreement,
+                        left_value=left_value,
+                        right_value=right_value,
+                        left_indices=left_indices.astype(np.int32, copy=False),
+                        right_indices=right_indices.astype(np.int32, copy=False),
+                    )
+                )
+
+        return decisions
 
     def _evaluate_node(
         self,
@@ -280,4 +495,4 @@ class PackBoost:
         )
 
     def _should_use_gpu(self) -> bool:
-        return self.config.device == "cuda" and cuda_available()
+        return self.config.device == "cuda" and cuda_frontier_evaluate is not None and cuda_available()
