@@ -133,7 +133,7 @@ class DESTest(unittest.TestCase):
         booster = PackBoost(config)
         booster._num_eras = int(era_ids.max()) + 1
 
-        batch = booster._prepare_frontier_batch(node_samples)  # type: ignore[attr-defined]
+        batch = booster._prepare_frontier_batch(node_samples, era_ids)  # type: ignore[attr-defined]
         native_decisions = booster._evaluate_frontier_batch(
             X_binned=X_binned,
             gradients=gradients,
@@ -206,7 +206,7 @@ class DESTest(unittest.TestCase):
         booster = PackBoost(config)
         booster._num_eras = int(era_ids.max()) + 1
 
-        batch = booster._prepare_frontier_batch(node_samples)  # type: ignore[attr-defined]
+        batch = booster._prepare_frontier_batch(node_samples, era_ids)  # type: ignore[attr-defined]
         gpu_decisions = booster._evaluate_frontier_batch(
             X_binned=X_binned,
             gradients=gradients,

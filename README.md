@@ -15,6 +15,9 @@ across regime shifts.
 - **CPU & CUDA frontier backends** – native C++/CUDA extensions batch whole
   depth frontiers, score DES splits, and return child partitions without Python
   loops.
+- **Era-tiling on CPU** – the CPU backend now streams eras in tiles, reusing
+  histograms and Welford-style statistics to keep memory bounded even for
+  hundreds of eras.
 - **Deterministic by design** – quantile binning, seeded sampling, and pure
   functions keep runs reproducible.
 - **Friendly tooling** – scikit-learn compatible wrapper, standalone
@@ -45,7 +48,8 @@ CUDA users need `nvcc` in `PATH`. The build script detects it automatically and
 compiles the optimized kernels (including the frontier evaluator) when available.
 Set `PACKBOOST_DISABLE_CUDA=1` before the build to force a CPU-only wheel even on
 GPU machines. Without CUDA the script still builds the fast multi-threaded CPU
-backend; if neither backend is built PackBoost falls back to the pure NumPy
+backend, which now streams era tiles and accumulates split statistics in O(1)
+memory. If neither backend is built PackBoost falls back to the pure NumPy
 implementation.
 
 ## Quick Start

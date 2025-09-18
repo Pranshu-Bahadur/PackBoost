@@ -183,20 +183,22 @@ FrontierEvalResult evaluate_frontier_cuda(
     const uint8_t* bins,
     const int32_t* node_indices,
     const int32_t* node_offsets,
+    const int32_t* node_era_offsets,
+    const int32_t* era_group_eras,
+    const int32_t* era_group_offsets,
     const int32_t* feature_subset,
     const float* gradients,
     const float* hessians,
-    const int16_t* era_inverse,
     std::size_t n_rows,
     std::size_t n_features_total,
     std::size_t n_nodes,
     std::size_t n_features_subset,
     int max_bins,
-    int n_eras,
     double lambda_l2,
     double lambda_dro,
     int min_samples_leaf,
-    double direction_weight) {
+    double direction_weight,
+    int era_tile_size) {
 
     // TODO: implement full CUDA frontier evaluation once kernels are available.
     // For now, fall back to the tuned CPU implementation so the interface stays
@@ -205,20 +207,22 @@ FrontierEvalResult evaluate_frontier_cuda(
         bins,
         node_indices,
         node_offsets,
+        node_era_offsets,
+        era_group_eras,
+        era_group_offsets,
         feature_subset,
         gradients,
         hessians,
-        era_inverse,
         n_rows,
         n_features_total,
         n_nodes,
         n_features_subset,
         max_bins,
-        n_eras,
         lambda_l2,
         lambda_dro,
         min_samples_leaf,
-        direction_weight);
+        direction_weight,
+        era_tile_size);
 }
 
 }  // namespace packboost
@@ -272,24 +276,29 @@ py::tuple cuda_frontier_evaluate_binding(
     py::array_t<uint8_t, py::array::c_style | py::array::forcecast> bins,
     py::array_t<int32_t, py::array::c_style | py::array::forcecast> node_indices,
     py::array_t<int32_t, py::array::c_style | py::array::forcecast> node_offsets,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> node_era_offsets,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> era_group_eras,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> era_group_offsets,
     py::array_t<int32_t, py::array::c_style | py::array::forcecast> feature_subset,
     py::array_t<float, py::array::c_style | py::array::forcecast> gradients,
     py::array_t<float, py::array::c_style | py::array::forcecast> hessians,
-    py::array_t<int16_t, py::array::c_style | py::array::forcecast> era_inverse,
     int max_bins,
-    int n_eras,
+    int n_eras_total,
     double lambda_l2,
     double lambda_dro,
     int min_samples_leaf,
-    double direction_weight) {
+    double direction_weight,
+    int era_tile_size) {
 
     py::buffer_info bins_info = bins.request();
     py::buffer_info idx_info = node_indices.request();
     py::buffer_info offsets_info = node_offsets.request();
+    py::buffer_info node_era_info = node_era_offsets.request();
+    py::buffer_info era_group_info = era_group_eras.request();
+    py::buffer_info era_group_offsets_info = era_group_offsets.request();
     py::buffer_info feat_info = feature_subset.request();
     py::buffer_info grad_info = gradients.request();
     py::buffer_info hess_info = hessians.request();
-    py::buffer_info era_info = era_inverse.request();
 
     if (bins_info.ndim != 2) {
         throw std::invalid_argument("bins must be 2D");
@@ -304,20 +313,23 @@ py::tuple cuda_frontier_evaluate_binding(
         static_cast<uint8_t*>(bins_info.ptr),
         static_cast<int32_t*>(idx_info.ptr),
         static_cast<int32_t*>(offsets_info.ptr),
+        static_cast<int32_t*>(node_era_info.ptr),
+        static_cast<int32_t*>(era_group_info.ptr),
+        static_cast<int32_t*>(era_group_offsets_info.ptr),
         static_cast<int32_t*>(feat_info.ptr),
         static_cast<float*>(grad_info.ptr),
         static_cast<float*>(hess_info.ptr),
-        static_cast<int16_t*>(era_info.ptr),
         n_rows,
         n_features_total,
         n_nodes,
         n_features_subset,
         max_bins,
-        n_eras,
+        n_eras_total,
         lambda_l2,
         lambda_dro,
         min_samples_leaf,
-        direction_weight);
+        direction_weight,
+        era_tile_size);
 
     std::vector<py::ssize_t> vec_shape = {static_cast<py::ssize_t>(n_nodes)};
     py::array_t<int32_t> feature_arr(vec_shape);

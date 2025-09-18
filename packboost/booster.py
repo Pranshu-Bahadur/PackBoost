@@ -180,7 +180,7 @@ class PackBoost:
             if not node_samples:
                 continue
 
-            batch = self._prepare_frontier_batch(node_samples)
+            batch = self._prepare_frontier_batch(node_samples, era_ids)
             decisions = self._evaluate_frontier_batch(
                 X_binned=X_binned,
                 gradients=gradients,
@@ -239,13 +239,64 @@ class PackBoost:
                     tree.ensure_leaf(node_id, node.prediction)
 
     @staticmethod
-    def _prepare_frontier_batch(node_samples: List[np.ndarray]) -> dict[str, np.ndarray | list[np.ndarray]]:
-        offsets = np.zeros(len(node_samples) + 1, dtype=np.int32)
-        for i, indices in enumerate(node_samples, start=1):
-            offsets[i] = offsets[i - 1] + indices.size
+    def _prepare_frontier_batch(
+        node_samples: List[np.ndarray],
+        era_ids: np.ndarray,
+    ) -> dict[str, np.ndarray | list[np.ndarray]]:
+        node_offsets = np.zeros(len(node_samples) + 1, dtype=np.int32)
+        node_era_offsets = np.zeros(len(node_samples) + 1, dtype=np.int32)
 
-        concatenated = np.concatenate(node_samples) if offsets[-1] > 0 else np.empty(0, dtype=np.int32)
-        return {"offsets": offsets, "indices": concatenated, "samples": node_samples}
+        concatenated_parts: list[np.ndarray] = []
+        era_group_eras: list[int] = []
+        era_group_offsets: list[int] = [0]
+
+        running_index = 0
+        running_era_group = 0
+
+        for node_idx, samples in enumerate(node_samples):
+            node_offsets[node_idx + 1] = running_index
+            node_era_offsets[node_idx + 1] = running_era_group
+
+            if samples.size == 0:
+                continue
+
+            sample_era_ids = era_ids[samples]
+            order = np.argsort(sample_era_ids, kind="stable")
+            sorted_samples = samples[order]
+            sorted_eras = sample_era_ids[order]
+
+            concatenated_parts.append(sorted_samples.astype(np.int32, copy=False))
+            running_index += sorted_samples.size
+            node_offsets[node_idx + 1] = running_index
+
+            unique_eras, counts = np.unique(sorted_eras, return_counts=True)
+            if unique_eras.size == 0:
+                node_era_offsets[node_idx + 1] = running_era_group
+                continue
+
+            era_group_eras.extend(int(e) for e in unique_eras)
+            running_era_group += unique_eras.size
+            node_era_offsets[node_idx + 1] = running_era_group
+
+            for count in counts:
+                era_group_offsets.append(era_group_offsets[-1] + int(count))
+
+        indices = (
+            np.concatenate(concatenated_parts)
+            if concatenated_parts
+            else np.empty(0, dtype=np.int32)
+        )
+        era_group_eras_arr = np.asarray(era_group_eras, dtype=np.int32)
+        era_group_offsets_arr = np.asarray(era_group_offsets, dtype=np.int32)
+
+        return {
+            "node_offsets": node_offsets,
+            "node_era_offsets": node_era_offsets,
+            "era_group_eras": era_group_eras_arr,
+            "era_group_offsets": era_group_offsets_arr,
+            "indices": indices,
+            "samples": node_samples,
+        }
 
     def _evaluate_frontier_batch(
         self,
@@ -259,7 +310,10 @@ class PackBoost:
     ) -> List[SplitDecision]:
         node_samples = batch["samples"]  # type: ignore[index]
         indices = batch["indices"]  # type: ignore[index]
-        offsets = batch["offsets"]  # type: ignore[index]
+        node_offsets = batch["node_offsets"]  # type: ignore[index]
+        node_era_offsets = batch["node_era_offsets"]  # type: ignore[index]
+        era_group_eras = batch["era_group_eras"]  # type: ignore[index]
+        era_group_offsets = batch["era_group_offsets"]  # type: ignore[index]
 
         features_arr = np.asarray(list(features), dtype=np.int32)
         if features_arr.size == 0:
@@ -272,6 +326,11 @@ class PackBoost:
                 features=features,
                 config=self.config,
             )
+
+        if era_ids.size:
+            n_total_eras = int(self._num_eras or (int(era_ids.max()) + 1))
+        else:
+            n_total_eras = int(self._num_eras or 0)
 
         if self._use_gpu and cuda_frontier_evaluate is not None:
             (
@@ -289,17 +348,20 @@ class PackBoost:
             ) = cuda_frontier_evaluate(
                 X_binned,
                 indices,
-                offsets,
+                node_offsets,
+                node_era_offsets,
+                era_group_eras,
+                era_group_offsets,
                 features_arr,
                 gradients,
                 hessians,
-                era_ids,
                 self.config.max_bins,
-                self._num_eras or int(era_ids.max() + 1),
+                n_total_eras,
                 self.config.lambda_l2,
                 self.config.lambda_dro,
                 self.config.min_samples_leaf,
                 self.config.direction_weight,
+                self.config.era_tile_size,
             )
         elif cpu_frontier_evaluate is not None:
             (
@@ -317,17 +379,20 @@ class PackBoost:
             ) = cpu_frontier_evaluate(
                 X_binned,
                 indices,
-                offsets,
+                node_offsets,
+                node_era_offsets,
+                era_group_eras,
+                era_group_offsets,
                 features_arr,
                 gradients,
                 hessians,
-                era_ids,
                 self.config.max_bins,
-                self._num_eras or int(era_ids.max() + 1),
+                n_total_eras,
                 self.config.lambda_l2,
                 self.config.lambda_dro,
                 self.config.min_samples_leaf,
                 self.config.direction_weight,
+                self.config.era_tile_size,
             )
         else:
             return evaluate_frontier(
