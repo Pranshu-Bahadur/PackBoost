@@ -39,7 +39,7 @@ class PackBoost:
         """Fit PackBoost to the provided data."""
         X = np.asarray(X, dtype=np.float32)
         y = np.asarray(y, dtype=np.float32)
-        era_ids = np.asarray(era_ids, dtype=np.int32)
+        era_ids = np.asarray(era_ids, dtype=np.int16)
 
         if X.shape[0] != y.shape[0] or X.shape[0] != era_ids.shape[0]:
             raise ValueError("X, y, and era_ids must have the same number of rows")
@@ -240,7 +240,7 @@ class PackBoost:
             raise RuntimeError("CUDA backend is not available")
 
         features_arr = np.array(list(features), dtype=np.int32)
-        node_bins = X_binned[np.ix_(node_indices, features_arr)]
+        node_bins = X_binned[np.ix_(node_indices, features_arr)].astype(np.uint8, copy=False)
         gradients_node = gradients[node_indices]
         hessians_node = hessians[node_indices]
         unique_eras, era_inverse = np.unique(era_ids[node_indices], return_inverse=True)
@@ -257,6 +257,7 @@ class PackBoost:
                 right_indices=np.array([], dtype=np.int32),
             )
 
+        era_inverse = era_inverse.astype(np.int16, copy=False)
         hist_grad, hist_hess, hist_count = cuda_histogram(
             node_bins,
             gradients_node,

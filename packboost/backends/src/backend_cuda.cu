@@ -4,7 +4,10 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 
+#include <cstdint>
+#include <cstring>
 #include <stdexcept>
+#include <string>
 
 namespace py = pybind11;
 
@@ -30,7 +33,7 @@ __global__ void histogram_kernel(
     const uint8_t* __restrict__ bins,
     const float* __restrict__ gradients,
     const float* __restrict__ hessians,
-    const int32_t* __restrict__ era_inverse,
+    const int16_t* __restrict__ era_inverse,
     int n_rows,
     int n_features,
     int max_bins,
@@ -45,8 +48,6 @@ __global__ void histogram_kernel(
     int32_t* shared_count = reinterpret_cast<int32_t*>(shared_hess + max_bins * n_eras);
 
     const int feature = blockIdx.x;
-    const uint8_t* feature_bins = bins + feature;
-
     // zero shared memory
     for (int idx = threadIdx.x; idx < max_bins * n_eras; idx += blockDim.x) {
         shared_grad[idx] = 0.0f;
@@ -56,9 +57,9 @@ __global__ void histogram_kernel(
     __syncthreads();
 
     for (int row = threadIdx.x; row < n_rows; row += blockDim.x) {
-        const int era = era_inverse[row];
+        const int era = static_cast<int>(era_inverse[row]);
         if (era < 0 || era >= n_eras) continue;
-        const uint8_t bin = feature_bins[row * n_features];
+        const uint8_t bin = bins[row * n_features + feature];
         if (bin >= max_bins) continue;
         const int idx = bin * n_eras + era;
         atomicAdd(shared_grad + idx, gradients[row]);
@@ -82,7 +83,7 @@ void launch_histogram_kernel(
     const uint8_t* bins,
     const float* gradients,
     const float* hessians,
-    const int32_t* era_inverse,
+    const int16_t* era_inverse,
     int n_rows,
     int n_features,
     int max_bins,
@@ -92,7 +93,7 @@ void launch_histogram_kernel(
     int32_t* out_count) {
 
     const dim3 grid(n_features);
-    const int threads = 64; //256
+    const int threads = 256;
     const std::size_t shared = static_cast<std::size_t>(max_bins) * n_eras * (2 * sizeof(float) + sizeof(int32_t));
     histogram_kernel<<<grid, threads, shared>>>(
         bins, gradients, hessians, era_inverse,
@@ -107,7 +108,7 @@ HistogramBuffers build_histograms_cuda(
     const uint8_t* bins,
     const float* gradients,
     const float* hessians,
-    const int32_t* era_inverse,
+    const int16_t* era_inverse,
     std::size_t n_rows,
     std::size_t n_features,
     int max_bins,
@@ -115,7 +116,7 @@ HistogramBuffers build_histograms_cuda(
 
     const std::size_t row_bytes = n_rows * n_features * sizeof(uint8_t);
     const std::size_t vec_bytes = n_rows * sizeof(float);
-    const std::size_t era_bytes = n_rows * sizeof(int32_t);
+    const std::size_t era_bytes = n_rows * sizeof(int16_t);
     const std::size_t hist_size = n_features * max_bins * n_eras;
     const std::size_t hist_bytes_f = hist_size * sizeof(float);
     const std::size_t hist_bytes_i = hist_size * sizeof(int32_t);
@@ -123,7 +124,7 @@ HistogramBuffers build_histograms_cuda(
     uint8_t* d_bins = nullptr;
     float* d_grad = nullptr;
     float* d_hess = nullptr;
-    int32_t* d_era = nullptr;
+    int16_t* d_era = nullptr;
     float* d_out_grad = nullptr;
     float* d_out_hess = nullptr;
     int32_t* d_out_count = nullptr;
@@ -183,7 +184,7 @@ py::tuple cuda_histogram_binding(
     py::array_t<uint8_t, py::array::c_style | py::array::forcecast> bins,
     py::array_t<float, py::array::c_style | py::array::forcecast> gradients,
     py::array_t<float, py::array::c_style | py::array::forcecast> hessians,
-    py::array_t<int32_t, py::array::c_style | py::array::forcecast> era_inverse,
+    py::array_t<int16_t, py::array::c_style | py::array::forcecast> era_inverse,
     int max_bins,
     int n_eras) {
 
@@ -209,8 +210,17 @@ py::tuple cuda_histogram_binding(
         max_bins,
         n_eras);
 
-    return py::make_tuple(
-        py::array_t<float>({static_cast<ssize_t>(n_features), max_bins, n_eras}, std::move(buffers.grad)),
-        py::array_t<float>({static_cast<ssize_t>(n_features), max_bins, n_eras}, std::move(buffers.hess)),
-        py::array_t<int32_t>({static_cast<ssize_t>(n_features), max_bins, n_eras}, std::move(buffers.count)));
+    std::vector<py::ssize_t> shape = {
+        static_cast<py::ssize_t>(n_features),
+        static_cast<py::ssize_t>(max_bins),
+        static_cast<py::ssize_t>(n_eras),
+    };
+    py::array_t<float> grad_arr(shape);
+    py::array_t<float> hess_arr(shape);
+    py::array_t<int32_t> count_arr(shape);
+    std::memcpy(grad_arr.mutable_data(), buffers.grad.data(), buffers.grad.size() * sizeof(float));
+    std::memcpy(hess_arr.mutable_data(), buffers.hess.data(), buffers.hess.size() * sizeof(float));
+    std::memcpy(count_arr.mutable_data(), buffers.count.data(), buffers.count.size() * sizeof(int32_t));
+
+    return py::make_tuple(std::move(grad_arr), std::move(hess_arr), std::move(count_arr));
 }

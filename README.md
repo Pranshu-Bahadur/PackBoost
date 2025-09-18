@@ -12,8 +12,8 @@ across regime shifts.
   feature subsets.
 - **Directional Era Splitting (DES)** – score candidates with
   `mean − λ·std` across eras plus a directional agreement penalty.
-- **CPU & CUDA backends** – fast NumPy implementation out of the box, with an
-  optional CuPy-powered GPU path when a CUDA device is available.
+- **CPU & CUDA backends** – fast NumPy implementation out of the box, with
+  optional native C++/CUDA histogram builders for Murky-grade throughput.
 - **Deterministic by design** – quantile binning, seeded sampling, and pure
   functions keep runs reproducible.
 - **Friendly tooling** – scikit-learn compatible wrapper, standalone
@@ -24,8 +24,9 @@ across regime shifts.
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt  # create this if you use pinned deps
-pip install numpy scikit-learn lightgbm xgboost catboost
+git clone https://github.com/Pranshu-Bahadur/PackBoost.git
+cd PackBoost
+pip install -e .[cuda]  # add [cuda] if you plan to build on GPU
 ```
 
 ### Native backends
@@ -34,14 +35,14 @@ PackBoost ships optional C++/CUDA extensions that provide high-performance
 histogram builders. Build them with `pybind11` and a modern compiler:
 
 ```bash
-pip install pybind11
-python setup_native.py build_ext --inplace  # script provided in packboost/backends
+pip install pybind11 numpy
+python setup_native.py build_ext --inplace
 ```
 
-CUDA users need `nvcc` in `PATH`. The build script defines
-`PACKBOOST_ENABLE_CUDA` automatically when it detects CUDA headers. If the
-extension is not built PackBoost will fall back to the pure NumPy implementation
-(CPU only).
+CUDA users need `nvcc` in `PATH`. The build script detects it automatically and
+compiles the optimized kernel (`backend_cuda.cu`). Without CUDA the script still
+builds the fast multi-threaded CPU backend; if neither backend is built PackBoost
+falls back to the pure NumPy implementation.
 
 ## Quick Start
 
@@ -103,11 +104,10 @@ running the benchmark.
 A Colab-friendly notebook lives in `notebooks/numerai_gpu_demo.ipynb`. It
 illustrates how to:
 
-1. Install dependencies inside Colab
+1. Install dependencies inside Colab (including the native backend)
 2. Download the Numerai dataset via `numerapi`
-3. Bin features deterministically
-4. Train/evaluate PackBoost on CPU or GPU
-5. Upload diagnostics back to Numerai
+3. Train/evaluate PackBoost on CPU or GPU (Numerai features are already binned)
+4. Upload diagnostics back to Numerai
 
 Open the notebook in Google Colab and follow the step-by-step cells.
 

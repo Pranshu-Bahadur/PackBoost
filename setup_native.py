@@ -1,43 +1,82 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 from shutil import which
 
 from pybind11.setup_helpers import Pybind11Extension, build_ext
 from setuptools import setup
 
+try:
+    import pybind11
+except ImportError as exc:  # pragma: no cover
+    raise SystemExit("pybind11 is required: pip install pybind11") from exc
+
+try:
+    import numpy as np
+except ImportError as exc:  # pragma: no cover
+    raise SystemExit("numpy is required: pip install numpy") from exc
+
 ROOT = Path(__file__).parent
 SRC_DIR = ROOT / "packboost" / "backends" / "src"
 
-sources = [str(SRC_DIR / "backend_cpu.cpp")]
-macros = []
-extra_compile_args = {"cxx": ["-O3", "-std=c++17", "-fvisibility=hidden"]}
-extra_link_args: list[str] = []
+CPU_SOURCES = [str(SRC_DIR / "backend_cpu.cpp")]
+CUDA_SOURCE = SRC_DIR / "backend_cuda.cu"
 
 NVCC = which("nvcc")
-if NVCC and os.environ.get("PACKBOOST_DISABLE_CUDA") != "1":
-    sources.append(str(SRC_DIR / "backend_cuda.cu"))
-    macros.append(("PACKBOOST_ENABLE_CUDA", "1"))
-    extra_compile_args["nvcc"] = [
-        "-O3",
-        "-arch=sm_70",
+ENABLE_CUDA = NVCC and os.environ.get("PACKBOOST_DISABLE_CUDA") != "1"
+
+macros: list[tuple[str, str | None]] = []
+extra_objects: list[str] = []
+
+if ENABLE_CUDA:
+    build_temp = ROOT / "build" / "temp"
+    build_temp.mkdir(parents=True, exist_ok=True)
+    cuda_obj = build_temp / "backend_cuda.o"
+    include_dirs = [
+        pybind11.get_include(),
+        pybind11.get_include(user=True),
+        sysconfig.get_paths()["include"],
+        np.get_include(),
+        str(SRC_DIR),
+    ]
+    cmd = [
+        NVCC,
         "-std=c++17",
+        "-O3",
         "-Xcompiler",
         "-fPIC",
+        "-arch=sm_70",
+        "-c",
+        str(CUDA_SOURCE),
+        "-o",
+        str(cuda_obj),
     ]
+    for inc in include_dirs:
+        cmd.extend(["-I", inc])
+    cmd.extend(["-DPACKBOOST_ENABLE_CUDA=1"])
+    print("[setup_native] compiling CUDA backend:", " ".join(cmd))
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError as exc:  # pragma: no cover
+        raise SystemExit(f"nvcc failed with exit code {exc.returncode}") from exc
+    macros.append(("PACKBOOST_ENABLE_CUDA", "1"))
+    extra_objects.append(str(cuda_obj))
 else:
     sys.stderr.write("[setup_native] CUDA compiler not found – building CPU backend only\n")
 
 ext_modules = [
     Pybind11Extension(
         "packboost._backend",
-        sources,
+        CPU_SOURCES,
         define_macros=macros,
-        extra_compile_args=extra_compile_args,
-        extra_link_args=extra_link_args,
-        include_dirs=[str(SRC_DIR)],
+        include_dirs=[str(SRC_DIR), np.get_include()],
+        extra_compile_args=["-O3", "-std=c++17", "-fvisibility=hidden", "-fopenmp"],
+        extra_link_args=["-fopenmp"],
+        extra_objects=extra_objects,
     )
 ]
 

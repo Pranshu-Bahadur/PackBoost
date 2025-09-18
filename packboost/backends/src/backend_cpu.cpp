@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 
 #if defined(_OPENMP)
@@ -19,7 +20,7 @@ HistogramBuffers build_histograms_cpu(
     const uint8_t* bins,
     const float* gradients,
     const float* hessians,
-    const int32_t* era_inverse,
+    const int16_t* era_inverse,
     std::size_t n_rows,
     std::size_t n_features,
     int max_bins,
@@ -33,36 +34,27 @@ HistogramBuffers build_histograms_cpu(
 
     const std::size_t feat_stride = static_cast<std::size_t>(max_bins) * n_eras;
 
-#pragma omp parallel for if(n_features > 1)
+#pragma omp parallel for schedule(static)
     for (std::size_t feature = 0; feature < n_features; ++feature) {
-        const uint8_t* feature_bins = bins + feature;
-        std::vector<float> thread_grad(feat_stride, 0.0f);
-        std::vector<float> thread_hess(feat_stride, 0.0f);
-        std::vector<int32_t> thread_count(feat_stride, 0);
-
-        for (std::size_t row = 0; row < n_rows; ++row) {
-            const int32_t era = era_inverse[row];
-            if (era < 0 || era >= n_eras) {
-                continue;
-            }
-            const uint8_t bin = feature_bins[row * n_features];
-            if (bin >= max_bins) {
-                continue;
-            }
-            const std::size_t idx = static_cast<std::size_t>(bin) * n_eras + era;
-            thread_grad[idx] += gradients[row];
-            thread_hess[idx] += hessians[row];
-            thread_count[idx] += 1;
-        }
-
         float* grad_out = buffers.grad.data() + feature * feat_stride;
         float* hess_out = buffers.hess.data() + feature * feat_stride;
         int32_t* count_out = buffers.count.data() + feature * feat_stride;
 
-        for (std::size_t i = 0; i < feat_stride; ++i) {
-            grad_out[i] += thread_grad[i];
-            hess_out[i] += thread_hess[i];
-            count_out[i] += thread_count[i];
+        for (std::size_t row = 0; row < n_rows; ++row) {
+            const int era = static_cast<int>(era_inverse[row]);
+            if (era < 0 || era >= n_eras) {
+                continue;
+            }
+            const uint8_t bin = bins[row * n_features + feature];
+            if (bin >= max_bins) {
+                continue;
+            }
+            const std::size_t idx = static_cast<std::size_t>(bin) * n_eras + era;
+            const float grad = gradients[row];
+            const float hess = hessians[row];
+            grad_out[idx] += grad;
+            hess_out[idx] += hess;
+            count_out[idx] += 1;
         }
     }
 
@@ -81,19 +73,33 @@ static void check_contiguous(const py::buffer_info& info, const char* name) {
     }
 }
 
-static py::array_t<float> make_array_float(std::vector<float>&& data, std::size_t n_features, int max_bins, int n_eras) {
-    return py::array_t<float>({static_cast<ssize_t>(n_features), max_bins, n_eras}, std::move(data));
+static py::array_t<float> make_array_float(const std::vector<float>& data, std::size_t n_features, int max_bins, int n_eras) {
+    std::vector<py::ssize_t> shape = {
+        static_cast<py::ssize_t>(n_features),
+        static_cast<py::ssize_t>(max_bins),
+        static_cast<py::ssize_t>(n_eras),
+    };
+    py::array_t<float> arr(shape);
+    std::memcpy(arr.mutable_data(), data.data(), data.size() * sizeof(float));
+    return arr;
 }
 
-static py::array_t<int32_t> make_array_int(std::vector<int32_t>&& data, std::size_t n_features, int max_bins, int n_eras) {
-    return py::array_t<int32_t>({static_cast<ssize_t>(n_features), max_bins, n_eras}, std::move(data));
+static py::array_t<int32_t> make_array_int(const std::vector<int32_t>& data, std::size_t n_features, int max_bins, int n_eras) {
+    std::vector<py::ssize_t> shape = {
+        static_cast<py::ssize_t>(n_features),
+        static_cast<py::ssize_t>(max_bins),
+        static_cast<py::ssize_t>(n_eras),
+    };
+    py::array_t<int32_t> arr(shape);
+    std::memcpy(arr.mutable_data(), data.data(), data.size() * sizeof(int32_t));
+    return arr;
 }
 
 static py::tuple cpu_histogram_binding(
     py::array_t<uint8_t, py::array::c_style | py::array::forcecast> bins,
     py::array_t<float, py::array::c_style | py::array::forcecast> gradients,
     py::array_t<float, py::array::c_style | py::array::forcecast> hessians,
-    py::array_t<int32_t, py::array::c_style | py::array::forcecast> era_inverse,
+    py::array_t<int16_t, py::array::c_style | py::array::forcecast> era_inverse,
     int max_bins,
     int n_eras) {
 
@@ -117,16 +123,16 @@ static py::tuple cpu_histogram_binding(
         static_cast<uint8_t*>(bins_info.ptr),
         static_cast<float*>(grad_info.ptr),
         static_cast<float*>(hess_info.ptr),
-        static_cast<int32_t*>(era_info.ptr),
+        static_cast<int16_t*>(era_info.ptr),
         n_rows,
         n_features,
         max_bins,
         n_eras);
 
     return py::make_tuple(
-        make_array_float(std::move(buffers.grad), n_features, max_bins, n_eras),
-        make_array_float(std::move(buffers.hess), n_features, max_bins, n_eras),
-        make_array_int(std::move(buffers.count), n_features, max_bins, n_eras));
+        make_array_float(buffers.grad, n_features, max_bins, n_eras),
+        make_array_float(buffers.hess, n_features, max_bins, n_eras),
+        make_array_int(buffers.count, n_features, max_bins, n_eras));
 }
 
 // Forward declaration for the optional CUDA binding (implemented in backend_cuda.cu)

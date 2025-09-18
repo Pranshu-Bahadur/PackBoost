@@ -202,10 +202,10 @@ class _CPUHistogramEvaluator:
         era_ids: np.ndarray,
         config: PackBoostConfig,
     ) -> None:
-        self.X_binned = X_binned
+        self.X_binned = X_binned.astype(np.uint8, copy=False)
         self.gradients = gradients
         self.hessians = hessians
-        self.era_ids = era_ids
+        self.era_ids = era_ids.astype(np.int16, copy=False)
         self.config = config
 
     def evaluate(self, node_indices: np.ndarray, features: Iterable[int]) -> SplitDecision:
@@ -213,7 +213,7 @@ class _CPUHistogramEvaluator:
             return _empty_decision(node_indices)
 
         features_arr = np.array(list(features), dtype=np.int32)
-        node_bins = self.X_binned[np.ix_(node_indices, features_arr)]
+        node_bins = self.X_binned[np.ix_(node_indices, features_arr)].astype(np.uint8, copy=False)
         gradients_node = self.gradients[node_indices]
         hessians_node = self.hessians[node_indices]
 
@@ -221,6 +221,8 @@ class _CPUHistogramEvaluator:
         n_eras = unique_eras.size
         if n_eras == 0:
             return _empty_decision(node_indices)
+
+        era_inverse = era_inverse.astype(np.int16, copy=False)
 
         max_bins = self.config.max_bins
         if cpu_histogram is not None:
@@ -238,9 +240,10 @@ class _CPUHistogramEvaluator:
             hist_count = np.zeros((features_arr.size, max_bins, n_eras), dtype=np.int32)
 
             flat_multiplier = n_eras
+            era_inv32 = era_inverse.astype(np.int32, copy=False)
             for feature_idx in range(features_arr.size):
-                feature_bins = node_bins[:, feature_idx].astype(np.int32)
-                keys = feature_bins * flat_multiplier + era_inverse
+                feature_bins = node_bins[:, feature_idx].astype(np.int32, copy=False)
+                keys = feature_bins * flat_multiplier + era_inv32
 
                 grad_flat = np.bincount(
                     keys,
