@@ -8,6 +8,7 @@ from typing import Iterable, Optional
 import numpy as np
 
 from .config import PackBoostConfig
+from .backends import cpu_histogram
 
 
 @dataclass
@@ -222,31 +223,40 @@ class _CPUHistogramEvaluator:
             return _empty_decision(node_indices)
 
         max_bins = self.config.max_bins
-        hist_grad = np.zeros((features_arr.size, max_bins, n_eras), dtype=np.float32)
-        hist_hess = np.zeros_like(hist_grad)
-        hist_count = np.zeros((features_arr.size, max_bins, n_eras), dtype=np.int32)
-
-        # vectorised accumulation using bincount per feature
-        flat_multiplier = n_eras
-        for feature_idx in range(features_arr.size):
-            feature_bins = node_bins[:, feature_idx].astype(np.int32)
-            keys = feature_bins * flat_multiplier + era_inverse
-
-            grad_flat = np.bincount(
-                keys,
-                weights=gradients_node,
-                minlength=max_bins * n_eras,
+        if cpu_histogram is not None:
+            hist_grad, hist_hess, hist_count = cpu_histogram(
+                node_bins,
+                gradients_node,
+                hessians_node,
+                era_inverse,
+                max_bins,
+                n_eras,
             )
-            hess_flat = np.bincount(
-                keys,
-                weights=hessians_node,
-                minlength=max_bins * n_eras,
-            )
-            count_flat = np.bincount(keys, minlength=max_bins * n_eras)
+        else:
+            hist_grad = np.zeros((features_arr.size, max_bins, n_eras), dtype=np.float32)
+            hist_hess = np.zeros_like(hist_grad)
+            hist_count = np.zeros((features_arr.size, max_bins, n_eras), dtype=np.int32)
 
-            hist_grad[feature_idx] = grad_flat.reshape(max_bins, n_eras)
-            hist_hess[feature_idx] = hess_flat.reshape(max_bins, n_eras)
-            hist_count[feature_idx] = count_flat.reshape(max_bins, n_eras)
+            flat_multiplier = n_eras
+            for feature_idx in range(features_arr.size):
+                feature_bins = node_bins[:, feature_idx].astype(np.int32)
+                keys = feature_bins * flat_multiplier + era_inverse
+
+                grad_flat = np.bincount(
+                    keys,
+                    weights=gradients_node,
+                    minlength=max_bins * n_eras,
+                )
+                hess_flat = np.bincount(
+                    keys,
+                    weights=hessians_node,
+                    minlength=max_bins * n_eras,
+                )
+                count_flat = np.bincount(keys, minlength=max_bins * n_eras)
+
+                hist_grad[feature_idx] = grad_flat.reshape(max_bins, n_eras)
+                hist_hess[feature_idx] = hess_flat.reshape(max_bins, n_eras)
+                hist_count[feature_idx] = count_flat.reshape(max_bins, n_eras)
 
         return _score_from_histograms(
             features=features_arr,

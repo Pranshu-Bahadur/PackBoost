@@ -1,6 +1,6 @@
 # PackBoost
 
-PackBoost is a fast, era-aware gradient boosting library that marries Murky's
+PackBoost is a fast, era-aware gradient boosting library that combines Murky's
 ExtraFastBooster design with the Directional Era Splitting (DES) criterion.
 It grows *packs* of shallow trees layer-parallel, samples features per depth,
 and scores splits using era-bucketed robust gains so that models stay stable
@@ -28,13 +28,20 @@ pip install -r requirements.txt  # create this if you use pinned deps
 pip install numpy scikit-learn lightgbm xgboost catboost
 ```
 
-To enable GPU acceleration install CuPy compiled for your CUDA toolkit, e.g.:
+### Native backends
+
+PackBoost ships optional C++/CUDA extensions that provide high-performance
+histogram builders. Build them with `pybind11` and a modern compiler:
 
 ```bash
-pip install cupy-cuda12x  # replace with the wheel matching your CUDA version
+pip install pybind11
+python setup_native.py build_ext --inplace  # script provided in packboost/backends
 ```
 
-If CuPy or a GPU is not present PackBoost will fall back to the CPU backend.
+CUDA users need `nvcc` in `PATH`. The build script defines
+`PACKBOOST_ENABLE_CUDA` automatically when it detects CUDA headers. If the
+extension is not built PackBoost will fall back to the pure NumPy implementation
+(CPU only).
 
 ## Quick Start
 

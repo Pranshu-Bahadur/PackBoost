@@ -7,17 +7,10 @@ from typing import Dict, Iterable, List, Sequence
 import numpy as np
 
 from .config import PackBoostConfig
-from .des import SplitDecision, evaluate_node_split
-
-try:  # optional GPU backend
-    from .gpu import evaluate_node_split_gpu, has_cuda
-except ImportError:  # pragma: no cover - optional dependency
-    evaluate_node_split_gpu = None
-
-    def has_cuda() -> bool:  # type: ignore[override]
-        return False
+from .des import SplitDecision, evaluate_node_split, evaluate_node_split_from_hist
 from .model import PackBoostModel, Tree, TreeNode
 from .utils.binning import apply_binning, quantile_binning
+from .backends import cuda_available, cuda_histogram
 
 
 class PackBoost:
@@ -56,7 +49,7 @@ class PackBoost:
 
         if self.config.device == "cuda" and not self._should_use_gpu():
             raise RuntimeError(
-                "CUDA device requested but CuPy is not available or no GPU detected."
+                "CUDA device requested but the native CUDA backend is not available."
             )
         self._use_gpu = self._should_use_gpu()
 
@@ -214,15 +207,14 @@ class PackBoost:
         node_indices: np.ndarray,
         features: Iterable[int],
     ) -> SplitDecision:
-        if self._use_gpu and evaluate_node_split_gpu is not None:
-            return evaluate_node_split_gpu(
+        if self._use_gpu:
+            return self._evaluate_node_gpu(
                 X_binned=X_binned,
                 gradients=gradients,
                 hessians=hessians,
                 era_ids=era_ids,
                 node_indices=node_indices,
                 features=features,
-                config=self.config,
             )
         return evaluate_node_split(
             X_binned=X_binned,
@@ -234,5 +226,57 @@ class PackBoost:
             config=self.config,
         )
 
+    def _evaluate_node_gpu(
+        self,
+        *,
+        X_binned: np.ndarray,
+        gradients: np.ndarray,
+        hessians: np.ndarray,
+        era_ids: np.ndarray,
+        node_indices: np.ndarray,
+        features: Iterable[int],
+    ) -> SplitDecision:
+        if cuda_histogram is None:
+            raise RuntimeError("CUDA backend is not available")
+
+        features_arr = np.array(list(features), dtype=np.int32)
+        node_bins = X_binned[np.ix_(node_indices, features_arr)]
+        gradients_node = gradients[node_indices]
+        hessians_node = hessians[node_indices]
+        unique_eras, era_inverse = np.unique(era_ids[node_indices], return_inverse=True)
+        n_eras = unique_eras.size
+        if n_eras == 0:
+            return SplitDecision(
+                feature=None,
+                threshold=None,
+                score=float("-inf"),
+                direction_agreement=0.0,
+                left_value=0.0,
+                right_value=0.0,
+                left_indices=node_indices,
+                right_indices=np.array([], dtype=np.int32),
+            )
+
+        hist_grad, hist_hess, hist_count = cuda_histogram(
+            node_bins,
+            gradients_node,
+            hessians_node,
+            era_inverse,
+            self.config.max_bins,
+            n_eras,
+        )
+
+        return evaluate_node_split_from_hist(
+            features=features_arr,
+            node_indices=node_indices,
+            node_bins=node_bins,
+            gradients=gradients,
+            hessians=hessians,
+            config=self.config,
+            hist_grad=hist_grad,
+            hist_hess=hist_hess,
+            hist_count=hist_count,
+        )
+
     def _should_use_gpu(self) -> bool:
-        return self.config.device == "cuda" and evaluate_node_split_gpu is not None and has_cuda()
+        return self.config.device == "cuda" and cuda_available()

@@ -6,6 +6,7 @@ __pycache__/
 # Build directories
 dist/
 build/
+packboost/_backend.*
 *.egg-info/
 
 # Virtual environments
