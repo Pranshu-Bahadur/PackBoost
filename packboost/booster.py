@@ -7,10 +7,10 @@ from typing import Dict, Iterable, List, Sequence
 import numpy as np
 
 from .config import PackBoostConfig
-from .des import SplitDecision, evaluate_frontier, evaluate_node_split, evaluate_node_split_from_hist, _score_from_histograms
+from .des import SplitDecision, evaluate_frontier, evaluate_node_split, evaluate_node_split_from_hist
 from .model import PackBoostModel, Tree, TreeNode
 from .utils.binning import apply_binning, quantile_binning
-from .backends import cpu_available, cpu_frontier_histogram, cuda_available, cuda_histogram
+from .backends import cpu_available, cpu_frontier_evaluate, cuda_available, cuda_histogram
 
 
 class PackBoost:
@@ -255,7 +255,7 @@ class PackBoost:
         indices = batch["indices"]  # type: ignore[index]
         offsets = batch["offsets"]  # type: ignore[index]
 
-        if cpu_frontier_histogram is None:
+        if cpu_frontier_evaluate is None:
             return evaluate_frontier(
                 X_binned=X_binned,
                 gradients=gradients,
@@ -278,7 +278,21 @@ class PackBoost:
                 config=self.config,
             )
 
-        hist_grad, hist_hess, hist_count = cpu_frontier_histogram(
+        features_arr = features_arr.astype(np.int32, copy=False)
+
+        (
+            features_native,
+            thresholds,
+            scores,
+            agreements,
+            left_vals,
+            right_vals,
+            base_vals,
+            left_offsets,
+            right_offsets,
+            left_indices_flat,
+            right_indices_flat,
+        ) = cpu_frontier_evaluate(
             X_binned,
             indices,
             offsets,
@@ -288,31 +302,35 @@ class PackBoost:
             era_ids,
             self.config.max_bins,
             self._num_eras or int(era_ids.max() + 1),
-        )
-
-        scores = _score_from_histograms(
-            hist_grad=hist_grad,
-            hist_hess=hist_hess,
-            hist_count=hist_count,
-            config=self.config,
-            lambda_l2=self.config.lambda_l2,
-            min_leaf=self.config.min_samples_leaf,
+            self.config.lambda_l2,
+            self.config.lambda_dro,
+            self.config.min_samples_leaf,
+            self.config.direction_weight,
         )
 
         decisions: List[SplitDecision] = []
         for idx, samples_arr in enumerate(node_samples):
-            best_feature = int(scores["feature"][idx])
-            threshold = int(scores["threshold"][idx])
-            score = float(scores["score"][idx])
-            agreement = float(scores["agreement"][idx])
-            left_value = float(scores["left_value"][idx])
-            right_value = float(scores["right_value"][idx])
-            base_value = float(scores["base_value"][idx])
+            best_feature = int(features_native[idx])
+            threshold = int(thresholds[idx])
+            score = float(scores[idx])
+            agreement = float(agreements[idx])
+            left_value = float(left_vals[idx])
+            right_value = float(right_vals[idx])
+            base_value = float(base_vals[idx])
+
+            left_start = int(left_offsets[idx])
+            left_end = int(left_offsets[idx + 1])
+            right_start = int(right_offsets[idx])
+            right_end = int(right_offsets[idx + 1])
+
+            left_indices = left_indices_flat[left_start:left_end].astype(np.int32, copy=False)
+            right_indices = right_indices_flat[right_start:right_end].astype(np.int32, copy=False)
 
             if (
                 best_feature < 0
                 or score <= 0
-                or samples_arr.size == 0
+                or left_indices.size == 0
+                or right_indices.size == 0
             ):
                 decisions.append(
                     SplitDecision(
@@ -327,12 +345,6 @@ class PackBoost:
                     )
                 )
                 continue
-
-            feature_idx = int(features_arr[best_feature])
-            node_bins = X_binned[samples_arr, feature_idx]
-            left_mask = node_bins <= threshold
-            left_indices = samples_arr[left_mask]
-            right_indices = samples_arr[~left_mask]
 
             if (
                 left_indices.size < self.config.min_samples_leaf
@@ -353,7 +365,7 @@ class PackBoost:
             else:
                 decisions.append(
                     SplitDecision(
-                        feature=feature_idx,
+                        feature=best_feature,
                         threshold=threshold,
                         score=score,
                         direction_agreement=agreement,

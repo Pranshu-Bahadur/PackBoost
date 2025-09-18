@@ -2,8 +2,10 @@ import unittest
 
 import numpy as np
 
+from packboost.booster import PackBoost
+from packboost.backends import cpu_frontier_evaluate
 from packboost.config import PackBoostConfig
-from packboost.des import evaluate_node_split
+from packboost.des import evaluate_frontier, evaluate_node_split
 
 
 class DESTest(unittest.TestCase):
@@ -87,6 +89,78 @@ class DESTest(unittest.TestCase):
         )
 
         self.assertLess(decision.score, 0.5)
+
+    def test_cpu_frontier_evaluate_matches_python_partitions(self) -> None:
+        if cpu_frontier_evaluate is None:
+            self.skipTest("cpu_frontier_evaluate unavailable")
+
+        X_binned = np.array(
+            [
+                [0, 1],
+                [1, 1],
+                [0, 0],
+                [1, 0],
+                [0, 1],
+                [1, 0],
+            ],
+            dtype=np.uint8,
+        )
+        gradients = np.array([-2.0, 2.5, -1.5, 1.0, -0.5, 0.5], dtype=np.float32)
+        hessians = np.ones_like(gradients)
+        era_ids = np.array([0, 0, 1, 1, 2, 2], dtype=np.int16)
+
+        config = PackBoostConfig(
+            pack_size=1,
+            max_depth=2,
+            learning_rate=0.1,
+            lambda_l2=0.0,
+            lambda_dro=0.0,
+            min_samples_leaf=1,
+            max_bins=4,
+            random_state=0,
+            layer_feature_fraction=1.0,
+            direction_weight=0.0,
+            era_tile_size=2,
+        )
+
+        node_samples = [
+            np.array([0, 1, 2], dtype=np.int32),
+            np.array([3, 4, 5], dtype=np.int32),
+        ]
+        feature_subset = np.array([0, 1], dtype=np.int32)
+
+        booster = PackBoost(config)
+        booster._num_eras = int(era_ids.max()) + 1
+
+        batch = booster._prepare_frontier_batch(node_samples)  # type: ignore[attr-defined]
+        native_decisions = booster._evaluate_frontier_batch(
+            X_binned=X_binned,
+            gradients=gradients,
+            hessians=hessians,
+            era_ids=era_ids,
+            batch=batch,
+            features=feature_subset,
+        )
+
+        python_decisions = evaluate_frontier(
+            X_binned=X_binned,
+            gradients=gradients,
+            hessians=hessians,
+            era_ids=era_ids,
+            node_indices_list=node_samples,
+            features=feature_subset,
+            config=config,
+        )
+
+        for native, python_decision in zip(native_decisions, python_decisions):
+            self.assertEqual(native.feature, python_decision.feature)
+            self.assertEqual(native.threshold, python_decision.threshold)
+            self.assertAlmostEqual(native.score, python_decision.score, places=6)
+            self.assertAlmostEqual(native.direction_agreement, python_decision.direction_agreement, places=6)
+            self.assertAlmostEqual(native.left_value, python_decision.left_value, places=6)
+            self.assertAlmostEqual(native.right_value, python_decision.right_value, places=6)
+            np.testing.assert_array_equal(native.left_indices, python_decision.left_indices)
+            np.testing.assert_array_equal(native.right_indices, python_decision.right_indices)
 
 
 if __name__ == "__main__":
