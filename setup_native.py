@@ -27,6 +27,10 @@ CPU_SOURCES = [str(SRC_DIR / "backend_cpu.cpp")]
 CUDA_SOURCE = SRC_DIR / "backend_cuda.cu"
 
 NVCC = which("nvcc")
+if not NVCC:
+    default_nvcc = Path("/usr/local/cuda/bin/nvcc")
+    if default_nvcc.exists():
+        NVCC = str(default_nvcc)
 ENABLE_CUDA = NVCC and os.environ.get("PACKBOOST_DISABLE_CUDA") != "1"
 
 macros: list[tuple[str, str | None]] = []

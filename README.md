@@ -28,6 +28,7 @@ source .venv/bin/activate
 git clone https://github.com/Pranshu-Bahadur/PackBoost.git
 cd PackBoost
 pip install -e .[cuda]  # add [cuda] if you plan to build on GPU
+# Optionally include [numerai] to install Numerai notebook dependencies
 ```
 
 ### Native backends
@@ -113,7 +114,9 @@ illustrates how to:
 3. Train/evaluate PackBoost on CPU or GPU (Numerai features are already binned)
 4. Upload diagnostics back to Numerai
 
-Open the notebook in Google Colab and follow the step-by-step cells.
+Open the notebook in Google Colab and follow the step-by-step cells. For a local
+run, install the optional extras with `pip install -e .[numerai]` to pull in
+`numerapi`, `pyarrow`, and related dependencies.
 
 ## Testing
 

@@ -70,8 +70,8 @@ class PackBoostConfig:
             raise ValueError("lambda_dro must be non-negative")
         if self.min_samples_leaf <= 0:
             raise ValueError("min_samples_leaf must be positive")
-        if not (8 <= self.max_bins <= 255):
-            raise ValueError("max_bins must be in [8, 255]")
+        if not (2 <= self.max_bins <= 255):
+            raise ValueError("max_bins must be in [2, 255]")
         if not (0 < self.layer_feature_fraction <= 1):
             raise ValueError("layer_feature_fraction must be in (0, 1]")
         if not (0 <= self.direction_weight <= 1):
