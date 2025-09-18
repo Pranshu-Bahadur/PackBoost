@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable, List
 
 import numpy as np
+import pandas as pd
 from sklearn.datasets import make_regression
 from sklearn.metrics import r2_score
 from sklearn.model_selection import train_test_split
@@ -93,6 +94,9 @@ if __name__ == "__main__":
     X_train, X_test, y_train, y_test, era_train, era_test = train_test_split(
         X, y, era, test_size=0.2, random_state=SEED
     )
+    feature_names = [f"f{i}" for i in range(X_train.shape[1])]
+    X_train_df = pd.DataFrame(X_train, columns=feature_names)
+    X_test_df = pd.DataFrame(X_test, columns=feature_names)
 
     results: List[BenchmarkResult] = []
 
@@ -160,8 +164,8 @@ if __name__ == "__main__":
     results.append(
         benchmark(
             "LightGBM",
-            lambda: lgbm.fit(X_train, y_train),
-            lambda: lgbm.predict(X_test),
+            lambda: lgbm.fit(X_train_df, y_train),
+            lambda: lgbm.predict(X_test_df),
             y_test,
         )
     )

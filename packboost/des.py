@@ -1,4 +1,4 @@
-"""Directional era splitting (DES) scoring utilities."""
+"""Directional era splitting (DES) utilities."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from .config import PackBoostConfig
 
 @dataclass
 class SplitDecision:
-    """Best split metadata for a node."""
+    """Container describing the best split for a node."""
 
     feature: Optional[int]
     threshold: Optional[int]
@@ -22,6 +22,11 @@ class SplitDecision:
     right_value: float
     left_indices: np.ndarray
     right_indices: np.ndarray
+
+
+# ---------------------------------------------------------------------------
+# Public CPU interface
+# ---------------------------------------------------------------------------
 
 
 def evaluate_node_split(
@@ -34,117 +39,14 @@ def evaluate_node_split(
     features: Iterable[int],
     config: PackBoostConfig,
 ) -> SplitDecision:
-    """Return the DES-optimal split for ``node_indices``."""
-    if node_indices.size == 0:
-        return _empty_decision(node_indices)
+    """Return the DES-optimal split for ``node_indices`` using the CPU backend."""
+    evaluator = _CPUHistogramEvaluator(X_binned, gradients, hessians, era_ids, config)
+    return evaluator.evaluate(node_indices=node_indices, features=features)
 
-    lambda_l2 = config.lambda_l2
-    min_leaf = config.min_samples_leaf
 
-    total_grad = gradients[node_indices].sum()
-    total_hess = hessians[node_indices].sum()
-    base_value = -total_grad / (total_hess + lambda_l2)
-
-    best = SplitDecision(
-        feature=None,
-        threshold=None,
-        score=float("-inf"),
-        direction_agreement=0.0,
-        left_value=base_value,
-        right_value=base_value,
-        left_indices=node_indices,
-        right_indices=np.array([], dtype=np.int32),
-    )
-
-    unique_eras = np.unique(era_ids[node_indices])
-    if unique_eras.size == 0:
-        return best
-
-    thresholds = np.arange(0, config.max_bins - 1, dtype=np.int32)
-    for feature in features:
-        bins = X_binned[node_indices, feature]
-        gain_sum = np.zeros_like(thresholds, dtype=np.float64)
-        gain_sumsq = np.zeros_like(thresholds, dtype=np.float64)
-        gain_count = np.zeros_like(thresholds, dtype=np.int32)
-        dir_sum = np.zeros_like(thresholds, dtype=np.float64)
-        dir_count = np.zeros_like(thresholds, dtype=np.int32)
-
-        for start in range(0, unique_eras.size, config.era_tile_size):
-            era_tile = unique_eras[start : start + config.era_tile_size]
-            for era in era_tile:
-                mask = era_ids[node_indices] == era
-                if not np.any(mask):
-                    continue
-                era_bins = bins[mask]
-                grad = gradients[node_indices][mask]
-                hess = hessians[node_indices][mask]
-
-                counts = np.bincount(era_bins, minlength=config.max_bins)
-                grad_sum = np.bincount(era_bins, weights=grad, minlength=config.max_bins)
-                hess_sum = np.bincount(era_bins, weights=hess, minlength=config.max_bins)
-
-                if counts.sum() < 2 * min_leaf:
-                    continue
-
-                prefix_grad = np.cumsum(grad_sum[:-1])
-                prefix_hess = np.cumsum(hess_sum[:-1])
-                prefix_count = np.cumsum(counts[:-1])
-
-                total_grad = grad_sum.sum()
-                total_hess = hess_sum.sum()
-                total_count = counts.sum()
-
-                suffix_grad = total_grad - prefix_grad
-                suffix_hess = total_hess - prefix_hess
-                suffix_count = total_count - prefix_count
-
-                parent_score = 0.5 * (total_grad ** 2) / (total_hess + lambda_l2)
-
-                for t_idx, threshold in enumerate(thresholds):
-                    left_count = prefix_count[t_idx]
-                    right_count = suffix_count[t_idx]
-                    if left_count < min_leaf or right_count < min_leaf:
-                        continue
-
-                    g_left = prefix_grad[t_idx]
-                    g_right = suffix_grad[t_idx]
-                    h_left = prefix_hess[t_idx]
-                    h_right = suffix_hess[t_idx]
-
-                    gain_left = 0.5 * (g_left ** 2) / (h_left + lambda_l2)
-                    gain_right = 0.5 * (g_right ** 2) / (h_right + lambda_l2)
-                    gain = gain_left + gain_right - parent_score
-
-                    if not np.isfinite(gain):
-                        continue
-
-                    gain_sum[t_idx] += gain
-                    gain_sumsq[t_idx] += gain * gain
-                    gain_count[t_idx] += 1
-
-                    v_left = -g_left / (h_left + lambda_l2)
-                    v_right = -g_right / (h_right + lambda_l2)
-                    dir_sum[t_idx] += 1.0 if v_left >= v_right else -1.0
-                    dir_count[t_idx] += 1
-
-        best = _update_best_split(
-            best=best,
-            feature=feature,
-            thresholds=thresholds,
-            gain_sum=gain_sum,
-            gain_sumsq=gain_sumsq,
-            gain_count=gain_count,
-            dir_sum=dir_sum,
-            dir_count=dir_count,
-            bins=bins,
-            gradients=gradients,
-            hessians=hessians,
-            node_indices=node_indices,
-            lambda_l2=lambda_l2,
-            config=config,
-        )
-
-    return best
+# ---------------------------------------------------------------------------
+# Shared helpers (CPU & GPU)
+# ---------------------------------------------------------------------------
 
 
 def _empty_decision(node_indices: np.ndarray) -> SplitDecision:
@@ -160,58 +62,234 @@ def _empty_decision(node_indices: np.ndarray) -> SplitDecision:
     )
 
 
-def _update_best_split(
+def _score_from_histograms(
     *,
-    best: SplitDecision,
-    feature: int,
-    thresholds: np.ndarray,
-    gain_sum: np.ndarray,
-    gain_sumsq: np.ndarray,
-    gain_count: np.ndarray,
-    dir_sum: np.ndarray,
-    dir_count: np.ndarray,
-    bins: np.ndarray,
+    features: np.ndarray,
+    node_indices: np.ndarray,
+    node_bins: np.ndarray,
     gradients: np.ndarray,
     hessians: np.ndarray,
-    node_indices: np.ndarray,
-    lambda_l2: float,
     config: PackBoostConfig,
+    hist_grad: np.ndarray,
+    hist_hess: np.ndarray,
+    hist_count: np.ndarray,
 ) -> SplitDecision:
-    for t_idx, threshold in enumerate(thresholds):
-        count = gain_count[t_idx]
-        if count == 0:
-            continue
-        mean = gain_sum[t_idx] / count
-        variance = max(gain_sumsq[t_idx] / count - mean * mean, 0.0)
-        std = variance ** 0.5
-        dro_score = mean - config.lambda_dro * std
-        agreement = abs(dir_sum[t_idx]) / dir_count[t_idx] if dir_count[t_idx] else 0.0
-        final_score = dro_score + config.direction_weight * agreement
+    """Select the best split from pre-computed histograms."""
+    if node_indices.size == 0:
+        return _empty_decision(node_indices)
 
-        if final_score <= best.score:
-            continue
+    lambda_l2 = config.lambda_l2
+    min_leaf = config.min_samples_leaf
 
-        left_mask = bins <= threshold
-        right_mask = ~left_mask
-        left_indices = node_indices[left_mask]
-        right_indices = node_indices[right_mask]
+    n_features, max_bins, n_eras = hist_grad.shape
+    if n_eras == 0:
+        return _empty_decision(node_indices)
 
-        g_left_total = gradients[left_indices].sum()
-        h_left_total = hessians[left_indices].sum()
-        g_right_total = gradients[right_indices].sum()
-        h_right_total = hessians[right_indices].sum()
+    # Prefix sums across bins (axis=1) for left child statistics
+    prefix_grad = np.cumsum(hist_grad, axis=1)[:, :-1, :]
+    prefix_hess = np.cumsum(hist_hess, axis=1)[:, :-1, :]
+    prefix_count = np.cumsum(hist_count, axis=1)[:, :-1, :]
 
-        left_value = -g_left_total / (h_left_total + lambda_l2)
-        right_value = -g_right_total / (h_right_total + lambda_l2)
+    total_grad = hist_grad.sum(axis=1)[:, None, :]  # (n_features, 1, n_eras)
+    total_hess = hist_hess.sum(axis=1)[:, None, :]
+    total_count = hist_count.sum(axis=1)[:, None, :]
 
-        best = SplitDecision(
-            feature=int(feature),
-            threshold=int(threshold),
-            score=float(final_score),
-            direction_agreement=float(agreement),
-            left_value=float(left_value),
-            right_value=float(right_value),
-            left_indices=left_indices.astype(np.int32, copy=False),
-            right_indices=right_indices.astype(np.int32, copy=False),
+    suffix_grad = total_grad - prefix_grad
+    suffix_hess = total_hess - prefix_hess
+    suffix_count = total_count - prefix_count
+
+    parent_score = 0.5 * (total_grad ** 2) / np.maximum(total_hess + lambda_l2, 1e-12)
+
+    denom_left = np.maximum(prefix_hess + lambda_l2, 1e-12)
+    denom_right = np.maximum(suffix_hess + lambda_l2, 1e-12)
+
+    gain_left = 0.5 * (prefix_grad ** 2) / denom_left
+    gain_right = 0.5 * (suffix_grad ** 2) / denom_right
+    gains = gain_left + gain_right - parent_score
+
+    valid_mask = (prefix_count >= min_leaf) & (suffix_count >= min_leaf)
+    gains = np.where(valid_mask, gains, np.nan)
+
+    valid_counts = np.sum(~np.isnan(gains), axis=2)
+    sum_gain = np.nansum(gains, axis=2)
+    mean_gain = np.divide(
+        sum_gain,
+        valid_counts,
+        out=np.full(sum_gain.shape, np.nan, dtype=np.float32),
+        where=valid_counts > 0,
+    )
+    mean_for_var = np.where(np.isnan(mean_gain), 0.0, mean_gain)
+    sum_sq = np.nansum((gains - mean_for_var[..., None]) ** 2, axis=2)
+    variance = np.divide(
+        sum_sq,
+        valid_counts,
+        out=np.zeros_like(sum_sq),
+        where=valid_counts > 0,
+    )
+    std_gain = np.sqrt(variance, dtype=np.float32)
+    dro_score = mean_gain - config.lambda_dro * std_gain
+
+    # Directional agreement
+    left_value = -prefix_grad / denom_left
+    right_value = -suffix_grad / denom_right
+    direction = np.where(valid_mask, np.where(left_value >= right_value, 1.0, -1.0), 0.0)
+    direction_counts = np.sum(valid_mask, axis=2)
+    agreement = np.zeros_like(dro_score)
+    nonzero = direction_counts > 0
+    agreement[nonzero] = (
+        np.abs(np.sum(direction, axis=2)[nonzero]) / direction_counts[nonzero]
+    )
+
+    final_score = dro_score + config.direction_weight * agreement
+    final_score = np.where(np.isnan(final_score), -np.inf, final_score)
+
+    if not np.isfinite(final_score).any():
+        return _empty_decision(node_indices)
+
+    best_feature_idx, best_threshold_idx = np.unravel_index(
+        np.nanargmax(final_score), final_score.shape
+    )
+    best_score = final_score[best_feature_idx, best_threshold_idx]
+    best_agreement = agreement[best_feature_idx, best_threshold_idx]
+
+    feature = int(features[best_feature_idx])
+    threshold = int(best_threshold_idx)
+
+    feature_bins = node_bins[:, best_feature_idx]
+    left_mask = feature_bins <= threshold
+    right_mask = ~left_mask
+
+    left_indices = node_indices[left_mask]
+    right_indices = node_indices[right_mask]
+
+    if left_indices.size < min_leaf or right_indices.size < min_leaf:
+        return _empty_decision(node_indices)
+
+    g_left_total = gradients[left_indices].sum()
+    h_left_total = hessians[left_indices].sum()
+    g_right_total = gradients[right_indices].sum()
+    h_right_total = hessians[right_indices].sum()
+
+    left_value_scalar = -g_left_total / (h_left_total + lambda_l2)
+    right_value_scalar = -g_right_total / (h_right_total + lambda_l2)
+
+    return SplitDecision(
+        feature=feature,
+        threshold=threshold,
+        score=float(best_score),
+        direction_agreement=float(best_agreement),
+        left_value=float(left_value_scalar),
+        right_value=float(right_value_scalar),
+        left_indices=left_indices.astype(np.int32, copy=False),
+        right_indices=right_indices.astype(np.int32, copy=False),
+    )
+
+
+# ---------------------------------------------------------------------------
+# CPU histogram builder
+# ---------------------------------------------------------------------------
+
+
+class _CPUHistogramEvaluator:
+    """Helper that accumulates histograms on the CPU."""
+
+    def __init__(
+        self,
+        X_binned: np.ndarray,
+        gradients: np.ndarray,
+        hessians: np.ndarray,
+        era_ids: np.ndarray,
+        config: PackBoostConfig,
+    ) -> None:
+        self.X_binned = X_binned
+        self.gradients = gradients
+        self.hessians = hessians
+        self.era_ids = era_ids
+        self.config = config
+
+    def evaluate(self, node_indices: np.ndarray, features: Iterable[int]) -> SplitDecision:
+        if node_indices.size == 0:
+            return _empty_decision(node_indices)
+
+        features_arr = np.array(list(features), dtype=np.int32)
+        node_bins = self.X_binned[np.ix_(node_indices, features_arr)]
+        gradients_node = self.gradients[node_indices]
+        hessians_node = self.hessians[node_indices]
+
+        unique_eras, era_inverse = np.unique(self.era_ids[node_indices], return_inverse=True)
+        n_eras = unique_eras.size
+        if n_eras == 0:
+            return _empty_decision(node_indices)
+
+        max_bins = self.config.max_bins
+        hist_grad = np.zeros((features_arr.size, max_bins, n_eras), dtype=np.float32)
+        hist_hess = np.zeros_like(hist_grad)
+        hist_count = np.zeros((features_arr.size, max_bins, n_eras), dtype=np.int32)
+
+        # vectorised accumulation using bincount per feature
+        flat_multiplier = n_eras
+        for feature_idx in range(features_arr.size):
+            feature_bins = node_bins[:, feature_idx].astype(np.int32)
+            keys = feature_bins * flat_multiplier + era_inverse
+
+            grad_flat = np.bincount(
+                keys,
+                weights=gradients_node,
+                minlength=max_bins * n_eras,
+            )
+            hess_flat = np.bincount(
+                keys,
+                weights=hessians_node,
+                minlength=max_bins * n_eras,
+            )
+            count_flat = np.bincount(keys, minlength=max_bins * n_eras)
+
+            hist_grad[feature_idx] = grad_flat.reshape(max_bins, n_eras)
+            hist_hess[feature_idx] = hess_flat.reshape(max_bins, n_eras)
+            hist_count[feature_idx] = count_flat.reshape(max_bins, n_eras)
+
+        return _score_from_histograms(
+            features=features_arr,
+            node_indices=node_indices,
+            node_bins=node_bins,
+            gradients=self.gradients,
+            hessians=self.hessians,
+            config=self.config,
+            hist_grad=hist_grad,
+            hist_hess=hist_hess,
+            hist_count=hist_count,
         )
-    return best
+
+
+# ---------------------------------------------------------------------------
+# GPU hook
+# ---------------------------------------------------------------------------
+
+
+def evaluate_node_split_from_hist(
+    *,
+    features: np.ndarray,
+    node_indices: np.ndarray,
+    node_bins: np.ndarray,
+    gradients: np.ndarray,
+    hessians: np.ndarray,
+    config: PackBoostConfig,
+    hist_grad: np.ndarray,
+    hist_hess: np.ndarray,
+    hist_count: np.ndarray,
+) -> SplitDecision:
+    """Expose histogram scoring for GPU backends."""
+    return _score_from_histograms(
+        features=features,
+        node_indices=node_indices,
+        node_bins=node_bins,
+        gradients=gradients,
+        hessians=hessians,
+        config=config,
+        hist_grad=hist_grad,
+        hist_hess=hist_hess,
+        hist_count=hist_count,
+    )
+
+
+__all__ = ["SplitDecision", "evaluate_node_split", "evaluate_node_split_from_hist"]

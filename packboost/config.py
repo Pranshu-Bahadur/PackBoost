@@ -33,6 +33,8 @@ class PackBoostConfig:
         Optional weight added for directional agreement when choosing splits.
     era_tile_size: int
         Number of eras processed at once when evaluating splits (``E``).
+    device: str
+        Execution device, ``"cpu"`` or ``"cuda"`` (GPU requires CuPy).
     """
 
     pack_size: int = 4
@@ -46,6 +48,7 @@ class PackBoostConfig:
     layer_feature_fraction: float = 0.5
     direction_weight: float = 0.0
     era_tile_size: int = 32
+    device: str = "cpu"
 
     def validate(self, n_features: int) -> None:
         """Validate configuration values.
@@ -75,6 +78,8 @@ class PackBoostConfig:
             raise ValueError("direction_weight must be in [0, 1]")
         if self.era_tile_size <= 0:
             raise ValueError("era_tile_size must be positive")
+        if self.device not in {"cpu", "cuda"}:
+            raise ValueError("device must be either 'cpu' or 'cuda'")
         if n_features <= 0:
             raise ValueError("n_features must be positive")
         min_features = max(1, int(self.layer_feature_fraction * n_features))

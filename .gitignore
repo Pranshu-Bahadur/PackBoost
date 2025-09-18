@@ -22,9 +22,8 @@ build/
 
 # Data / cache
 /data/
-*.parquet
-*.npz
-*.npy
+numerai-data/
+.cache/
 
 # Logs
 *.log

@@ -7,7 +7,15 @@ from typing import Dict, Iterable, List, Sequence
 import numpy as np
 
 from .config import PackBoostConfig
-from .des import evaluate_node_split
+from .des import SplitDecision, evaluate_node_split
+
+try:  # optional GPU backend
+    from .gpu import evaluate_node_split_gpu, has_cuda
+except ImportError:  # pragma: no cover - optional dependency
+    evaluate_node_split_gpu = None
+
+    def has_cuda() -> bool:  # type: ignore[override]
+        return False
 from .model import PackBoostModel, Tree, TreeNode
 from .utils.binning import apply_binning, quantile_binning
 
@@ -18,6 +26,7 @@ class PackBoost:
     def __init__(self, config: PackBoostConfig) -> None:
         self.config = config
         self._model: PackBoostModel | None = None
+        self._use_gpu: bool = False
 
     @property
     def model(self) -> PackBoostModel:
@@ -44,6 +53,12 @@ class PackBoost:
 
         n_samples, n_features = X.shape
         self.config.validate(n_features)
+
+        if self.config.device == "cuda" and not self._should_use_gpu():
+            raise RuntimeError(
+                "CUDA device requested but CuPy is not available or no GPU detected."
+            )
+        self._use_gpu = self._should_use_gpu()
 
         X_binned, bin_edges = quantile_binning(
             X, self.config.max_bins, random_state=self.config.random_state
@@ -148,14 +163,13 @@ class PackBoost:
                 if node_indices is None or node_indices.size == 0:
                     continue
 
-                decision = evaluate_node_split(
+                decision = self._evaluate_node(
                     X_binned=X_binned,
                     gradients=gradients,
                     hessians=hessians,
                     era_ids=era_ids,
                     node_indices=node_indices,
                     features=feature_subset,
-                    config=self.config,
                 )
 
                 if decision.feature is None or decision.score <= 0:
@@ -189,3 +203,36 @@ class PackBoost:
             for node_id, node in enumerate(tree.nodes):
                 if node.is_leaf or (node.left is None and node.right is None):
                     tree.ensure_leaf(node_id, node.prediction)
+
+    def _evaluate_node(
+        self,
+        *,
+        X_binned: np.ndarray,
+        gradients: np.ndarray,
+        hessians: np.ndarray,
+        era_ids: np.ndarray,
+        node_indices: np.ndarray,
+        features: Iterable[int],
+    ) -> SplitDecision:
+        if self._use_gpu and evaluate_node_split_gpu is not None:
+            return evaluate_node_split_gpu(
+                X_binned=X_binned,
+                gradients=gradients,
+                hessians=hessians,
+                era_ids=era_ids,
+                node_indices=node_indices,
+                features=features,
+                config=self.config,
+            )
+        return evaluate_node_split(
+            X_binned=X_binned,
+            gradients=gradients,
+            hessians=hessians,
+            era_ids=era_ids,
+            node_indices=node_indices,
+            features=features,
+            config=self.config,
+        )
+
+    def _should_use_gpu(self) -> bool:
+        return self.config.device == "cuda" and evaluate_node_split_gpu is not None and has_cuda()
