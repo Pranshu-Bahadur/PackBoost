@@ -31,3 +31,7 @@ numerai-data/
 # OS files
 .DS_Store
 Thumbs.db
+catboost_info/
+2309.14496v5.pdf
+EraSplitting.txt
+Extra_Fast_Booster.ipynb
