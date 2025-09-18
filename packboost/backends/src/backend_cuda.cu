@@ -92,7 +92,7 @@ void launch_histogram_kernel(
     int32_t* out_count) {
 
     const dim3 grid(n_features);
-    const int threads = 256;
+    const int threads = 64; //256
     const std::size_t shared = static_cast<std::size_t>(max_bins) * n_eras * (2 * sizeof(float) + sizeof(int32_t));
     histogram_kernel<<<grid, threads, shared>>>(
         bins, gradients, hessians, era_inverse,
