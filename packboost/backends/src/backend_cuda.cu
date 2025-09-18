@@ -204,7 +204,7 @@ py::tuple cuda_histogram_binding(
         static_cast<uint8_t*>(bins_info.ptr),
         static_cast<float*>(grad_info.ptr),
         static_cast<float*>(hess_info.ptr),
-        static_cast<int32_t*>(era_info.ptr),
+        static_cast<int16_t*>(era_info.ptr),
         n_rows,
         n_features,
         max_bins,
