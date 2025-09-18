@@ -1,0 +1,34 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.so
+
+# Build directories
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+.venv/
+.env/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# IDE metadata
+.vscode/
+.idea/
+*.swp
+
+# Data / cache
+/data/
+*.parquet
+*.npz
+*.npy
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
