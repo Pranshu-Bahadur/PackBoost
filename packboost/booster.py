@@ -10,7 +10,13 @@ from .config import PackBoostConfig
 from .des import SplitDecision, evaluate_frontier, evaluate_node_split, evaluate_node_split_from_hist
 from .model import PackBoostModel, Tree, TreeNode
 from .utils.binning import apply_binning, quantile_binning
-from .backends import cpu_available, cpu_frontier_evaluate, cuda_available, cuda_histogram
+from .backends import (
+    cpu_available,
+    cpu_frontier_evaluate,
+    cuda_available,
+    cuda_frontier_evaluate,
+    cuda_histogram,
+)
 
 
 class PackBoost:
@@ -255,17 +261,6 @@ class PackBoost:
         indices = batch["indices"]  # type: ignore[index]
         offsets = batch["offsets"]  # type: ignore[index]
 
-        if cpu_frontier_evaluate is None:
-            return evaluate_frontier(
-                X_binned=X_binned,
-                gradients=gradients,
-                hessians=hessians,
-                era_ids=era_ids,
-                node_indices_list=node_samples,
-                features=features,
-                config=self.config,
-            )
-
         features_arr = np.asarray(list(features), dtype=np.int32)
         if features_arr.size == 0:
             return evaluate_frontier(
@@ -278,35 +273,74 @@ class PackBoost:
                 config=self.config,
             )
 
-        features_arr = features_arr.astype(np.int32, copy=False)
+        if self._use_gpu and cuda_frontier_evaluate is not None:
+            (
+                features_native,
+                thresholds,
+                scores,
+                agreements,
+                left_vals,
+                right_vals,
+                base_vals,
+                left_offsets,
+                right_offsets,
+                left_indices_flat,
+                right_indices_flat,
+            ) = cuda_frontier_evaluate(
+                X_binned,
+                indices,
+                offsets,
+                features_arr,
+                gradients,
+                hessians,
+                era_ids,
+                self.config.max_bins,
+                self._num_eras or int(era_ids.max() + 1),
+                self.config.lambda_l2,
+                self.config.lambda_dro,
+                self.config.min_samples_leaf,
+                self.config.direction_weight,
+            )
+        elif cpu_frontier_evaluate is not None:
+            (
+                features_native,
+                thresholds,
+                scores,
+                agreements,
+                left_vals,
+                right_vals,
+                base_vals,
+                left_offsets,
+                right_offsets,
+                left_indices_flat,
+                right_indices_flat,
+            ) = cpu_frontier_evaluate(
+                X_binned,
+                indices,
+                offsets,
+                features_arr,
+                gradients,
+                hessians,
+                era_ids,
+                self.config.max_bins,
+                self._num_eras or int(era_ids.max() + 1),
+                self.config.lambda_l2,
+                self.config.lambda_dro,
+                self.config.min_samples_leaf,
+                self.config.direction_weight,
+            )
+        else:
+            return evaluate_frontier(
+                X_binned=X_binned,
+                gradients=gradients,
+                hessians=hessians,
+                era_ids=era_ids,
+                node_indices_list=node_samples,
+                features=features,
+                config=self.config,
+            )
 
-        (
-            features_native,
-            thresholds,
-            scores,
-            agreements,
-            left_vals,
-            right_vals,
-            base_vals,
-            left_offsets,
-            right_offsets,
-            left_indices_flat,
-            right_indices_flat,
-        ) = cpu_frontier_evaluate(
-            X_binned,
-            indices,
-            offsets,
-            features_arr,
-            gradients,
-            hessians,
-            era_ids,
-            self.config.max_bins,
-            self._num_eras or int(era_ids.max() + 1),
-            self.config.lambda_l2,
-            self.config.lambda_dro,
-            self.config.min_samples_leaf,
-            self.config.direction_weight,
-        )
+        features_arr = features_arr.astype(np.int32, copy=False)
 
         decisions: List[SplitDecision] = []
         for idx, samples_arr in enumerate(node_samples):
@@ -461,4 +495,4 @@ class PackBoost:
         )
 
     def _should_use_gpu(self) -> bool:
-        return self.config.device == "cuda" and cuda_available()
+        return self.config.device == "cuda" and cuda_frontier_evaluate is not None and cuda_available()

@@ -1,9 +1,10 @@
 import unittest
+from dataclasses import replace
 
 import numpy as np
 
 from packboost.booster import PackBoost
-from packboost.backends import cpu_frontier_evaluate
+from packboost.backends import cpu_frontier_evaluate, cuda_frontier_evaluate
 from packboost.config import PackBoostConfig
 from packboost.des import evaluate_frontier, evaluate_node_split
 
@@ -161,6 +162,80 @@ class DESTest(unittest.TestCase):
             self.assertAlmostEqual(native.right_value, python_decision.right_value, places=6)
             np.testing.assert_array_equal(native.left_indices, python_decision.left_indices)
             np.testing.assert_array_equal(native.right_indices, python_decision.right_indices)
+
+    def test_cuda_frontier_evaluate_matches_cpu(self) -> None:
+        if cuda_frontier_evaluate is None:
+            self.skipTest("cuda_frontier_evaluate unavailable")
+
+        X_binned = np.array(
+            [
+                [0, 1],
+                [1, 1],
+                [0, 0],
+                [1, 0],
+                [0, 1],
+                [1, 0],
+            ],
+            dtype=np.uint8,
+        )
+        gradients = np.array([-2.0, 2.5, -1.5, 1.0, -0.5, 0.5], dtype=np.float32)
+        hessians = np.ones_like(gradients)
+        era_ids = np.array([0, 0, 1, 1, 2, 2], dtype=np.int16)
+
+        config = PackBoostConfig(
+            pack_size=1,
+            max_depth=2,
+            learning_rate=0.1,
+            lambda_l2=0.0,
+            lambda_dro=0.0,
+            min_samples_leaf=1,
+            max_bins=4,
+            random_state=0,
+            layer_feature_fraction=1.0,
+            direction_weight=0.0,
+            era_tile_size=2,
+            device="cuda",
+        )
+
+        node_samples = [
+            np.array([0, 1, 2], dtype=np.int32),
+            np.array([3, 4, 5], dtype=np.int32),
+        ]
+        feature_subset = np.array([0, 1], dtype=np.int32)
+
+        booster = PackBoost(config)
+        booster._num_eras = int(era_ids.max()) + 1
+
+        batch = booster._prepare_frontier_batch(node_samples)  # type: ignore[attr-defined]
+        gpu_decisions = booster._evaluate_frontier_batch(
+            X_binned=X_binned,
+            gradients=gradients,
+            hessians=hessians,
+            era_ids=era_ids,
+            batch=batch,
+            features=feature_subset,
+        )
+
+        cpu_booster = PackBoost(replace(config, device="cpu"))
+        cpu_booster._num_eras = booster._num_eras
+        cpu_decisions = cpu_booster._evaluate_frontier_batch(
+            X_binned=X_binned,
+            gradients=gradients,
+            hessians=hessians,
+            era_ids=era_ids,
+            batch=batch,
+            features=feature_subset,
+        )
+
+        for gpu_decision, cpu_decision in zip(gpu_decisions, cpu_decisions):
+            self.assertEqual(gpu_decision.feature, cpu_decision.feature)
+            self.assertEqual(gpu_decision.threshold, cpu_decision.threshold)
+            self.assertAlmostEqual(gpu_decision.score, cpu_decision.score, places=6)
+            self.assertAlmostEqual(gpu_decision.direction_agreement, cpu_decision.direction_agreement, places=6)
+            self.assertAlmostEqual(gpu_decision.left_value, cpu_decision.left_value, places=6)
+            self.assertAlmostEqual(gpu_decision.right_value, cpu_decision.right_value, places=6)
+            np.testing.assert_array_equal(gpu_decision.left_indices, cpu_decision.left_indices)
+            np.testing.assert_array_equal(gpu_decision.right_indices, cpu_decision.right_indices)
 
 
 if __name__ == "__main__":

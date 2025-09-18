@@ -12,8 +12,9 @@ across regime shifts.
   feature subsets.
 - **Directional Era Splitting (DES)** – score candidates with
   `mean − λ·std` across eras plus a directional agreement penalty.
-- **CPU & CUDA backends** – fast NumPy implementation out of the box, with
-  optional native C++/CUDA histogram builders for Murky-grade throughput.
+- **CPU & CUDA frontier backends** – native C++/CUDA extensions batch whole
+  depth frontiers, score DES splits, and return child partitions without Python
+  loops.
 - **Deterministic by design** – quantile binning, seeded sampling, and pure
   functions keep runs reproducible.
 - **Friendly tooling** – scikit-learn compatible wrapper, standalone
@@ -40,9 +41,11 @@ python setup_native.py build_ext --inplace
 ```
 
 CUDA users need `nvcc` in `PATH`. The build script detects it automatically and
-compiles the optimized kernel (`backend_cuda.cu`). Without CUDA the script still
-builds the fast multi-threaded CPU backend; if neither backend is built PackBoost
-falls back to the pure NumPy implementation.
+compiles the optimized kernels (including the frontier evaluator) when available.
+Set `PACKBOOST_DISABLE_CUDA=1` before the build to force a CPU-only wheel even on
+GPU machines. Without CUDA the script still builds the fast multi-threaded CPU
+backend; if neither backend is built PackBoost falls back to the pure NumPy
+implementation.
 
 ## Quick Start
 
@@ -73,8 +76,9 @@ booster = PackBoost(config)
 booster.fit(X_train, y_train, era_ids_train)
 ```
 
-PackBoost will raise a clear error if `device="cuda"` is requested but CuPy or a
-CUDA device is unavailable.
+PackBoost now relies on the native frontier evaluator each depth. It raises a
+clear error if `device="cuda"` is requested but the CUDA frontier backend is
+missing or a CUDA device is unavailable.
 
 ## scikit-learn Wrapper
 
