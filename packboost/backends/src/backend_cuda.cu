@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
+#include <limits>
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 
@@ -21,7 +22,7 @@ namespace packboost {
 namespace {
 
 constexpr int WARP_SIZE = 32;
-constexpr float NEG_INF_F = -CUDART_INF_F;
+constexpr float NEG_INF_F = -std::numeric_limits<float>::infinity();
 
 inline void check(cudaError_t status, const char* msg) {
     if (status != cudaSuccess) {
