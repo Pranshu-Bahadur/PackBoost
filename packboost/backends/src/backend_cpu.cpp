@@ -677,7 +677,8 @@ static py::tuple cpu_frontier_evaluate_binding(
 
 // Forward declaration for the optional CUDA binding (implemented in backend_cuda.cu)
 #ifdef PACKBOOST_ENABLE_CUDA
-py::tuple cuda_histogram_binding(
+// GPU binding declarations implemented in backend_cuda.cu
+extern py::tuple cuda_histogram_binding(
     py::array_t<uint8_t, py::array::c_style | py::array::forcecast>,
     py::array_t<float, py::array::c_style | py::array::forcecast>,
     py::array_t<float, py::array::c_style | py::array::forcecast>,
@@ -685,7 +686,7 @@ py::tuple cuda_histogram_binding(
     int,
     int);
 
-py::tuple cuda_frontier_evaluate_binding(
+extern py::tuple cuda_frontier_evaluate_binding(
     py::array_t<uint8_t, py::array::c_style | py::array::forcecast>,
     py::array_t<int32_t, py::array::c_style | py::array::forcecast>,
     py::array_t<int32_t, py::array::c_style | py::array::forcecast>,
@@ -720,14 +721,37 @@ PYBIND11_MODULE(_backend, m) {
           py::arg("max_bins"), py::arg("n_eras_total"), py::arg("lambda_l2"), py::arg("lambda_dro"),
           py::arg("min_samples_leaf"), py::arg("direction_weight"), py::arg("era_tile_size"));
 #ifdef PACKBOOST_ENABLE_CUDA
-    m.def("cuda_histogram", &cuda_histogram_binding, "Build histograms on the GPU",
-          py::arg("bins"), py::arg("gradients"), py::arg("hessians"), py::arg("era_inverse"), py::arg("max_bins"), py::arg("n_eras"));
-    m.def("cuda_frontier_evaluate", &cuda_frontier_evaluate_binding, "Evaluate frontier nodes with DES scoring on the GPU",
-          py::arg("bins"), py::arg("node_indices"), py::arg("node_offsets"), py::arg("node_era_offsets"),
-          py::arg("era_group_eras"), py::arg("era_group_offsets"), py::arg("feature_subset"),
-          py::arg("gradients"), py::arg("hessians"),
-          py::arg("max_bins"), py::arg("n_eras_total"), py::arg("lambda_l2"), py::arg("lambda_dro"),
-          py::arg("min_samples_leaf"), py::arg("direction_weight"), py::arg("era_tile_size"),
-          py::arg("threads_per_block"), py::arg("rows_per_thread"));
+    m.def(
+        "cuda_histogram",
+        &cuda_histogram_binding,
+        "Build histograms on the GPU",
+        py::arg("bins"),
+        py::arg("gradients"),
+        py::arg("hessians"),
+        py::arg("era_inverse"),
+        py::arg("max_bins"),
+        py::arg("n_eras"));
+    m.def(
+        "cuda_frontier_evaluate",
+        &cuda_frontier_evaluate_binding,
+        "Evaluate frontier nodes with DES scoring on the GPU",
+        py::arg("bins"),
+        py::arg("node_indices"),
+        py::arg("node_offsets"),
+        py::arg("node_era_offsets"),
+        py::arg("era_group_eras"),
+        py::arg("era_group_offsets"),
+        py::arg("feature_subset"),
+        py::arg("gradients"),
+        py::arg("hessians"),
+        py::arg("max_bins"),
+        py::arg("n_eras_total"),
+        py::arg("lambda_l2"),
+        py::arg("lambda_dro"),
+        py::arg("min_samples_leaf"),
+        py::arg("direction_weight"),
+        py::arg("era_tile_size"),
+        py::arg("threads_per_block"),
+        py::arg("rows_per_thread"));
 #endif
 }
