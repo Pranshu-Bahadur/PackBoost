@@ -31,7 +31,6 @@ namespace packboost {
 
 namespace {
 
-constexpr int WARP_SIZE = 32;
 constexpr float NEG_INF_F = -std::numeric_limits<float>::infinity();
 
 inline void check(cudaError_t status, const char* msg) {
@@ -188,12 +187,6 @@ struct MakeKey {
 struct ExtractNode {
     __host__ __device__ int32_t operator()(int64_t key) const {
         return static_cast<int32_t>(key >> 32);
-    }
-};
-
-struct ExtractEra {
-    __host__ __device__ int32_t operator()(int64_t key) const {
-        return static_cast<int32_t>(key & 0xffffffff);
     }
 };
 
@@ -695,12 +688,6 @@ private:
 
     std::vector<HostRegistration> host_registrations_;
 };
-
-__inline__ __device__ int lane_id() {
-    int id;
-    asm volatile("mov.s32 %0, %laneid;" : "=r"(id));
-    return id;
-}
 
 __global__ void histogram_kernel(
     const uint8_t* __restrict__ bins,
@@ -1527,6 +1514,8 @@ FrontierEvalResult evaluate_frontier_cuda(
     return result;
 }
 
+}  // namespace packboost
+
 py::tuple cuda_histogram_binding(
     py::array_t<uint8_t, py::array::c_style | py::array::forcecast> bins,
     py::array_t<float, py::array::c_style | py::array::forcecast> gradients,
@@ -1684,7 +1673,7 @@ py::tuple cuda_frontier_evaluate_binding(
 }
 
 void bind_cuda_workspace(py::module_& m) {
-    py::class_<CudaFrontierWorkspace>(m, "CudaFrontierWorkspace")
+    py::class_<packboost::CudaFrontierWorkspace>(m, "CudaFrontierWorkspace")
         .def(
             py::init<std::size_t, std::size_t, int, int, int, int>(),
             py::arg("n_rows"),
@@ -1693,12 +1682,12 @@ void bind_cuda_workspace(py::module_& m) {
             py::arg("n_eras_total"),
             py::arg("threads_per_block"),
             py::arg("rows_per_thread"))
-        .def("set_binned", &CudaFrontierWorkspace::set_binned, py::arg("binned"))
-        .def("set_era_ids", &CudaFrontierWorkspace::set_era_ids, py::arg("era_ids"))
-        .def("register_host", &CudaFrontierWorkspace::register_host, py::arg("array"))
+        .def("set_binned", &packboost::CudaFrontierWorkspace::set_binned, py::arg("binned"))
+        .def("set_era_ids", &packboost::CudaFrontierWorkspace::set_era_ids, py::arg("era_ids"))
+        .def("register_host", &packboost::CudaFrontierWorkspace::register_host, py::arg("array"))
         .def(
             "evaluate_frontier",
-            &CudaFrontierWorkspace::evaluate_frontier,
+            &packboost::CudaFrontierWorkspace::evaluate_frontier,
             py::arg("node_samples"),
             py::arg("feature_subset"),
             py::arg("gradients"),
@@ -1709,5 +1698,3 @@ void bind_cuda_workspace(py::module_& m) {
             py::arg("direction_weight"),
             py::arg("era_tile_size"));
 }
-
-}  // namespace packboost
