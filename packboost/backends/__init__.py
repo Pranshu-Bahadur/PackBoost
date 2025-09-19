@@ -14,13 +14,15 @@ CudaFrontierWorkspace: Optional[Any]
 
 try:  # pragma: no cover - optional extension
     backend = import_module("packboost._backend")
+    backend_load_error: ImportError | None = None
     cpu_histogram = getattr(backend, "cpu_histogram", None)
     cpu_frontier_histogram = getattr(backend, "cpu_frontier_histogram", None)
     cpu_frontier_evaluate = getattr(backend, "cpu_frontier_evaluate", None)
     cuda_histogram = getattr(backend, "cuda_histogram", None)
     cuda_frontier_evaluate = getattr(backend, "cuda_frontier_evaluate", None)
     CudaFrontierWorkspace = getattr(backend, "CudaFrontierWorkspace", None)
-except ImportError:  # pragma: no cover - extension not built
+except ImportError as exc:  # pragma: no cover - extension not built
+    backend_load_error = exc
     cpu_histogram = None
     cpu_frontier_histogram = None
     cpu_frontier_evaluate = None
@@ -46,6 +48,7 @@ __all__ = [
     "cuda_histogram",
     "cuda_frontier_evaluate",
     "CudaFrontierWorkspace",
+    "backend_load_error",
     "cpu_available",
     "cuda_available",
 ]
