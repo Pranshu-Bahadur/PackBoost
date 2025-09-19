@@ -1822,56 +1822,50 @@ py::array_t<float> cuda_predict_forest_binding(
     thrust::device_vector<float> d_values(total_nodes);
     thrust::device_vector<float> d_out(n_rows);
 
-    auto throw_cuda_error = [](cudaError_t status, const char* msg) {
-        if (status != cudaSuccess) {
-            throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(status));
-        }
-    };
-
-    throw_cuda_error(cudaMemcpy(
+    check(cudaMemcpy(
               thrust::raw_pointer_cast(d_bins.data()),
               bins_info.ptr,
               bins_bytes,
               cudaMemcpyHostToDevice),
           "cudaMemcpy bins");
-    throw_cuda_error(cudaMemcpy(
+    check(cudaMemcpy(
               thrust::raw_pointer_cast(d_offsets.data()),
               offsets_info.ptr,
               offsets_bytes,
               cudaMemcpyHostToDevice),
           "cudaMemcpy offsets");
     if (total_nodes > 0) {
-        throw_cuda_error(cudaMemcpy(
+        check(cudaMemcpy(
                   thrust::raw_pointer_cast(d_features.data()),
                   feat_info.ptr,
                   node_bytes,
                   cudaMemcpyHostToDevice),
               "cudaMemcpy features");
-        throw_cuda_error(cudaMemcpy(
+        check(cudaMemcpy(
                   thrust::raw_pointer_cast(d_thresholds.data()),
                   thresh_info.ptr,
                   node_bytes,
                   cudaMemcpyHostToDevice),
               "cudaMemcpy thresholds");
-        throw_cuda_error(cudaMemcpy(
+        check(cudaMemcpy(
                   thrust::raw_pointer_cast(d_lefts.data()),
                   left_info.ptr,
                   node_bytes,
                   cudaMemcpyHostToDevice),
               "cudaMemcpy lefts");
-        throw_cuda_error(cudaMemcpy(
+        check(cudaMemcpy(
                   thrust::raw_pointer_cast(d_rights.data()),
                   right_info.ptr,
                   node_bytes,
                   cudaMemcpyHostToDevice),
               "cudaMemcpy rights");
-        throw_cuda_error(cudaMemcpy(
+        check(cudaMemcpy(
                   thrust::raw_pointer_cast(d_is_leaf.data()),
                   leaf_info.ptr,
                   leaf_bytes,
                   cudaMemcpyHostToDevice),
               "cudaMemcpy is_leaf");
-        throw_cuda_error(cudaMemcpy(
+        check(cudaMemcpy(
                   thrust::raw_pointer_cast(d_values.data()),
                   value_info.ptr,
                   value_bytes,
@@ -1882,7 +1876,7 @@ py::array_t<float> cuda_predict_forest_binding(
     const int threads = 256;
     const int blocks = (n_rows_i + threads - 1) / threads;
     if (blocks > 0) {
-        packboost::predict_forest_kernel<<<blocks, threads>>>(
+        predict_forest_kernel<<<blocks, threads>>>(
             thrust::raw_pointer_cast(d_bins.data()),
             n_rows_i,
             n_features_i,
@@ -1897,11 +1891,11 @@ py::array_t<float> cuda_predict_forest_binding(
             static_cast<float>(tree_weight),
             static_cast<float>(initial_prediction),
             thrust::raw_pointer_cast(d_out.data()));
-        throw_cuda_error(cudaGetLastError(), "predict_forest_kernel launch");
-        throw_cuda_error(cudaDeviceSynchronize(), "predict_forest_kernel sync");
+        check(cudaGetLastError(), "predict_forest_kernel launch");
+        check(cudaDeviceSynchronize(), "predict_forest_kernel sync");
     }
 
-    throw_cuda_error(cudaMemcpy(
+    check(cudaMemcpy(
               out.mutable_data(),
               thrust::raw_pointer_cast(d_out.data()),
               n_rows * sizeof(float),
