@@ -121,6 +121,7 @@ __global__ void frontier_feature_kernel(
     int thresholds,
     int n_features_subset,
     int n_eras_total,
+    int rows_per_thread,
     int min_samples_leaf,
     float lambda,
     float lambda_dro,
@@ -134,6 +135,10 @@ __global__ void frontier_feature_kernel(
     int32_t* left_count_out,
     int32_t* right_count_out)
 {
+    if (rows_per_thread < 1) {
+        rows_per_thread = 1;
+    }
+
     const int node_idx = blockIdx.x;
     const int feature_idx = blockIdx.y;
     if (node_idx >= gridDim.x || feature_idx >= n_features_subset) {
@@ -220,21 +225,29 @@ __global__ void frontier_feature_kernel(
         }
         __syncthreads();
 
-        for (int32_t pos = range_begin + threadIdx.x; pos < range_end; pos += blockDim.x) {
-            const int32_t row = node_indices[pos];
-            if (row < 0 || row >= n_rows) {
-                continue;
+        for (int32_t pos_block = range_begin + threadIdx.x * rows_per_thread;
+             pos_block < range_end;
+             pos_block += blockDim.x * rows_per_thread) {
+            for (int r = 0; r < rows_per_thread; ++r) {
+                const int32_t pos = pos_block + r;
+                if (pos >= range_end) {
+                    break;
+                }
+                const int32_t row = node_indices[pos];
+                if (row < 0 || row >= n_rows) {
+                    continue;
+                }
+                const std::size_t feature_offset = static_cast<std::size_t>(row) * n_features_total + static_cast<std::size_t>(feature);
+                const uint8_t bin = bins[feature_offset];
+                if (bin >= max_bins) {
+                    continue;
+                }
+                const float grad = gradients[row];
+                const float hess = hessians[row];
+                atomicAdd(&hist_grad[bin], grad);
+                atomicAdd(&hist_hess[bin], hess);
+                atomicAdd(&hist_count[bin], 1);
             }
-            const std::size_t feature_offset = static_cast<std::size_t>(row) * n_features_total + static_cast<std::size_t>(feature);
-            const uint8_t bin = bins[feature_offset];
-            if (bin >= max_bins) {
-                continue;
-            }
-            const float grad = gradients[row];
-            const float hess = hessians[row];
-            atomicAdd(&hist_grad[bin], grad);
-            atomicAdd(&hist_hess[bin], hess);
-            atomicAdd(&hist_count[bin], 1);
         }
         __syncthreads();
 
@@ -530,10 +543,18 @@ FrontierEvalResult evaluate_frontier_cuda(
     double lambda_dro,
     int min_samples_leaf,
     double direction_weight,
-    int era_tile_size) {
+    int era_tile_size,
+    int threads_per_block,
+    int rows_per_thread) {
 
     (void)era_group_eras;
     (void)era_tile_size;
+    if (threads_per_block <= 0 || threads_per_block > 1024) {
+        threads_per_block = 128;
+    }
+    if (rows_per_thread <= 0) {
+        rows_per_thread = 1;
+    }
 
     FrontierEvalResult result;
 
@@ -669,7 +690,7 @@ FrontierEvalResult evaluate_frontier_cuda(
         malloc_and_track(reinterpret_cast<void**>(&d_right_count), node_bytes_i, "cudaMalloc right_count");
 
         const dim3 grid(static_cast<unsigned int>(n_nodes), static_cast<unsigned int>(n_features_subset), 1);
-        const int threads = 128;
+        const int threads = threads_per_block;
         const std::size_t shared_bytes =
             static_cast<std::size_t>(max_bins) * (2 * sizeof(float) + sizeof(int32_t)) +
             static_cast<std::size_t>(thresholds) * (6 * sizeof(float) + 4 * sizeof(int32_t));
@@ -689,6 +710,7 @@ FrontierEvalResult evaluate_frontier_cuda(
             thresholds,
             static_cast<int>(n_features_subset),
             n_eras_total,
+            rows_per_thread,
             min_samples_leaf,
             lambda,
             lambda_dro_f,
@@ -703,7 +725,7 @@ FrontierEvalResult evaluate_frontier_cuda(
             d_right_count_per_feature);
         check(cudaDeviceSynchronize(), "frontier_feature_kernel launch failed");
 
-        const int threads_select = 128;
+        const int threads_select = threads_per_block;
         const int blocks_select = static_cast<int>((n_nodes + threads_select - 1) / threads_select);
 
         frontier_select_kernel<<<blocks_select, threads_select>>>(
@@ -899,7 +921,9 @@ py::tuple cuda_frontier_evaluate_binding(
     double lambda_dro,
     int min_samples_leaf,
     double direction_weight,
-    int era_tile_size) {
+    int era_tile_size,
+    int threads_per_block,
+    int rows_per_thread) {
 
     py::buffer_info bins_info = bins.request();
     py::buffer_info idx_info = node_indices.request();
@@ -940,7 +964,9 @@ py::tuple cuda_frontier_evaluate_binding(
         lambda_dro,
         min_samples_leaf,
         direction_weight,
-        era_tile_size);
+        era_tile_size,
+        threads_per_block,
+        rows_per_thread);
 
     std::vector<py::ssize_t> vec_shape = {static_cast<py::ssize_t>(n_nodes)};
     py::array_t<int32_t> feature_arr(vec_shape);

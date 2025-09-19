@@ -237,6 +237,52 @@ class DESTest(unittest.TestCase):
             np.testing.assert_array_equal(gpu_decision.left_indices, cpu_decision.left_indices)
             np.testing.assert_array_equal(gpu_decision.right_indices, cpu_decision.right_indices)
 
+    def test_fit_supports_callbacks_and_eval_set(self) -> None:
+        X = np.random.RandomState(0).randn(40, 3).astype(np.float32)
+        y = np.random.RandomState(1).randn(40).astype(np.float32)
+
+        config = PackBoostConfig(
+            pack_size=1,
+            max_depth=2,
+            learning_rate=0.1,
+            lambda_l2=0.1,
+            lambda_dro=0.0,
+            min_samples_leaf=2,
+            max_bins=16,
+            random_state=2,
+            layer_feature_fraction=1.0,
+            direction_weight=0.0,
+            era_tile_size=4,
+        )
+
+        booster = PackBoost(config)
+        metrics: list[tuple[int, float, float]] = []
+
+        class Capture:
+            def on_round(self, _booster, info: dict) -> None:
+                metrics.append(
+                    (
+                        info.get("round", 0),
+                        float(info.get("train_corr", 0.0)),
+                        float(info.get("valid_corr", 0.0)),
+                    )
+                )
+
+        booster.fit(
+            X,
+            y,
+            era_ids=None,
+            num_rounds=3,
+            eval_set=(X, y, None),
+            callbacks=[Capture()],
+            log_evaluation=None,
+        )
+
+        self.assertEqual(len(metrics), 3)
+        for _, train_corr, valid_corr in metrics:
+            self.assertTrue(np.isfinite(train_corr))
+            self.assertTrue(np.isfinite(valid_corr))
+
 
 if __name__ == "__main__":
     unittest.main()

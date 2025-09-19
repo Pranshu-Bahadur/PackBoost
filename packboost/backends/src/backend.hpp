@@ -88,20 +88,25 @@ FrontierEvalResult evaluate_frontier_cuda(
     const uint8_t* bins,
     const int32_t* node_indices,
     const int32_t* node_offsets,
+    const int32_t* node_era_offsets,
+    const int32_t* era_group_eras,
+    const int32_t* era_group_offsets,
     const int32_t* feature_subset,
     const float* gradients,
     const float* hessians,
-    const int16_t* era_inverse,
     std::size_t n_rows,
     std::size_t n_features_total,
     std::size_t n_nodes,
     std::size_t n_features_subset,
     int max_bins,
-    int n_eras,
+    int n_eras_total,
     double lambda_l2,
     double lambda_dro,
     int min_samples_leaf,
-    double direction_weight);
+    double direction_weight,
+    int era_tile_size,
+    int threads_per_block,
+    int rows_per_thread);
 #endif
 
 }  // namespace packboost

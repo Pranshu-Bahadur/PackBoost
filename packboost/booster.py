@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Sequence
 
 import numpy as np
 
@@ -39,14 +39,20 @@ class PackBoost:
         self,
         X: np.ndarray,
         y: np.ndarray,
-        era_ids: Sequence[int],
+        era_ids: Sequence[int] | None,
         *,
         num_rounds: int = 10,
+        eval_set: tuple[np.ndarray, np.ndarray, Sequence[int] | None] | None = None,
+        callbacks: Sequence[Any] | None = None,
+        log_evaluation: int | None = None,
     ) -> "PackBoost":
         """Fit PackBoost to the provided data."""
         X = np.asarray(X, dtype=np.float32)
         y = np.asarray(y, dtype=np.float32)
-        era_ids = np.asarray(era_ids, dtype=np.int64)
+        if era_ids is None:
+            era_ids = np.zeros(X.shape[0], dtype=np.int64)
+        else:
+            era_ids = np.asarray(era_ids, dtype=np.int64)
 
         if X.shape[0] != y.shape[0] or X.shape[0] != era_ids.shape[0]:
             raise ValueError("X, y, and era_ids must have the same number of rows")
@@ -72,11 +78,41 @@ class PackBoost:
         predictions = np.full(n_samples, initial_prediction, dtype=np.float32)
         hessians = np.ones(n_samples, dtype=np.float32)
 
+        eval_data: tuple[np.ndarray, np.ndarray] | None = None
+        predictions_valid: np.ndarray | None = None
+        if eval_set is not None:
+            X_val, y_val, era_val = eval_set
+            X_val = np.asarray(X_val, dtype=np.float32)
+            y_val = np.asarray(y_val, dtype=np.float32)
+            if era_val is None:
+                era_val = np.zeros(X_val.shape[0], dtype=np.int64)
+            else:
+                era_val = np.asarray(era_val, dtype=np.int64)
+            if X_val.shape[0] != y_val.shape[0] or X_val.shape[0] != era_val.shape[0]:
+                raise ValueError("eval_set components must have the same number of rows")
+            X_val_binned = apply_binning(X_val, bin_edges)
+            eval_data = (X_val_binned, y_val)
+            predictions_valid = np.full(X_val.shape[0], initial_prediction, dtype=np.float32)
+
+        X_val_binned: np.ndarray | None = None
+        y_val_array: np.ndarray | None = None
+        if eval_data is not None:
+            X_val_binned, y_val_array = eval_data
+
         trees: List[Tree] = []
         rng = np.random.default_rng(self.config.random_state)
         tree_weight = self.config.learning_rate / self.config.pack_size
 
-        for _ in range(num_rounds):
+        def _nan_safe_corr(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            if y_true.size == 0:
+                return float("nan")
+            corr_matrix = np.corrcoef(y_true, y_pred)
+            corr = float(corr_matrix[0, 1]) if corr_matrix.shape == (2, 2) else float("nan")
+            if not np.isfinite(corr):
+                return 0.0
+            return corr
+
+        for round_idx in range(num_rounds):
             gradients = predictions - y
             pack_trees, pack_frontiers, pack_samples = self._initialise_pack(n_samples)
 
@@ -100,8 +136,42 @@ class PackBoost:
             self._finalise_trees(pack_trees)
 
             for tree in pack_trees:
-                predictions += tree_weight * tree.predict_binned(X_binned)
+                tree_pred = tree.predict_binned(X_binned)
+                predictions += tree_weight * tree_pred
+                if X_val_binned is not None and predictions_valid is not None:
+                    predictions_valid += tree_weight * tree.predict_binned(X_val_binned)
                 trees.append(tree)
+
+            train_corr = _nan_safe_corr(y, predictions)
+            valid_corr = float("nan")
+            if y_val_array is not None and predictions_valid is not None:
+                valid_corr = _nan_safe_corr(y_val_array, predictions_valid)
+
+            if log_evaluation is not None and log_evaluation > 0 and (round_idx + 1) % log_evaluation == 0:
+                if np.isnan(valid_corr):
+                    print(f"Round {round_idx + 1}: train corr = {train_corr:.4f}")
+                else:
+                    print(
+                        f"Round {round_idx + 1}: train corr = {train_corr:.4f}, "
+                        f"valid corr = {valid_corr:.4f}"
+                    )
+
+            if callbacks:
+                info = {
+                    "round": round_idx + 1,
+                    "train_corr": train_corr,
+                    "valid_corr": valid_corr,
+                    "predictions_train": predictions,
+                    "predictions_valid": predictions_valid,
+                }
+                for callback in callbacks:
+                    if hasattr(callback, "on_round"):
+                        callback.on_round(self, info)
+                    else:
+                        try:
+                            callback(self, info)
+                        except TypeError:
+                            callback(self)
 
         self._model = PackBoostModel(
             config=self.config,
@@ -362,6 +432,8 @@ class PackBoost:
                 self.config.min_samples_leaf,
                 self.config.direction_weight,
                 self.config.era_tile_size,
+                self.config.cuda_threads_per_block,
+                self.config.cuda_rows_per_thread,
             )
         elif cpu_frontier_evaluate is not None:
             (

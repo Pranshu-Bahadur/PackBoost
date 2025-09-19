@@ -722,6 +722,7 @@ PYBIND11_MODULE(_backend, m) {
           py::arg("era_group_eras"), py::arg("era_group_offsets"), py::arg("feature_subset"),
           py::arg("gradients"), py::arg("hessians"),
           py::arg("max_bins"), py::arg("n_eras_total"), py::arg("lambda_l2"), py::arg("lambda_dro"),
-          py::arg("min_samples_leaf"), py::arg("direction_weight"), py::arg("era_tile_size"));
+          py::arg("min_samples_leaf"), py::arg("direction_weight"), py::arg("era_tile_size"),
+          py::arg("threads_per_block"), py::arg("rows_per_thread"));
 #endif
 }

@@ -35,6 +35,10 @@ class PackBoostConfig:
         Number of eras processed at once when evaluating splits (``E``).
     device: str
         Execution device, ``"cpu"`` or ``"cuda"`` (GPU requires CuPy).
+    cuda_threads_per_block: int
+        Threads per block for CUDA frontier kernels.
+    cuda_rows_per_thread: int
+        Number of frontier rows processed per CUDA thread.
     """
 
     pack_size: int = 4
@@ -49,6 +53,8 @@ class PackBoostConfig:
     direction_weight: float = 0.0
     era_tile_size: int = 32
     device: str = "cpu"
+    cuda_threads_per_block: int = 128
+    cuda_rows_per_thread: int = 1
 
     def validate(self, n_features: int) -> None:
         """Validate configuration values.
@@ -78,6 +84,10 @@ class PackBoostConfig:
             raise ValueError("direction_weight must be in [0, 1]")
         if self.era_tile_size <= 0:
             raise ValueError("era_tile_size must be positive")
+        if self.cuda_threads_per_block <= 0 or self.cuda_threads_per_block > 1024:
+            raise ValueError("cuda_threads_per_block must be in [1, 1024]")
+        if self.cuda_rows_per_thread <= 0:
+            raise ValueError("cuda_rows_per_thread must be positive")
         if self.device not in {"cpu", "cuda"}:
             raise ValueError("device must be either 'cpu' or 'cuda'")
         if n_features <= 0:

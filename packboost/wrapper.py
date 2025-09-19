@@ -28,6 +28,9 @@ class PackBoostRegressor(BaseEstimator, RegressorMixin):
         layer_feature_fraction: float = 0.5,
         direction_weight: float = 0.0,
         era_tile_size: int = 32,
+        device: str = "cpu",
+        cuda_threads_per_block: int = 128,
+        cuda_rows_per_thread: int = 1,
         num_rounds: int = 10,
     ) -> None:
         self.pack_size = pack_size
@@ -41,6 +44,9 @@ class PackBoostRegressor(BaseEstimator, RegressorMixin):
         self.layer_feature_fraction = layer_feature_fraction
         self.direction_weight = direction_weight
         self.era_tile_size = era_tile_size
+        self.device = device
+        self.cuda_threads_per_block = cuda_threads_per_block
+        self.cuda_rows_per_thread = cuda_rows_per_thread
         self.num_rounds = num_rounds
         self._booster: Optional[PackBoost] = None
 
@@ -56,8 +62,10 @@ class PackBoostRegressor(BaseEstimator, RegressorMixin):
         era: Sequence[int] | None
             Optional era identifiers. If ``None`` a single era is assumed.
         """
-        if era is None:
-            era = np.zeros(X.shape[0], dtype=np.int32)
+        if era is not None:
+            era_array: Sequence[int] | None = np.asarray(era)
+        else:
+            era_array = None
         config = PackBoostConfig(
             pack_size=self.pack_size,
             max_depth=self.max_depth,
@@ -70,9 +78,12 @@ class PackBoostRegressor(BaseEstimator, RegressorMixin):
             layer_feature_fraction=self.layer_feature_fraction,
             direction_weight=self.direction_weight,
             era_tile_size=self.era_tile_size,
+            device=self.device,
+            cuda_threads_per_block=self.cuda_threads_per_block,
+            cuda_rows_per_thread=self.cuda_rows_per_thread,
         )
         booster = PackBoost(config)
-        booster.fit(np.asarray(X), np.asarray(y), np.asarray(era), num_rounds=self.num_rounds)
+        booster.fit(np.asarray(X), np.asarray(y), era_array, num_rounds=self.num_rounds)
         self._booster = booster
         self.model_ = booster.model
         self.bin_edges_ = booster.model.bin_edges

@@ -77,6 +77,19 @@ booster.fit(X_train, y_train, era_ids_train, num_rounds=20)
 preds = booster.predict(X_valid)
 ```
 
+Monitor correlations during training by providing a validation set and a logging interval:
+
+```python
+booster.fit(
+    X_train,
+    y_train,
+    era_ids_train,
+    num_rounds=20,
+    eval_set=(X_valid, y_valid, era_valid),
+    log_evaluation=5,
+)
+```
+
 ### Switching to GPU
 
 ```python
