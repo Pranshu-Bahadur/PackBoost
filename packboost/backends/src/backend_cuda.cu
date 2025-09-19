@@ -40,6 +40,56 @@ inline void check(cudaError_t status, const char* msg) {
     }
 }
 
+__global__ void frontier_feature_kernel(
+    const uint8_t* __restrict__ bins,
+    const int32_t* __restrict__ node_indices,
+    const int32_t* __restrict__ node_offsets,
+    const int32_t* __restrict__ node_era_offsets,
+    const int32_t* __restrict__ era_group_offsets,
+    const int32_t* __restrict__ feature_subset,
+    const float* __restrict__ gradients,
+    const float* __restrict__ hessians,
+    int n_rows,
+    int n_features_total,
+    int max_bins,
+    int thresholds,
+    int n_features_subset,
+    int n_eras_total,
+    int rows_per_thread,
+    int min_samples_leaf,
+    float lambda,
+    float lambda_dro,
+    float direction_weight,
+    float eps,
+    int32_t* best_threshold_out,
+    float* score_out,
+    float* agreement_out,
+    float* left_value_out,
+    float* right_value_out,
+    int32_t* left_count_out,
+    int32_t* right_count_out);
+
+__global__ void frontier_select_kernel(
+    const int32_t* __restrict__ feature_subset,
+    int n_features_subset,
+    const int32_t* __restrict__ node_offsets,
+    int n_nodes,
+    const int32_t* __restrict__ best_threshold_per_feature,
+    const float* __restrict__ score_per_feature,
+    const float* __restrict__ agreement_per_feature,
+    const float* __restrict__ left_value_per_feature,
+    const float* __restrict__ right_value_per_feature,
+    const int32_t* __restrict__ left_count_per_feature,
+    const int32_t* __restrict__ right_count_per_feature,
+    int32_t* best_feature_out,
+    int32_t* best_threshold_out,
+    float* score_out,
+    float* agreement_out,
+    float* left_value_out,
+    float* right_value_out,
+    int32_t* left_count_out,
+    int32_t* right_count_out);
+
 __global__ void gather_era_kernel(
     const int32_t* __restrict__ node_indices,
     const int16_t* __restrict__ era_ids,
@@ -1477,8 +1527,6 @@ FrontierEvalResult evaluate_frontier_cuda(
     return result;
 }
 
-}  // namespace packboost
-
 py::tuple cuda_histogram_binding(
     py::array_t<uint8_t, py::array::c_style | py::array::forcecast> bins,
     py::array_t<float, py::array::c_style | py::array::forcecast> gradients,
@@ -1635,10 +1683,8 @@ py::tuple cuda_frontier_evaluate_binding(
         right_indices_arr);
 }
 
-}  // namespace packboost
-
 void bind_cuda_workspace(py::module_& m) {
-    py::class_<packboost::CudaFrontierWorkspace>(m, "CudaFrontierWorkspace")
+    py::class_<CudaFrontierWorkspace>(m, "CudaFrontierWorkspace")
         .def(
             py::init<std::size_t, std::size_t, int, int, int, int>(),
             py::arg("n_rows"),
@@ -1647,12 +1693,12 @@ void bind_cuda_workspace(py::module_& m) {
             py::arg("n_eras_total"),
             py::arg("threads_per_block"),
             py::arg("rows_per_thread"))
-        .def("set_binned", &packboost::CudaFrontierWorkspace::set_binned, py::arg("binned"))
-        .def("set_era_ids", &packboost::CudaFrontierWorkspace::set_era_ids, py::arg("era_ids"))
-        .def("register_host", &packboost::CudaFrontierWorkspace::register_host, py::arg("array"))
+        .def("set_binned", &CudaFrontierWorkspace::set_binned, py::arg("binned"))
+        .def("set_era_ids", &CudaFrontierWorkspace::set_era_ids, py::arg("era_ids"))
+        .def("register_host", &CudaFrontierWorkspace::register_host, py::arg("array"))
         .def(
             "evaluate_frontier",
-            &packboost::CudaFrontierWorkspace::evaluate_frontier,
+            &CudaFrontierWorkspace::evaluate_frontier,
             py::arg("node_samples"),
             py::arg("feature_subset"),
             py::arg("gradients"),
@@ -1663,3 +1709,5 @@ void bind_cuda_workspace(py::module_& m) {
             py::arg("direction_weight"),
             py::arg("era_tile_size"));
 }
+
+}  // namespace packboost
