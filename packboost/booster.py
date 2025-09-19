@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Dict, Iterable, List, Sequence
 
 import numpy as np
@@ -9,7 +10,7 @@ import numpy as np
 from .config import PackBoostConfig
 from .des import SplitDecision, evaluate_frontier, evaluate_node_split, evaluate_node_split_from_hist
 from .model import PackBoostModel, Tree, TreeNode
-from .utils.binning import apply_binning, quantile_binning
+from .utils.binning import apply_binning, ensure_prebinned, quantile_binning
 from .backends import (
     cpu_available,
     cpu_frontier_evaluate,
@@ -27,6 +28,7 @@ class PackBoost:
         self._model: PackBoostModel | None = None
         self._use_gpu: bool = False
         self._num_eras: int | None = None
+        self._auto_prebinned: bool = False
 
     @property
     def model(self) -> PackBoostModel:
@@ -47,17 +49,37 @@ class PackBoost:
         log_evaluation: int | None = None,
     ) -> "PackBoost":
         """Fit PackBoost to the provided data."""
-        X = np.asarray(X, dtype=np.float32)
+        X_array = np.asarray(X)
+        if X_array.ndim != 2:
+            raise ValueError("X must be a 2D array")
+
+        prebinned_candidate: np.ndarray | None = None
+        auto_prebinned = False
+        if not self.config.prebinned and np.issubdtype(X_array.dtype, np.integer):
+            if X_array.size == 0:
+                auto_prebinned = True
+                prebinned_candidate = X_array.astype(np.uint8, copy=False)
+            else:
+                min_val = int(X_array.min())
+                max_val = int(X_array.max())
+                if min_val >= 0 and max_val < self.config.max_bins:
+                    auto_prebinned = True
+                    prebinned_candidate = X_array.astype(np.uint8, copy=False)
+        if auto_prebinned:
+            self.config = replace(self.config, prebinned=True)
+
+        self._auto_prebinned = auto_prebinned
+
         y = np.asarray(y, dtype=np.float32)
         if era_ids is None:
-            era_ids = np.zeros(X.shape[0], dtype=np.int64)
+            era_ids = np.zeros(X_array.shape[0], dtype=np.int64)
         else:
             era_ids = np.asarray(era_ids, dtype=np.int64)
 
-        if X.shape[0] != y.shape[0] or X.shape[0] != era_ids.shape[0]:
+        if X_array.shape[0] != y.shape[0] or X_array.shape[0] != era_ids.shape[0]:
             raise ValueError("X, y, and era_ids must have the same number of rows")
 
-        n_samples, n_features = X.shape
+        n_samples, n_features = X_array.shape
         self.config.validate(n_features)
 
         unique_eras, era_ids = np.unique(era_ids, return_inverse=True)
@@ -70,9 +92,17 @@ class PackBoost:
             )
         self._use_gpu = self._should_use_gpu()
 
-        X_binned, bin_edges = quantile_binning(
-            X, self.config.max_bins, random_state=self.config.random_state
-        )
+        if self.config.prebinned:
+            if prebinned_candidate is not None:
+                X_binned = prebinned_candidate
+            else:
+                X_binned = ensure_prebinned(X_array, self.config.max_bins)
+            bin_edges: np.ndarray | None = None
+        else:
+            X_float = X_array.astype(np.float32, copy=False)
+            X_binned, bin_edges = quantile_binning(
+                X_float, self.config.max_bins, random_state=self.config.random_state
+            )
 
         initial_prediction = float(np.mean(y))
         predictions = np.full(n_samples, initial_prediction, dtype=np.float32)
@@ -82,17 +112,20 @@ class PackBoost:
         predictions_valid: np.ndarray | None = None
         if eval_set is not None:
             X_val, y_val, era_val = eval_set
-            X_val = np.asarray(X_val, dtype=np.float32)
+            X_val_array = np.asarray(X_val)
             y_val = np.asarray(y_val, dtype=np.float32)
             if era_val is None:
-                era_val = np.zeros(X_val.shape[0], dtype=np.int64)
+                era_val = np.zeros(X_val_array.shape[0], dtype=np.int64)
             else:
                 era_val = np.asarray(era_val, dtype=np.int64)
-            if X_val.shape[0] != y_val.shape[0] or X_val.shape[0] != era_val.shape[0]:
+            if X_val_array.shape[0] != y_val.shape[0] or X_val_array.shape[0] != era_val.shape[0]:
                 raise ValueError("eval_set components must have the same number of rows")
-            X_val_binned = apply_binning(X_val, bin_edges)
+            if self.config.prebinned:
+                X_val_binned = ensure_prebinned(X_val_array, self.config.max_bins)
+            else:
+                X_val_binned = apply_binning(X_val_array.astype(np.float32, copy=False), bin_edges)
             eval_data = (X_val_binned, y_val)
-            predictions_valid = np.full(X_val.shape[0], initial_prediction, dtype=np.float32)
+            predictions_valid = np.full(X_val_array.shape[0], initial_prediction, dtype=np.float32)
 
         X_val_binned: np.ndarray | None = None
         y_val_array: np.ndarray | None = None
@@ -192,8 +225,11 @@ class PackBoost:
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict targets for ``X`` using the fitted model."""
         model = self.model
-        X = np.asarray(X, dtype=np.float32)
-        X_binned = apply_binning(X, model.bin_edges)
+        X_array = np.asarray(X)
+        if model.config.prebinned:
+            X_binned = ensure_prebinned(X_array, model.config.max_bins)
+        else:
+            X_binned = apply_binning(X_array.astype(np.float32, copy=False), model.bin_edges)
         return model.predict_binned(X_binned)
 
     # ------------------------------------------------------------------

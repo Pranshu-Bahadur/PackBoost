@@ -5,6 +5,32 @@ from __future__ import annotations
 import numpy as np
 
 
+def ensure_prebinned(X: np.ndarray, max_bins: int) -> np.ndarray:
+    """Validate and return pre-binned features as ``uint8``."""
+
+    arr = np.asarray(X)
+    if arr.ndim != 2:
+        raise ValueError("Pre-binned features must be a 2D array")
+
+    if arr.size == 0:
+        return arr.astype(np.uint8, copy=False)
+
+    if not np.issubdtype(arr.dtype, np.integer):
+        if not np.issubdtype(arr.dtype, np.floating):
+            raise ValueError("Pre-binned features must be integer-valued")
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("Pre-binned features must be finite")
+        rounded = np.rint(arr)
+        if not np.allclose(arr, rounded, atol=0.0):
+            raise ValueError("Pre-binned features contain non-integer values")
+        arr = rounded.astype(np.int64, copy=False)
+
+    if arr.min() < 0 or arr.max() >= max_bins:
+        raise ValueError("Pre-binned features must lie within [0, max_bins)")
+
+    return arr.astype(np.uint8, copy=False)
+
+
 def quantile_binning(
     X: np.ndarray,
     max_bins: int,

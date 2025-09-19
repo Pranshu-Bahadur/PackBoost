@@ -39,6 +39,9 @@ class PackBoostConfig:
         Threads per block for CUDA frontier kernels.
     cuda_rows_per_thread: int
         Number of frontier rows processed per CUDA thread.
+    prebinned: bool
+        If ``True`` the input arrays are assumed to already contain bin indices
+        in ``[0, max_bins)`` and the CPU quantile binning step is skipped.
     """
 
     pack_size: int = 4
@@ -55,6 +58,7 @@ class PackBoostConfig:
     device: str = "cpu"
     cuda_threads_per_block: int = 128
     cuda_rows_per_thread: int = 1
+    prebinned: bool = False
 
     def validate(self, n_features: int) -> None:
         """Validate configuration values.

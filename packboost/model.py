@@ -78,7 +78,7 @@ class PackBoostModel:
     """Trained PackBoost ensemble."""
 
     config: PackBoostConfig
-    bin_edges: np.ndarray
+    bin_edges: Optional[np.ndarray]
     initial_prediction: float
     trees: List[Tree]
 
@@ -86,7 +86,7 @@ class PackBoostModel:
         """Serialise the model to a dictionary."""
         return {
             "config": self.config.__dict__,
-            "bin_edges": self.bin_edges.tolist(),
+            "bin_edges": self.bin_edges.tolist() if self.bin_edges is not None else None,
             "initial_prediction": self.initial_prediction,
             "trees": [
                 [
@@ -109,7 +109,10 @@ class PackBoostModel:
     def from_dict(cls, payload: Dict[str, object]) -> "PackBoostModel":
         """Create a model from ``payload`` produced by :meth:`to_dict`."""
         config = PackBoostConfig(**payload["config"])  # type: ignore[arg-type]
-        bin_edges = np.asarray(payload["bin_edges"], dtype=np.float32)
+        bin_edges_payload = payload["bin_edges"]
+        bin_edges = None
+        if bin_edges_payload is not None:
+            bin_edges = np.asarray(bin_edges_payload, dtype=np.float32)
         initial_prediction = float(payload["initial_prediction"])
         tree_payloads = payload["trees"]
         trees: List[Tree] = []

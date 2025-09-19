@@ -32,6 +32,7 @@ class PackBoostRegressor(BaseEstimator, RegressorMixin):
         cuda_threads_per_block: int = 128,
         cuda_rows_per_thread: int = 1,
         num_rounds: int = 10,
+        prebinned: bool = False,
     ) -> None:
         self.pack_size = pack_size
         self.max_depth = max_depth
@@ -48,6 +49,7 @@ class PackBoostRegressor(BaseEstimator, RegressorMixin):
         self.cuda_threads_per_block = cuda_threads_per_block
         self.cuda_rows_per_thread = cuda_rows_per_thread
         self.num_rounds = num_rounds
+        self.prebinned = prebinned
         self._booster: Optional[PackBoost] = None
 
     def fit(self, X: np.ndarray, y: np.ndarray, *, era: Optional[Sequence[int]] = None) -> "PackBoostRegressor":
@@ -81,12 +83,15 @@ class PackBoostRegressor(BaseEstimator, RegressorMixin):
             device=self.device,
             cuda_threads_per_block=self.cuda_threads_per_block,
             cuda_rows_per_thread=self.cuda_rows_per_thread,
+            prebinned=self.prebinned,
         )
         booster = PackBoost(config)
         booster.fit(np.asarray(X), np.asarray(y), era_array, num_rounds=self.num_rounds)
         self._booster = booster
         self.model_ = booster.model
         self.bin_edges_ = booster.model.bin_edges
+        self.prebinned_ = booster.model.config.prebinned
+        self.auto_prebinned_ = booster._auto_prebinned
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:

@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 
 from .model import PackBoostModel
-from .utils.binning import apply_binning
+from .utils.binning import apply_binning, ensure_prebinned
 
 
 class PackBoostPredictor:
@@ -29,8 +29,11 @@ class PackBoostPredictor:
         Path(path).write_text(json.dumps(payload))
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        X = np.asarray(X, dtype=np.float32)
-        X_binned = apply_binning(X, self._model.bin_edges)
+        X_array = np.asarray(X)
+        if self._model.config.prebinned:
+            X_binned = ensure_prebinned(X_array, self._model.config.max_bins)
+        else:
+            X_binned = apply_binning(X_array.astype(np.float32, copy=False), self._model.bin_edges)
         return self._model.predict_binned(X_binned)
 
     @property
