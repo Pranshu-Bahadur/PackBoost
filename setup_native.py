@@ -35,6 +35,9 @@ ENABLE_CUDA = NVCC and os.environ.get("PACKBOOST_DISABLE_CUDA") != "1"
 
 macros: list[tuple[str, str | None]] = []
 extra_objects: list[str] = []
+cuda_library_dirs: list[str] = []
+cuda_libraries: list[str] = []
+cuda_runtime_library_dirs: list[str] = []
 
 if ENABLE_CUDA:
     build_temp = ROOT / "build" / "temp"
@@ -76,6 +79,25 @@ if ENABLE_CUDA:
         raise SystemExit(f"nvcc failed with exit code {exc.returncode}") from exc
     macros.append(("PACKBOOST_ENABLE_CUDA", "1"))
     extra_objects.append(str(cuda_obj))
+
+    cuda_root_env = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if cuda_root_env:
+        cuda_root = Path(cuda_root_env)
+    else:
+        cuda_root = Path(NVCC).resolve().parent.parent  # type: ignore[arg-type]
+
+    lib_dir_env = os.environ.get("PACKBOOST_CUDA_LIBDIR")
+    candidate_dirs: list[Path] = []
+    if lib_dir_env:
+        candidate_dirs.append(Path(lib_dir_env))
+    candidate_dirs.extend([cuda_root / "lib64", cuda_root / "lib"])
+    for directory in candidate_dirs:
+        if directory.exists():
+            cuda_library_dirs.append(str(directory))
+            cuda_runtime_library_dirs.append(str(directory))
+            break
+
+    cuda_libraries.append("cudart")
 else:
     sys.stderr.write("[setup_native] CUDA compiler not found – building CPU backend only\n")
 
@@ -87,6 +109,9 @@ ext_modules = [
         include_dirs=[str(SRC_DIR), np.get_include()],
         extra_compile_args=["-O3", "-std=c++17", "-fvisibility=hidden", "-fopenmp"],
         extra_link_args=["-fopenmp"],
+        library_dirs=cuda_library_dirs,
+        libraries=cuda_libraries,
+        runtime_library_dirs=cuda_runtime_library_dirs,
         extra_objects=extra_objects,
     )
 ]
