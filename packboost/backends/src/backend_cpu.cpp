@@ -705,6 +705,8 @@ extern py::tuple cuda_frontier_evaluate_binding(
     int,
     int,
     int);
+
+extern void bind_cuda_workspace(py::module_&);
 #endif
 
 PYBIND11_MODULE(_backend, m) {
@@ -753,5 +755,7 @@ PYBIND11_MODULE(_backend, m) {
         py::arg("era_tile_size"),
         py::arg("threads_per_block"),
         py::arg("rows_per_thread"));
+
+    bind_cuda_workspace(m);
 #endif
 }

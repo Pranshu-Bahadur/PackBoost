@@ -15,6 +15,16 @@
 #include <string>
 #include <vector>
 
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/reduce.h>
+#include <thrust/scatter.h>
+#include <thrust/scan.h>
+#include <thrust/sort.h>
+
 namespace py = pybind11;
 
 namespace packboost {
@@ -29,6 +39,612 @@ inline void check(cudaError_t status, const char* msg) {
         throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(status));
     }
 }
+
+__global__ void gather_era_kernel(
+    const int32_t* __restrict__ node_indices,
+    const int16_t* __restrict__ era_ids,
+    int32_t* __restrict__ era_out,
+    int32_t total_indices)
+{
+    const int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_indices) {
+        return;
+    }
+    const int32_t row = node_indices[idx];
+    era_out[idx] = static_cast<int32_t>(era_ids[row]);
+}
+
+__global__ void base_value_kernel(
+    const int32_t* __restrict__ node_offsets,
+    const int32_t* __restrict__ node_indices,
+    const float* __restrict__ gradients,
+    const float* __restrict__ hessians,
+    int n_nodes,
+    float lambda,
+    float eps,
+    float* __restrict__ base_values)
+{
+    const int node = blockIdx.x;
+    if (node >= n_nodes) {
+        return;
+    }
+
+    const int32_t begin = node_offsets[node];
+    const int32_t end = node_offsets[node + 1];
+    float grad_sum = 0.0f;
+    float hess_sum = 0.0f;
+
+    for (int32_t idx = begin; idx < end; ++idx) {
+        const int32_t row = node_indices[idx];
+        grad_sum += gradients[row];
+        hess_sum += hessians[row];
+    }
+
+    base_values[node] = (end > begin) ? -grad_sum / (hess_sum + lambda + eps) : 0.0f;
+}
+
+__global__ void partition_rows_kernel(
+    const uint8_t* __restrict__ bins,
+    const int32_t* __restrict__ node_offsets,
+    const int32_t* __restrict__ node_indices,
+    const int32_t* __restrict__ best_feature,
+    const int32_t* __restrict__ best_threshold,
+    int n_nodes,
+    int n_features_total,
+    const int32_t* __restrict__ left_offsets,
+    const int32_t* __restrict__ right_offsets,
+    int32_t* __restrict__ left_indices,
+    int32_t* __restrict__ right_indices)
+{
+    const int node = blockIdx.x;
+    if (node >= n_nodes) {
+        return;
+    }
+
+    const int32_t feature = best_feature[node];
+    const int32_t threshold = best_threshold[node];
+    const int32_t begin = node_offsets[node];
+    const int32_t end = node_offsets[node + 1];
+    int32_t left_pos = left_offsets[node];
+    int32_t right_pos = right_offsets[node];
+
+    if (feature < 0 || threshold < 0) {
+        for (int32_t idx = begin; idx < end; ++idx) {
+            left_indices[left_pos++] = node_indices[idx];
+        }
+        return;
+    }
+
+    for (int32_t idx = begin; idx < end; ++idx) {
+        const int32_t row = node_indices[idx];
+        const std::size_t offset = static_cast<std::size_t>(row) * n_features_total + static_cast<std::size_t>(feature);
+        const uint8_t bin = bins[offset];
+        if (bin <= threshold) {
+            left_indices[left_pos++] = row;
+        } else {
+            right_indices[right_pos++] = row;
+        }
+    }
+}
+
+struct MakeKey {
+    __host__ __device__ int64_t operator()(const thrust::tuple<int32_t, int32_t>& value) const {
+        const int64_t node = static_cast<int64_t>(thrust::get<0>(value));
+        const uint32_t era = static_cast<uint32_t>(thrust::get<1>(value));
+        return (node << 32) | static_cast<int64_t>(era);
+    }
+};
+
+struct ExtractNode {
+    __host__ __device__ int32_t operator()(int64_t key) const {
+        return static_cast<int32_t>(key >> 32);
+    }
+};
+
+struct ExtractEra {
+    __host__ __device__ int32_t operator()(int64_t key) const {
+        return static_cast<int32_t>(key & 0xffffffff);
+    }
+};
+
+class CudaFrontierWorkspace {
+public:
+    CudaFrontierWorkspace(std::size_t n_rows,
+                          std::size_t n_features,
+                          int max_bins,
+                          int n_eras_total,
+                          int threads_per_block,
+                          int rows_per_thread)
+        : n_rows_(n_rows),
+          n_features_(n_features),
+          max_bins_(max_bins),
+          n_eras_total_(n_eras_total),
+          threads_per_block_((threads_per_block <= 0 || threads_per_block > 1024) ? 128 : threads_per_block),
+          rows_per_thread_(rows_per_thread <= 0 ? 1 : rows_per_thread),
+          d_bins_(n_rows * n_features),
+          d_era_ids_(n_rows),
+          d_gradients_(n_rows),
+          d_hessians_(n_rows) {}
+
+    ~CudaFrontierWorkspace() {
+        for (const HostRegistration& reg : host_registrations_) {
+            if (reg.ptr != nullptr) {
+                cudaHostUnregister(reg.ptr);
+            }
+        }
+    }
+
+    void set_binned(py::array_t<uint8_t, py::array::c_style | py::array::forcecast> bins) {
+        py::buffer_info info = bins.request();
+        if (info.ndim != 2) {
+            throw std::invalid_argument("bins must be 2D");
+        }
+        if (info.shape[0] != static_cast<py::ssize_t>(n_rows_) || info.shape[1] != static_cast<py::ssize_t>(n_features_)) {
+            throw std::invalid_argument("binned matrix shape mismatch");
+        }
+        const std::size_t bytes = static_cast<std::size_t>(info.shape[0]) * static_cast<std::size_t>(info.shape[1]) * sizeof(uint8_t);
+        check(cudaMemcpy(thrust::raw_pointer_cast(d_bins_.data()), info.ptr, bytes, cudaMemcpyHostToDevice), "cudaMemcpy bins");
+    }
+
+    void set_era_ids(py::array_t<int16_t, py::array::c_style | py::array::forcecast> era_ids) {
+        py::buffer_info info = era_ids.request();
+        if (info.ndim != 1) {
+            throw std::invalid_argument("era_ids must be 1D");
+        }
+        if (info.shape[0] != static_cast<py::ssize_t>(n_rows_)) {
+            throw std::invalid_argument("era_ids length mismatch");
+        }
+        const std::size_t bytes = static_cast<std::size_t>(info.shape[0]) * sizeof(int16_t);
+        check(cudaMemcpy(thrust::raw_pointer_cast(d_era_ids_.data()), info.ptr, bytes, cudaMemcpyHostToDevice), "cudaMemcpy era_ids");
+    }
+
+    void register_host(py::array array) {
+        py::array base = py::array::ensure(array);
+        if (!base) {
+            throw std::invalid_argument("register_host expects an array-like input");
+        }
+        py::buffer_info info = base.request();
+        register_host_buffer(info.ptr, static_cast<std::size_t>(info.size) * static_cast<std::size_t>(info.itemsize));
+    }
+
+    py::tuple evaluate_frontier(
+        py::list node_samples,
+        py::array_t<int32_t, py::array::c_style | py::array::forcecast> feature_subset,
+        py::array_t<float, py::array::c_style | py::array::forcecast> gradients,
+        py::array_t<float, py::array::c_style | py::array::forcecast> hessians,
+        double lambda_l2,
+        double lambda_dro,
+        int min_samples_leaf,
+        double direction_weight,
+        int era_tile_size)
+    {
+        (void)era_tile_size;
+
+        const std::size_t n_nodes = static_cast<std::size_t>(node_samples.size());
+        py::buffer_info feat_info = feature_subset.request();
+        if (feat_info.ndim != 1) {
+            throw std::invalid_argument("feature_subset must be 1D");
+        }
+        const std::size_t n_features_subset = static_cast<std::size_t>(feat_info.shape[0]);
+
+        py::buffer_info grad_info = gradients.request();
+        py::buffer_info hess_info = hessians.request();
+        if (grad_info.ndim != 1 || hess_info.ndim != 1) {
+            throw std::invalid_argument("gradients and hessians must be 1D");
+        }
+        if (grad_info.shape[0] != static_cast<py::ssize_t>(n_rows_) || hess_info.shape[0] != static_cast<py::ssize_t>(n_rows_)) {
+            throw std::invalid_argument("gradient/hessian length mismatch");
+        }
+        register_host_buffer(grad_info.ptr, static_cast<std::size_t>(grad_info.size) * sizeof(float));
+        register_host_buffer(hess_info.ptr, static_cast<std::size_t>(hess_info.size) * sizeof(float));
+        check(cudaMemcpy(thrust::raw_pointer_cast(d_gradients_.data()), grad_info.ptr, n_rows_ * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy gradients");
+        check(cudaMemcpy(thrust::raw_pointer_cast(d_hessians_.data()), hess_info.ptr, n_rows_ * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy hessians");
+
+        std::vector<py::array_t<int32_t, py::array::c_style | py::array::forcecast>> node_arrays;
+        node_arrays.reserve(n_nodes);
+        std::vector<int32_t> node_offsets(n_nodes + 1, 0);
+        for (std::size_t node = 0; node < n_nodes; ++node) {
+            py::array_t<int32_t, py::array::c_style | py::array::forcecast> arr =
+                node_samples[node].cast<py::array_t<int32_t, py::array::c_style | py::array::forcecast>>();
+            py::buffer_info info = arr.request();
+            if (info.ndim != 1) {
+                throw std::invalid_argument("node sample arrays must be 1D int32");
+            }
+            node_arrays.push_back(arr);
+            node_offsets[node + 1] = node_offsets[node] + static_cast<int32_t>(info.shape[0]);
+        }
+        const int32_t total_indices = node_offsets.empty() ? 0 : node_offsets.back();
+        std::vector<int32_t> node_indices_host(static_cast<std::size_t>(total_indices));
+        std::vector<int32_t> node_ids_host(static_cast<std::size_t>(total_indices));
+        for (std::size_t node = 0; node < node_arrays.size(); ++node) {
+            py::buffer_info info = node_arrays[node].request();
+            const int32_t length = static_cast<int32_t>(info.shape[0]);
+            const int32_t offset = node_offsets[node];
+            if (length > 0) {
+                std::memcpy(node_indices_host.data() + offset, info.ptr, static_cast<std::size_t>(length) * sizeof(int32_t));
+                std::fill(node_ids_host.begin() + offset, node_ids_host.begin() + offset + length, static_cast<int32_t>(node));
+            }
+        }
+
+        d_node_offsets_.assign(node_offsets.begin(), node_offsets.end());
+        d_node_indices_.assign(node_indices_host.begin(), node_indices_host.end());
+        d_node_ids_.assign(node_ids_host.begin(), node_ids_host.end());
+
+        if (n_features_subset > 0) {
+            const int32_t* feature_ptr = static_cast<int32_t*>(feat_info.ptr);
+            d_feature_subset_.assign(feature_ptr, feature_ptr + n_features_subset);
+        } else {
+            d_feature_subset_.clear();
+        }
+
+        d_era_keys_.resize(total_indices);
+        d_keys_.resize(total_indices);
+        if (total_indices > 0) {
+            const int threads = 256;
+            const int blocks = (total_indices + threads - 1) / threads;
+            gather_era_kernel<<<blocks, threads>>>(
+                thrust::raw_pointer_cast(d_node_indices_.data()),
+                thrust::raw_pointer_cast(d_era_ids_.data()),
+                thrust::raw_pointer_cast(d_era_keys_.data()),
+                total_indices);
+            check(cudaGetLastError(), "gather_era_kernel launch");
+
+            auto zip_begin = thrust::make_zip_iterator(thrust::make_tuple(d_node_ids_.begin(), d_era_keys_.begin()));
+            auto zip_end = zip_begin + total_indices;
+            thrust::transform(zip_begin, zip_end, d_keys_.begin(), MakeKey{});
+
+            auto values_begin = thrust::make_zip_iterator(thrust::make_tuple(d_node_indices_.begin(), d_node_ids_.begin(), d_era_keys_.begin()));
+            thrust::sort_by_key(d_keys_.begin(), d_keys_.end(), values_begin);
+        }
+
+        const int64_t minimal_capacity = total_indices > 0 ? total_indices : 1;
+        d_unique_keys_.resize(static_cast<std::size_t>(minimal_capacity));
+        d_group_counts_.resize(static_cast<std::size_t>(minimal_capacity));
+        int total_groups = 0;
+        if (total_indices > 0) {
+            auto reduce_result = thrust::reduce_by_key(
+                d_keys_.begin(),
+                d_keys_.end(),
+                thrust::make_constant_iterator<int32_t>(1),
+                d_unique_keys_.begin(),
+                d_group_counts_.begin());
+            total_groups = static_cast<int>(reduce_result.first - d_unique_keys_.begin());
+        }
+        d_unique_keys_.resize(static_cast<std::size_t>(total_groups));
+        d_group_counts_.resize(static_cast<std::size_t>(total_groups));
+
+        d_era_group_offsets_.resize(static_cast<std::size_t>(total_groups) + 1);
+        if (total_groups > 0) {
+            thrust::exclusive_scan(d_group_counts_.begin(), d_group_counts_.end(), d_era_group_offsets_.begin());
+            d_era_group_offsets_[total_groups] = total_indices;
+        } else {
+            d_era_group_offsets_[0] = 0;
+        }
+
+        d_node_era_offsets_.resize(n_nodes + 1);
+        if (n_nodes > 0) {
+            thrust::device_vector<int32_t> groups_per_node(n_nodes, 0);
+            if (total_groups > 0) {
+                thrust::device_vector<int32_t> unique_nodes(total_groups);
+                thrust::device_vector<int32_t> group_per_node_counts(total_groups);
+                auto node_iter = thrust::make_transform_iterator(d_unique_keys_.begin(), ExtractNode{});
+                auto reduce_nodes = thrust::reduce_by_key(
+                    node_iter,
+                    node_iter + total_groups,
+                    thrust::make_constant_iterator<int32_t>(1),
+                    unique_nodes.begin(),
+                    group_per_node_counts.begin());
+                const int nodes_with_groups = static_cast<int>(reduce_nodes.first - unique_nodes.begin());
+                if (nodes_with_groups > 0) {
+                    thrust::scatter(
+                        group_per_node_counts.begin(),
+                        group_per_node_counts.begin() + nodes_with_groups,
+                        unique_nodes.begin(),
+                        groups_per_node.begin());
+                }
+            }
+            thrust::exclusive_scan(groups_per_node.begin(), groups_per_node.end(), d_node_era_offsets_.begin());
+            d_node_era_offsets_[n_nodes] = total_groups;
+        } else {
+            d_node_era_offsets_[0] = 0;
+        }
+
+        const int thresholds = std::max(0, max_bins_ - 1);
+        const float lambda = static_cast<float>(lambda_l2);
+        const float lambda_dro_f = static_cast<float>(lambda_dro);
+        const float direction_weight_f = static_cast<float>(direction_weight);
+        const float eps = 1e-12f;
+
+        d_best_feature_.resize(n_nodes);
+        d_best_threshold_.resize(n_nodes);
+        d_score_.resize(n_nodes);
+        d_agreement_.resize(n_nodes);
+        d_left_value_.resize(n_nodes);
+        d_right_value_.resize(n_nodes);
+        d_left_count_.resize(n_nodes);
+        d_right_count_.resize(n_nodes);
+        d_base_value_.resize(n_nodes);
+
+        if (n_nodes > 0) {
+            base_value_kernel<<<static_cast<int>(n_nodes), 1>>>(
+                thrust::raw_pointer_cast(d_node_offsets_.data()),
+                thrust::raw_pointer_cast(d_node_indices_.data()),
+                thrust::raw_pointer_cast(d_gradients_.data()),
+                thrust::raw_pointer_cast(d_hessians_.data()),
+                static_cast<int>(n_nodes),
+                lambda,
+                eps,
+                thrust::raw_pointer_cast(d_base_value_.data()));
+            check(cudaGetLastError(), "base_value_kernel launch");
+        }
+
+        const bool have_features = (n_nodes > 0) && (n_features_subset > 0) && (thresholds > 0);
+        if (have_features) {
+            const std::size_t feature_slots = static_cast<std::size_t>(n_nodes) * n_features_subset;
+            d_best_threshold_per_feature_.resize(feature_slots);
+            d_score_per_feature_.resize(feature_slots);
+            d_agreement_per_feature_.resize(feature_slots);
+            d_left_value_per_feature_.resize(feature_slots);
+            d_right_value_per_feature_.resize(feature_slots);
+            d_left_count_per_feature_.resize(feature_slots);
+            d_right_count_per_feature_.resize(feature_slots);
+
+            const dim3 grid(static_cast<unsigned int>(n_nodes), static_cast<unsigned int>(n_features_subset), 1);
+            const std::size_t shared_bytes =
+                static_cast<std::size_t>(max_bins_) * (2 * sizeof(float) + sizeof(int32_t)) +
+                static_cast<std::size_t>(thresholds) * (6 * sizeof(float) + 4 * sizeof(int32_t));
+
+            frontier_feature_kernel<<<grid, threads_per_block_, shared_bytes>>>(
+                thrust::raw_pointer_cast(d_bins_.data()),
+                thrust::raw_pointer_cast(d_node_indices_.data()),
+                thrust::raw_pointer_cast(d_node_offsets_.data()),
+                thrust::raw_pointer_cast(d_node_era_offsets_.data()),
+                thrust::raw_pointer_cast(d_era_group_offsets_.data()),
+                thrust::raw_pointer_cast(d_feature_subset_.data()),
+                thrust::raw_pointer_cast(d_gradients_.data()),
+                thrust::raw_pointer_cast(d_hessians_.data()),
+                static_cast<int>(n_rows_),
+                static_cast<int>(n_features_),
+                max_bins_,
+                thresholds,
+                static_cast<int>(n_features_subset),
+                n_eras_total_,
+                rows_per_thread_,
+                min_samples_leaf,
+                lambda,
+                lambda_dro_f,
+                direction_weight_f,
+                eps,
+                thrust::raw_pointer_cast(d_best_threshold_per_feature_.data()),
+                thrust::raw_pointer_cast(d_score_per_feature_.data()),
+                thrust::raw_pointer_cast(d_agreement_per_feature_.data()),
+                thrust::raw_pointer_cast(d_left_value_per_feature_.data()),
+                thrust::raw_pointer_cast(d_right_value_per_feature_.data()),
+                thrust::raw_pointer_cast(d_left_count_per_feature_.data()),
+                thrust::raw_pointer_cast(d_right_count_per_feature_.data()));
+            check(cudaGetLastError(), "frontier_feature_kernel launch");
+
+            const int threads_select = threads_per_block_;
+            const int blocks_select = static_cast<int>((n_nodes + threads_select - 1) / threads_select);
+            frontier_select_kernel<<<blocks_select, threads_select>>>(
+                thrust::raw_pointer_cast(d_feature_subset_.data()),
+                static_cast<int>(n_features_subset),
+                thrust::raw_pointer_cast(d_node_offsets_.data()),
+                static_cast<int>(n_nodes),
+                thrust::raw_pointer_cast(d_best_threshold_per_feature_.data()),
+                thrust::raw_pointer_cast(d_score_per_feature_.data()),
+                thrust::raw_pointer_cast(d_agreement_per_feature_.data()),
+                thrust::raw_pointer_cast(d_left_value_per_feature_.data()),
+                thrust::raw_pointer_cast(d_right_value_per_feature_.data()),
+                thrust::raw_pointer_cast(d_left_count_per_feature_.data()),
+                thrust::raw_pointer_cast(d_right_count_per_feature_.data()),
+                thrust::raw_pointer_cast(d_best_feature_.data()),
+                thrust::raw_pointer_cast(d_best_threshold_.data()),
+                thrust::raw_pointer_cast(d_score_.data()),
+                thrust::raw_pointer_cast(d_agreement_.data()),
+                thrust::raw_pointer_cast(d_left_value_.data()),
+                thrust::raw_pointer_cast(d_right_value_.data()),
+                thrust::raw_pointer_cast(d_left_count_.data()),
+                thrust::raw_pointer_cast(d_right_count_.data()));
+            check(cudaGetLastError(), "frontier_select_kernel launch");
+        } else {
+            std::vector<int32_t> node_rows(n_nodes, 0);
+            for (std::size_t node = 0; node < n_nodes; ++node) {
+                node_rows[node] = node_offsets[node + 1] - node_offsets[node];
+            }
+            thrust::fill(d_best_feature_.begin(), d_best_feature_.end(), -1);
+            thrust::fill(d_best_threshold_.begin(), d_best_threshold_.end(), 0);
+            thrust::fill(d_score_.begin(), d_score_.end(), NEG_INF_F);
+            thrust::fill(d_agreement_.begin(), d_agreement_.end(), 0.0f);
+            thrust::copy(d_base_value_.begin(), d_base_value_.end(), d_left_value_.begin());
+            thrust::copy(d_base_value_.begin(), d_base_value_.end(), d_right_value_.begin());
+            d_left_count_.assign(node_rows.begin(), node_rows.end());
+            d_right_count_.assign(n_nodes, 0);
+        }
+
+        int32_t total_left = n_nodes > 0 ? thrust::reduce(d_left_count_.begin(), d_left_count_.end(), int32_t{0}) : 0;
+        int32_t total_right = n_nodes > 0 ? thrust::reduce(d_right_count_.begin(), d_right_count_.end(), int32_t{0}) : 0;
+
+        d_left_offsets_.resize(n_nodes + 1);
+        d_right_offsets_.resize(n_nodes + 1);
+        if (n_nodes > 0) {
+            thrust::exclusive_scan(d_left_count_.begin(), d_left_count_.end(), d_left_offsets_.begin());
+            thrust::exclusive_scan(d_right_count_.begin(), d_right_count_.end(), d_right_offsets_.begin());
+        }
+        d_left_offsets_[n_nodes] = total_left;
+        d_right_offsets_[n_nodes] = total_right;
+
+        d_left_indices_.resize(total_left);
+        d_right_indices_.resize(total_right);
+
+        if (n_nodes > 0) {
+            partition_rows_kernel<<<static_cast<int>(n_nodes), 1>>>(
+                thrust::raw_pointer_cast(d_bins_.data()),
+                thrust::raw_pointer_cast(d_node_offsets_.data()),
+                thrust::raw_pointer_cast(d_node_indices_.data()),
+                thrust::raw_pointer_cast(d_best_feature_.data()),
+                thrust::raw_pointer_cast(d_best_threshold_.data()),
+                static_cast<int>(n_nodes),
+                static_cast<int>(n_features_),
+                thrust::raw_pointer_cast(d_left_offsets_.data()),
+                thrust::raw_pointer_cast(d_right_offsets_.data()),
+                thrust::raw_pointer_cast(d_left_indices_.data()),
+                thrust::raw_pointer_cast(d_right_indices_.data()));
+            check(cudaGetLastError(), "partition_rows_kernel launch");
+        }
+
+        std::vector<int32_t> best_feature_host(n_nodes, -1);
+        std::vector<int32_t> best_threshold_host(n_nodes, 0);
+        std::vector<float> score_host(n_nodes, NEG_INF_F);
+        std::vector<float> agreement_host(n_nodes, 0.0f);
+        std::vector<float> left_value_host(n_nodes, 0.0f);
+        std::vector<float> right_value_host(n_nodes, 0.0f);
+        std::vector<int32_t> left_count_host(n_nodes, 0);
+        std::vector<int32_t> right_count_host(n_nodes, 0);
+        std::vector<float> base_value_host(n_nodes, 0.0f);
+        std::vector<int32_t> left_offsets_host(n_nodes + 1, 0);
+        std::vector<int32_t> right_offsets_host(n_nodes + 1, 0);
+        std::vector<int32_t> left_indices_host(static_cast<std::size_t>(total_left));
+        std::vector<int32_t> right_indices_host(static_cast<std::size_t>(total_right));
+
+        if (n_nodes > 0) {
+            check(cudaMemcpy(best_feature_host.data(), thrust::raw_pointer_cast(d_best_feature_.data()), n_nodes * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy best_feature");
+            check(cudaMemcpy(best_threshold_host.data(), thrust::raw_pointer_cast(d_best_threshold_.data()), n_nodes * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy best_threshold");
+            check(cudaMemcpy(score_host.data(), thrust::raw_pointer_cast(d_score_.data()), n_nodes * sizeof(float), cudaMemcpyDeviceToHost), "copy score");
+            check(cudaMemcpy(agreement_host.data(), thrust::raw_pointer_cast(d_agreement_.data()), n_nodes * sizeof(float), cudaMemcpyDeviceToHost), "copy agreement");
+            check(cudaMemcpy(left_value_host.data(), thrust::raw_pointer_cast(d_left_value_.data()), n_nodes * sizeof(float), cudaMemcpyDeviceToHost), "copy left_value");
+            check(cudaMemcpy(right_value_host.data(), thrust::raw_pointer_cast(d_right_value_.data()), n_nodes * sizeof(float), cudaMemcpyDeviceToHost), "copy right_value");
+            check(cudaMemcpy(left_count_host.data(), thrust::raw_pointer_cast(d_left_count_.data()), n_nodes * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy left_count");
+            check(cudaMemcpy(right_count_host.data(), thrust::raw_pointer_cast(d_right_count_.data()), n_nodes * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy right_count");
+            check(cudaMemcpy(base_value_host.data(), thrust::raw_pointer_cast(d_base_value_.data()), n_nodes * sizeof(float), cudaMemcpyDeviceToHost), "copy base_value");
+            if (!left_offsets_host.empty()) {
+                check(cudaMemcpy(left_offsets_host.data(), thrust::raw_pointer_cast(d_left_offsets_.data()), (n_nodes + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy left_offsets");
+                check(cudaMemcpy(right_offsets_host.data(), thrust::raw_pointer_cast(d_right_offsets_.data()), (n_nodes + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy right_offsets");
+            }
+            if (total_left > 0) {
+                check(cudaMemcpy(left_indices_host.data(), thrust::raw_pointer_cast(d_left_indices_.data()), total_left * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy left_indices");
+            }
+            if (total_right > 0) {
+                check(cudaMemcpy(right_indices_host.data(), thrust::raw_pointer_cast(d_right_indices_.data()), total_right * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy right_indices");
+            }
+        }
+
+        py::array_t<int32_t> feature_arr({static_cast<py::ssize_t>(n_nodes)});
+        py::array_t<int32_t> threshold_arr({static_cast<py::ssize_t>(n_nodes)});
+        py::array_t<float> score_arr({static_cast<py::ssize_t>(n_nodes)});
+        py::array_t<float> agreement_arr({static_cast<py::ssize_t>(n_nodes)});
+        py::array_t<float> left_value_arr({static_cast<py::ssize_t>(n_nodes)});
+        py::array_t<float> right_value_arr({static_cast<py::ssize_t>(n_nodes)});
+        py::array_t<float> base_value_arr({static_cast<py::ssize_t>(n_nodes)});
+        py::array_t<int32_t> left_offsets_arr({static_cast<py::ssize_t>(n_nodes + 1)});
+        py::array_t<int32_t> right_offsets_arr({static_cast<py::ssize_t>(n_nodes + 1)});
+        py::array_t<int32_t> left_indices_arr({static_cast<py::ssize_t>(total_left)});
+        py::array_t<int32_t> right_indices_arr({static_cast<py::ssize_t>(total_right)});
+
+        if (n_nodes > 0) {
+            std::memcpy(feature_arr.mutable_data(), best_feature_host.data(), n_nodes * sizeof(int32_t));
+            std::memcpy(threshold_arr.mutable_data(), best_threshold_host.data(), n_nodes * sizeof(int32_t));
+            std::memcpy(score_arr.mutable_data(), score_host.data(), n_nodes * sizeof(float));
+            std::memcpy(agreement_arr.mutable_data(), agreement_host.data(), n_nodes * sizeof(float));
+            std::memcpy(left_value_arr.mutable_data(), left_value_host.data(), n_nodes * sizeof(float));
+            std::memcpy(right_value_arr.mutable_data(), right_value_host.data(), n_nodes * sizeof(float));
+            std::memcpy(base_value_arr.mutable_data(), base_value_host.data(), n_nodes * sizeof(float));
+            std::memcpy(left_offsets_arr.mutable_data(), left_offsets_host.data(), (n_nodes + 1) * sizeof(int32_t));
+            std::memcpy(right_offsets_arr.mutable_data(), right_offsets_host.data(), (n_nodes + 1) * sizeof(int32_t));
+        }
+        if (total_left > 0) {
+            std::memcpy(left_indices_arr.mutable_data(), left_indices_host.data(), total_left * sizeof(int32_t));
+        }
+        if (total_right > 0) {
+            std::memcpy(right_indices_arr.mutable_data(), right_indices_host.data(), total_right * sizeof(int32_t));
+        }
+
+        return py::make_tuple(
+            std::move(feature_arr),
+            std::move(threshold_arr),
+            std::move(score_arr),
+            std::move(agreement_arr),
+            std::move(left_value_arr),
+            std::move(right_value_arr),
+            std::move(base_value_arr),
+            std::move(left_offsets_arr),
+            std::move(right_offsets_arr),
+            std::move(left_indices_arr),
+            std::move(right_indices_arr));
+    }
+
+private:
+    struct HostRegistration {
+        void* ptr;
+        std::size_t bytes;
+    };
+
+    void register_host_buffer(void* ptr, std::size_t bytes) {
+        if (ptr == nullptr || bytes == 0) {
+            return;
+        }
+        auto it = std::find_if(host_registrations_.begin(), host_registrations_.end(), [&](const HostRegistration& reg) {
+            return reg.ptr == ptr;
+        });
+        if (it != host_registrations_.end()) {
+            return;
+        }
+        cudaError_t status = cudaHostRegister(ptr, bytes, cudaHostRegisterDefault);
+        if (status == cudaErrorHostMemoryAlreadyRegistered) {
+            cudaGetLastError();
+            return;
+        }
+        check(status, "cudaHostRegister");
+        host_registrations_.push_back({ptr, bytes});
+    }
+
+    std::size_t n_rows_;
+    std::size_t n_features_;
+    int max_bins_;
+    int n_eras_total_;
+    int threads_per_block_;
+    int rows_per_thread_;
+
+    thrust::device_vector<uint8_t> d_bins_;
+    thrust::device_vector<int16_t> d_era_ids_;
+    thrust::device_vector<float> d_gradients_;
+    thrust::device_vector<float> d_hessians_;
+
+    thrust::device_vector<int32_t> d_node_indices_;
+    thrust::device_vector<int32_t> d_node_offsets_;
+    thrust::device_vector<int32_t> d_node_ids_;
+    thrust::device_vector<int32_t> d_era_keys_;
+    thrust::device_vector<int64_t> d_keys_;
+    thrust::device_vector<int64_t> d_unique_keys_;
+    thrust::device_vector<int32_t> d_group_counts_;
+    thrust::device_vector<int32_t> d_era_group_offsets_;
+    thrust::device_vector<int32_t> d_node_era_offsets_;
+    thrust::device_vector<int32_t> d_feature_subset_;
+
+    thrust::device_vector<int32_t> d_best_threshold_per_feature_;
+    thrust::device_vector<float> d_score_per_feature_;
+    thrust::device_vector<float> d_agreement_per_feature_;
+    thrust::device_vector<float> d_left_value_per_feature_;
+    thrust::device_vector<float> d_right_value_per_feature_;
+    thrust::device_vector<int32_t> d_left_count_per_feature_;
+    thrust::device_vector<int32_t> d_right_count_per_feature_;
+
+    thrust::device_vector<int32_t> d_best_feature_;
+    thrust::device_vector<int32_t> d_best_threshold_;
+    thrust::device_vector<float> d_score_;
+    thrust::device_vector<float> d_agreement_;
+    thrust::device_vector<float> d_left_value_;
+    thrust::device_vector<float> d_right_value_;
+    thrust::device_vector<int32_t> d_left_count_;
+    thrust::device_vector<int32_t> d_right_count_;
+    thrust::device_vector<float> d_base_value_;
+    thrust::device_vector<int32_t> d_left_offsets_;
+    thrust::device_vector<int32_t> d_right_offsets_;
+    thrust::device_vector<int32_t> d_left_indices_;
+    thrust::device_vector<int32_t> d_right_indices_;
+
+    std::vector<HostRegistration> host_registrations_;
+};
 
 __inline__ __device__ int lane_id() {
     int id;
@@ -1017,4 +1633,33 @@ py::tuple cuda_frontier_evaluate_binding(
         right_offsets_arr,
         left_indices_arr,
         right_indices_arr);
+}
+
+}  // namespace packboost
+
+void bind_cuda_workspace(py::module_& m) {
+    py::class_<packboost::CudaFrontierWorkspace>(m, "CudaFrontierWorkspace")
+        .def(
+            py::init<std::size_t, std::size_t, int, int, int, int>(),
+            py::arg("n_rows"),
+            py::arg("n_features"),
+            py::arg("max_bins"),
+            py::arg("n_eras_total"),
+            py::arg("threads_per_block"),
+            py::arg("rows_per_thread"))
+        .def("set_binned", &packboost::CudaFrontierWorkspace::set_binned, py::arg("binned"))
+        .def("set_era_ids", &packboost::CudaFrontierWorkspace::set_era_ids, py::arg("era_ids"))
+        .def("register_host", &packboost::CudaFrontierWorkspace::register_host, py::arg("array"))
+        .def(
+            "evaluate_frontier",
+            &packboost::CudaFrontierWorkspace::evaluate_frontier,
+            py::arg("node_samples"),
+            py::arg("feature_subset"),
+            py::arg("gradients"),
+            py::arg("hessians"),
+            py::arg("lambda_l2"),
+            py::arg("lambda_dro"),
+            py::arg("min_samples_leaf"),
+            py::arg("direction_weight"),
+            py::arg("era_tile_size"));
 }

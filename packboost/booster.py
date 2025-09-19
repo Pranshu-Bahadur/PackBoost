@@ -17,6 +17,7 @@ from .backends import (
     cuda_available,
     cuda_frontier_evaluate,
     cuda_histogram,
+    CudaFrontierWorkspace,
 )
 
 
@@ -29,6 +30,7 @@ class PackBoost:
         self._use_gpu: bool = False
         self._num_eras: int | None = None
         self._auto_prebinned: bool = False
+        self._cuda_workspace: Any | None = None
 
     @property
     def model(self) -> PackBoostModel:
@@ -52,6 +54,8 @@ class PackBoost:
         X_array = np.asarray(X)
         if X_array.ndim != 2:
             raise ValueError("X must be a 2D array")
+
+        self._cuda_workspace = None
 
         prebinned_candidate: np.ndarray | None = None
         auto_prebinned = False
@@ -104,9 +108,25 @@ class PackBoost:
                 X_float, self.config.max_bins, random_state=self.config.random_state
             )
 
+        if self._use_gpu and CudaFrontierWorkspace is not None:
+            X_binned = np.ascontiguousarray(X_binned, dtype=np.uint8)
+            era_ids = np.ascontiguousarray(era_ids, dtype=np.int16)
+            n_total_eras = int(self._num_eras or 0)
+            self._cuda_workspace = CudaFrontierWorkspace(
+                n_rows=n_samples,
+                n_features=n_features,
+                max_bins=self.config.max_bins,
+                n_eras_total=n_total_eras,
+                threads_per_block=self.config.cuda_threads_per_block,
+                rows_per_thread=self.config.cuda_rows_per_thread,
+            )
+            self._cuda_workspace.set_binned(X_binned)
+            self._cuda_workspace.set_era_ids(era_ids)
+
         initial_prediction = float(np.mean(y))
         predictions = np.full(n_samples, initial_prediction, dtype=np.float32)
         hessians = np.ones(n_samples, dtype=np.float32)
+        gradients = predictions - y
 
         eval_data: tuple[np.ndarray, np.ndarray] | None = None
         predictions_valid: np.ndarray | None = None
@@ -145,8 +165,12 @@ class PackBoost:
                 return 0.0
             return corr
 
+        if self._cuda_workspace is not None:
+            self._cuda_workspace.register_host(gradients)
+            self._cuda_workspace.register_host(hessians)
+
         for round_idx in range(num_rounds):
-            gradients = predictions - y
+            np.subtract(predictions, y, out=gradients)
             pack_trees, pack_frontiers, pack_samples = self._initialise_pack(n_samples)
 
             for depth in range(self.config.max_depth):
@@ -294,12 +318,17 @@ class PackBoost:
             if not node_samples:
                 continue
 
-            batch = self._prepare_frontier_batch(node_samples, era_ids)
+            workspace_active = self._use_gpu and self._cuda_workspace is not None
+            batch: dict[str, np.ndarray | list[np.ndarray]] | None = None
+            if not workspace_active:
+                batch = self._prepare_frontier_batch(node_samples, era_ids)
+
             decisions = self._evaluate_frontier_batch(
                 X_binned=X_binned,
                 gradients=gradients,
                 hessians=hessians,
                 era_ids=era_ids,
+                node_samples=node_samples,
                 batch=batch,
                 features=feature_subset,
             )
@@ -419,15 +448,14 @@ class PackBoost:
         gradients: np.ndarray,
         hessians: np.ndarray,
         era_ids: np.ndarray,
-        batch: dict[str, np.ndarray | list[np.ndarray]],
+        node_samples: list[np.ndarray] | None = None,
+        batch: dict[str, np.ndarray | list[np.ndarray]] | None = None,
         features: Iterable[int],
     ) -> List[SplitDecision]:
-        node_samples = batch["samples"]  # type: ignore[index]
-        indices = batch["indices"]  # type: ignore[index]
-        node_offsets = batch["node_offsets"]  # type: ignore[index]
-        node_era_offsets = batch["node_era_offsets"]  # type: ignore[index]
-        era_group_eras = batch["era_group_eras"]  # type: ignore[index]
-        era_group_offsets = batch["era_group_offsets"]  # type: ignore[index]
+        if node_samples is None:
+            if batch is None:
+                raise ValueError("node_samples or batch must be provided")
+            node_samples = batch["samples"]  # type: ignore[index]
 
         features_arr = np.asarray(list(features), dtype=np.int32)
         if features_arr.size == 0:
@@ -441,12 +469,10 @@ class PackBoost:
                 config=self.config,
             )
 
-        if era_ids.size:
-            n_total_eras = int(self._num_eras or (int(era_ids.max()) + 1))
-        else:
-            n_total_eras = int(self._num_eras or 0)
+        use_workspace = self._use_gpu and self._cuda_workspace is not None
 
-        if self._use_gpu and cuda_frontier_evaluate is not None:
+        if use_workspace:
+            gpu_samples = [np.ascontiguousarray(samples, dtype=np.int32) for samples in node_samples]
             (
                 features_native,
                 thresholds,
@@ -459,72 +485,112 @@ class PackBoost:
                 right_offsets,
                 left_indices_flat,
                 right_indices_flat,
-            ) = cuda_frontier_evaluate(
-                X_binned,
-                indices,
-                node_offsets,
-                node_era_offsets,
-                era_group_eras,
-                era_group_offsets,
-                features_arr,
-                gradients,
-                hessians,
-                self.config.max_bins,
-                n_total_eras,
-                self.config.lambda_l2,
-                self.config.lambda_dro,
-                self.config.min_samples_leaf,
-                self.config.direction_weight,
-                self.config.era_tile_size,
-                self.config.cuda_threads_per_block,
-                self.config.cuda_rows_per_thread,
-            )
-        elif cpu_frontier_evaluate is not None:
-            (
-                features_native,
-                thresholds,
-                scores,
-                agreements,
-                left_vals,
-                right_vals,
-                base_vals,
-                left_offsets,
-                right_offsets,
-                left_indices_flat,
-                right_indices_flat,
-            ) = cpu_frontier_evaluate(
-                X_binned,
-                indices,
-                node_offsets,
-                node_era_offsets,
-                era_group_eras,
-                era_group_offsets,
-                features_arr,
-                gradients,
-                hessians,
-                self.config.max_bins,
-                n_total_eras,
-                self.config.lambda_l2,
-                self.config.lambda_dro,
-                self.config.min_samples_leaf,
-                self.config.direction_weight,
-                self.config.era_tile_size,
-            )
-        else:
-            return evaluate_frontier(
-                X_binned=X_binned,
+            ) = self._cuda_workspace.evaluate_frontier(
+                node_samples=gpu_samples,
+                feature_subset=features_arr,
                 gradients=gradients,
                 hessians=hessians,
-                era_ids=era_ids,
-                node_indices_list=node_samples,
-                features=features,
-                config=self.config,
+                lambda_l2=self.config.lambda_l2,
+                lambda_dro=self.config.lambda_dro,
+                min_samples_leaf=self.config.min_samples_leaf,
+                direction_weight=self.config.direction_weight,
+                era_tile_size=self.config.era_tile_size,
             )
+            node_samples_backend: list[np.ndarray] = node_samples
+        else:
+            if batch is None:
+                batch = self._prepare_frontier_batch(node_samples, era_ids)
+            node_samples_backend = batch["samples"]  # type: ignore[index]
+            indices = batch["indices"]  # type: ignore[index]
+            node_offsets = batch["node_offsets"]  # type: ignore[index]
+            node_era_offsets = batch["node_era_offsets"]  # type: ignore[index]
+            era_group_eras = batch["era_group_eras"]  # type: ignore[index]
+            era_group_offsets = batch["era_group_offsets"]  # type: ignore[index]
+
+            if era_ids.size:
+                n_total_eras = int(self._num_eras or (int(era_ids.max()) + 1))
+            else:
+                n_total_eras = int(self._num_eras or 0)
+
+            if self._use_gpu and cuda_frontier_evaluate is not None:
+                (
+                    features_native,
+                    thresholds,
+                    scores,
+                    agreements,
+                    left_vals,
+                    right_vals,
+                    base_vals,
+                    left_offsets,
+                    right_offsets,
+                    left_indices_flat,
+                    right_indices_flat,
+                ) = cuda_frontier_evaluate(
+                    X_binned,
+                    indices,
+                    node_offsets,
+                    node_era_offsets,
+                    era_group_eras,
+                    era_group_offsets,
+                    features_arr,
+                    gradients,
+                    hessians,
+                    self.config.max_bins,
+                    n_total_eras,
+                    self.config.lambda_l2,
+                    self.config.lambda_dro,
+                    self.config.min_samples_leaf,
+                    self.config.direction_weight,
+                    self.config.era_tile_size,
+                    self.config.cuda_threads_per_block,
+                    self.config.cuda_rows_per_thread,
+                )
+            elif cpu_frontier_evaluate is not None:
+                (
+                    features_native,
+                    thresholds,
+                    scores,
+                    agreements,
+                    left_vals,
+                    right_vals,
+                    base_vals,
+                    left_offsets,
+                    right_offsets,
+                    left_indices_flat,
+                    right_indices_flat,
+                ) = cpu_frontier_evaluate(
+                    X_binned,
+                    indices,
+                    node_offsets,
+                    node_era_offsets,
+                    era_group_eras,
+                    era_group_offsets,
+                    features_arr,
+                    gradients,
+                    hessians,
+                    self.config.max_bins,
+                    n_total_eras,
+                    self.config.lambda_l2,
+                    self.config.lambda_dro,
+                    self.config.min_samples_leaf,
+                    self.config.direction_weight,
+                    self.config.era_tile_size,
+                )
+            else:
+                return evaluate_frontier(
+                    X_binned=X_binned,
+                    gradients=gradients,
+                    hessians=hessians,
+                    era_ids=era_ids,
+                    node_indices_list=node_samples,
+                    features=features,
+                    config=self.config,
+                )
 
         features_arr = features_arr.astype(np.int32, copy=False)
 
         decisions: List[SplitDecision] = []
-        for idx, samples_arr in enumerate(node_samples):
+        for idx, samples_arr in enumerate(node_samples_backend):
             best_feature = int(features_native[idx])
             threshold = int(thresholds[idx])
             score = float(scores[idx])
