@@ -706,6 +706,18 @@ extern py::tuple cuda_frontier_evaluate_binding(
     int,
     int);
 
+extern py::array_t<float> cuda_predict_forest_binding(
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast>,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast>,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast>,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast>,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast>,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast>,
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast>,
+    py::array_t<float, py::array::c_style | py::array::forcecast>,
+    double,
+    double);
+
 extern void bind_cuda_workspace(py::module_&);
 #endif
 
@@ -755,6 +767,21 @@ PYBIND11_MODULE(_backend, m) {
         py::arg("era_tile_size"),
         py::arg("threads_per_block"),
         py::arg("rows_per_thread"));
+
+    m.def(
+        "cuda_predict_forest",
+        &cuda_predict_forest_binding,
+        "Predict using a flattened forest on the GPU",
+        py::arg("bins"),
+        py::arg("tree_offsets"),
+        py::arg("features"),
+        py::arg("thresholds"),
+        py::arg("lefts"),
+        py::arg("rights"),
+        py::arg("is_leaf"),
+        py::arg("values"),
+        py::arg("tree_weight"),
+        py::arg("initial_prediction"));
 
     bind_cuda_workspace(m);
 #endif
