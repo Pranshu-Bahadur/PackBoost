@@ -50,11 +50,12 @@ python setup_native.py build_ext --inplace
 CUDA users need `nvcc` in `PATH`. The build script detects it automatically and
 compiles the optimized kernels (including the frontier evaluator) when available.
 Set `PACKBOOST_DISABLE_CUDA=1` before the build to force a CPU-only wheel even on
-GPU machines. Without CUDA the script still builds the fast multi-threaded CPU
-backend, which now streams era tiles and accumulates split statistics in O(1)
-memory. The CUDA frontier kernel mirrors the same tiling logic so high-era
-workloads stay on device. If neither backend is built PackBoost falls back to
-the pure NumPy implementation.
+GPU machines. You can also override the GPU architectures that `nvcc` targets by
+setting `PACKBOOST_CUDA_ARCHS="80,86"` (default is `70,75,80,86`). Without CUDA the
+script still builds the fast multi-threaded CPU backend, which now streams era tiles
+and accumulates split statistics in O(1) memory. The CUDA frontier kernel mirrors the
+same tiling logic so high-era workloads stay on device. If neither backend is built
+PackBoost falls back to the pure NumPy implementation.
 
 ## Quick Start
 

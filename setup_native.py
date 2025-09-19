@@ -47,18 +47,25 @@ if ENABLE_CUDA:
         np.get_include(),
         str(SRC_DIR),
     ]
+    arch_list_env = os.environ.get("PACKBOOST_CUDA_ARCHS")
+    if arch_list_env:
+        arch_list = [arch.strip() for arch in arch_list_env.split(",") if arch.strip()]
+    else:
+        arch_list = ["70", "75", "80", "86"]
     cmd = [
         NVCC,
         "-std=c++17",
         "-O3",
         "-Xcompiler",
         "-fPIC",
-        "-arch=sm_70",
         "-c",
         str(CUDA_SOURCE),
         "-o",
         str(cuda_obj),
     ]
+    for arch in arch_list:
+        cmd.extend(["-gencode", f"arch=compute_{arch},code=sm_{arch}"])
+        cmd.extend(["-gencode", f"arch=compute_{arch},code=compute_{arch}"])
     for inc in include_dirs:
         cmd.extend(["-I", inc])
     cmd.extend(["-DPACKBOOST_ENABLE_CUDA=1"])
