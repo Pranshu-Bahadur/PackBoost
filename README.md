@@ -18,6 +18,9 @@ across regime shifts.
 - **Era-tiling on CPU** – the CPU backend now streams eras in tiles, reusing
   histograms and Welford-style statistics to keep memory bounded even for
   hundreds of eras.
+- **GPU frontier kernels** – CUDA matches the streaming frontier interface,
+  accumulating DES statistics on-device so large era counts no longer fall back
+  to the CPU.
 - **Deterministic by design** – quantile binning, seeded sampling, and pure
   functions keep runs reproducible.
 - **Friendly tooling** – scikit-learn compatible wrapper, standalone
@@ -49,8 +52,9 @@ compiles the optimized kernels (including the frontier evaluator) when available
 Set `PACKBOOST_DISABLE_CUDA=1` before the build to force a CPU-only wheel even on
 GPU machines. Without CUDA the script still builds the fast multi-threaded CPU
 backend, which now streams era tiles and accumulates split statistics in O(1)
-memory. If neither backend is built PackBoost falls back to the pure NumPy
-implementation.
+memory. The CUDA frontier kernel mirrors the same tiling logic so high-era
+workloads stay on device. If neither backend is built PackBoost falls back to
+the pure NumPy implementation.
 
 ## Quick Start
 
