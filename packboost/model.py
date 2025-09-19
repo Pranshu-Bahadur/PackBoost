@@ -8,6 +8,20 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from .config import PackBoostConfig
+from .backends import cuda_predict_forest
+
+
+@dataclass
+class FlattenedForest:
+    """Contiguous representation of the ensemble for fast traversal."""
+
+    tree_offsets: np.ndarray
+    features: np.ndarray
+    thresholds: np.ndarray
+    lefts: np.ndarray
+    rights: np.ndarray
+    is_leaf: np.ndarray
+    values: np.ndarray
 
 
 @dataclass
@@ -81,6 +95,7 @@ class PackBoostModel:
     bin_edges: Optional[np.ndarray]
     initial_prediction: float
     trees: List[Tree]
+    _flattened: Optional[FlattenedForest] = field(default=None, init=False, repr=False)
 
     def to_dict(self) -> Dict[str, object]:
         """Serialise the model to a dictionary."""
@@ -139,8 +154,75 @@ class PackBoostModel:
 
     def predict_binned(self, X_binned: np.ndarray) -> np.ndarray:
         """Predict using pre-binned features."""
-        preds = np.full(X_binned.shape[0], self.initial_prediction, dtype=np.float32)
+        X_arr = np.asarray(X_binned)
+        if X_arr.ndim != 2:
+            raise ValueError("X_binned must be 2D")
+
+        if self.config.device == "cuda" and cuda_predict_forest is not None:
+            flat = self.flatten_forest()
+            X_device = np.ascontiguousarray(X_arr, dtype=np.uint8)
+            return cuda_predict_forest(
+                X_device,
+                flat.tree_offsets,
+                flat.features,
+                flat.thresholds,
+                flat.lefts,
+                flat.rights,
+                flat.is_leaf,
+                flat.values,
+                float(self.config.learning_rate / self.config.pack_size),
+                float(self.initial_prediction),
+            )
+
+        preds = np.full(X_arr.shape[0], self.initial_prediction, dtype=np.float32)
         tree_weight = self.config.learning_rate / self.config.pack_size
         for tree in self.trees:
-            preds += tree_weight * tree.predict_binned(X_binned)
+            preds += tree_weight * tree.predict_binned(X_arr)
         return preds
+
+    def flatten_forest(self) -> FlattenedForest:
+        """Return a flattened view of the ensemble suitable for GPU traversal."""
+
+        if self._flattened is not None:
+            return self._flattened
+
+        n_trees = len(self.trees)
+        tree_offsets = np.zeros(n_trees + 1, dtype=np.int32)
+        total_nodes = int(sum(len(tree.nodes) for tree in self.trees))
+
+        features = np.full(total_nodes, -1, dtype=np.int32)
+        thresholds = np.full(total_nodes, -1, dtype=np.int32)
+        lefts = np.full(total_nodes, -1, dtype=np.int32)
+        rights = np.full(total_nodes, -1, dtype=np.int32)
+        is_leaf = np.zeros(total_nodes, dtype=np.uint8)
+        values = np.zeros(total_nodes, dtype=np.float32)
+
+        cursor = 0
+        for tree_idx, tree in enumerate(self.trees):
+            tree_offsets[tree_idx] = cursor
+            for local_idx, node in enumerate(tree.nodes):
+                global_idx = cursor + local_idx
+                if node.feature is not None:
+                    features[global_idx] = int(node.feature)
+                if node.threshold is not None:
+                    thresholds[global_idx] = int(node.threshold)
+                if node.left is not None:
+                    lefts[global_idx] = cursor + int(node.left)
+                if node.right is not None:
+                    rights[global_idx] = cursor + int(node.right)
+                is_leaf[global_idx] = 1 if node.is_leaf else 0
+                values[global_idx] = np.float32(node.prediction)
+            cursor += len(tree.nodes)
+        tree_offsets[n_trees] = cursor
+
+        flattened = FlattenedForest(
+            tree_offsets=tree_offsets,
+            features=features,
+            thresholds=thresholds,
+            lefts=lefts,
+            rights=rights,
+            is_leaf=is_leaf,
+            values=values,
+        )
+        self._flattened = flattened
+        return flattened
