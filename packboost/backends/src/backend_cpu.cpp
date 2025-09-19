@@ -690,15 +690,20 @@ py::tuple cuda_frontier_evaluate_binding(
     py::array_t<int32_t, py::array::c_style | py::array::forcecast>,
     py::array_t<int32_t, py::array::c_style | py::array::forcecast>,
     py::array_t<int32_t, py::array::c_style | py::array::forcecast>,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast>,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast>,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast>,
     py::array_t<float, py::array::c_style | py::array::forcecast>,
     py::array_t<float, py::array::c_style | py::array::forcecast>,
-    py::array_t<int16_t, py::array::c_style | py::array::forcecast>,
     int,
     int,
     double,
     double,
     int,
-    double);
+    double,
+    int,
+    int,
+    int);
 #endif
 
 PYBIND11_MODULE(_backend, m) {
