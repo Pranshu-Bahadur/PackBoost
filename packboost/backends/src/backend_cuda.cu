@@ -211,7 +211,9 @@ public:
           d_bins_(n_rows * n_features),
           d_era_ids_(n_rows),
           d_gradients_(n_rows),
-          d_hessians_(n_rows) {}
+          d_hessians_(n_rows),
+          active_stream_(nullptr),
+          boosting_stats_dirty_(false) {}
 
     ~CudaFrontierWorkspace() {
         for (const HostRegistration& reg : host_registrations_) {
@@ -254,6 +256,54 @@ public:
         register_host_buffer(info.ptr, static_cast<std::size_t>(info.size) * static_cast<std::size_t>(info.itemsize));
     }
 
+    void update_boosting_stats(const float* gradients,
+                               const float* hessians,
+                               std::size_t n,
+                               cudaStream_t stream)
+    {
+        if (n == 0) {
+            boosting_stats_dirty_ = false;
+            active_stream_ = nullptr;
+            return;
+        }
+        if (n != n_rows_) {
+            throw std::invalid_argument("update_boosting_stats length mismatch");
+        }
+
+        const std::size_t bytes = n * sizeof(float);
+        float* d_grad_ptr = thrust::raw_pointer_cast(d_gradients_.data());
+        float* d_hess_ptr = thrust::raw_pointer_cast(d_hessians_.data());
+
+        if (gradients != nullptr) {
+            register_host_buffer(const_cast<float*>(gradients), bytes);
+        }
+        if (hessians != nullptr) {
+            register_host_buffer(const_cast<float*>(hessians), bytes);
+        }
+
+        bool used_async = false;
+        auto copy_async = [&](float* dst, const float* src, const char* name) {
+            if (dst == nullptr || src == nullptr) {
+                return false;
+            }
+            cudaError_t status = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream);
+            if (status == cudaErrorInvalidValue) {
+                cudaGetLastError();
+                status = cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+                throw_on_cuda(status, name);
+                return false;
+            }
+            throw_on_cuda(status, name);
+            return stream != nullptr;
+        };
+
+        used_async = copy_async(d_grad_ptr, gradients, "cudaMemcpyAsync gradients") || used_async;
+        used_async = copy_async(d_hess_ptr, hessians, "cudaMemcpyAsync hessians") || used_async;
+
+        boosting_stats_dirty_ = used_async;
+        active_stream_ = used_async ? stream : nullptr;
+    }
+
     py::tuple evaluate_frontier(
         py::list node_samples,
         py::array_t<int32_t, py::array::c_style | py::array::forcecast> feature_subset,
@@ -284,8 +334,11 @@ public:
         }
         register_host_buffer(grad_info.ptr, static_cast<std::size_t>(grad_info.size) * sizeof(float));
         register_host_buffer(hess_info.ptr, static_cast<std::size_t>(hess_info.size) * sizeof(float));
-        throw_on_cuda(cudaMemcpy(thrust::raw_pointer_cast(d_gradients_.data()), grad_info.ptr, n_rows_ * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy gradients");
-        throw_on_cuda(cudaMemcpy(thrust::raw_pointer_cast(d_hessians_.data()), hess_info.ptr, n_rows_ * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy hessians");
+        if (boosting_stats_dirty_) {
+            throw_on_cuda(cudaStreamSynchronize(active_stream_), "cudaStreamSynchronize gradients/hessians");
+            boosting_stats_dirty_ = false;
+            active_stream_ = nullptr;
+        }
 
         std::vector<py::array_t<int32_t, py::array::c_style | py::array::forcecast>> node_arrays;
         node_arrays.reserve(n_nodes);
@@ -691,6 +744,8 @@ private:
     thrust::device_vector<int32_t> d_right_indices_;
 
     std::vector<HostRegistration> host_registrations_;
+    cudaStream_t active_stream_;
+    bool boosting_stats_dirty_;
 };
 
 __global__ void histogram_kernel(
@@ -1924,6 +1979,34 @@ void bind_cuda_workspace(py::module_& m) {
         .def("set_binned", &packboost::CudaFrontierWorkspace::set_binned, py::arg("binned"))
         .def("set_era_ids", &packboost::CudaFrontierWorkspace::set_era_ids, py::arg("era_ids"))
         .def("register_host", &packboost::CudaFrontierWorkspace::register_host, py::arg("array"))
+        .def(
+            "update_boosting_stats",
+            [](packboost::CudaFrontierWorkspace& self,
+               py::array_t<float, py::array::c_style | py::array::forcecast> gradients,
+               py::array_t<float, py::array::c_style | py::array::forcecast> hessians,
+               py::object stream_obj) {
+                py::buffer_info grad_info = gradients.request();
+                py::buffer_info hess_info = hessians.request();
+                if (grad_info.ndim != 1 || hess_info.ndim != 1) {
+                    throw std::invalid_argument("update_boosting_stats expects 1D gradients and hessians");
+                }
+                if (grad_info.shape[0] != hess_info.shape[0]) {
+                    throw std::invalid_argument("gradient and hessian lengths must match");
+                }
+                cudaStream_t stream = nullptr;
+                if (!stream_obj.is_none()) {
+                    auto handle = stream_obj.cast<uintptr_t>();
+                    stream = reinterpret_cast<cudaStream_t>(handle);
+                }
+                self.update_boosting_stats(
+                    static_cast<const float*>(grad_info.ptr),
+                    static_cast<const float*>(hess_info.ptr),
+                    static_cast<std::size_t>(grad_info.shape[0]),
+                    stream);
+            },
+            py::arg("gradients"),
+            py::arg("hessians"),
+            py::arg("stream") = py::none())
         .def(
             "evaluate_frontier",
             &packboost::CudaFrontierWorkspace::evaluate_frontier,

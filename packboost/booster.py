@@ -171,6 +171,13 @@ class PackBoost:
 
         for round_idx in range(num_rounds):
             np.subtract(predictions, y, out=gradients)
+            if self._cuda_workspace is not None:
+                stream_handle = getattr(self.config, "cuda_frontier_stream", None)
+                self._cuda_workspace.update_boosting_stats(
+                    gradients,
+                    hessians,
+                    stream=stream_handle,
+                )
             pack_trees, pack_frontiers, pack_samples = self._initialise_pack(n_samples)
 
             for depth in range(self.config.max_depth):
