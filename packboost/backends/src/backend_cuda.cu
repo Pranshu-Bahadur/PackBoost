@@ -1103,6 +1103,83 @@ __global__ void frontier_select_kernel(
     }
 }
 
+__global__ void predict_forest_kernel(
+    const uint8_t* __restrict__ bins,
+    int n_rows,
+    int n_features,
+    const int32_t* __restrict__ tree_offsets,
+    int n_trees,
+    const int32_t* __restrict__ features,
+    const int32_t* __restrict__ thresholds,
+    const int32_t* __restrict__ lefts,
+    const int32_t* __restrict__ rights,
+    const uint8_t* __restrict__ is_leaf,
+    const float* __restrict__ values,
+    float tree_weight,
+    float initial_prediction,
+    float* __restrict__ out)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) {
+        return;
+    }
+
+    const uint8_t* row_bins = bins + static_cast<std::size_t>(row) * n_features;
+    float pred = initial_prediction;
+
+    for (int tree = 0; tree < n_trees; ++tree) {
+        const int tree_begin = tree_offsets[tree];
+        const int tree_end = tree_offsets[tree + 1];
+        int node = tree_begin;
+        int parent = node;
+        while (true) {
+            const bool outside = (node < tree_begin) || (node >= tree_end);
+            bool leaf = false;
+            if (!outside) {
+#if __CUDA_ARCH__ >= 350
+                leaf = __ldg(is_leaf + node) != 0;
+#else
+                leaf = is_leaf[node] != 0;
+#endif
+            }
+            if (outside || leaf) {
+                const int safe_idx = (node >= tree_begin && node < tree_end) ? node : parent;
+#if __CUDA_ARCH__ >= 350
+                pred += tree_weight * __ldg(values + safe_idx);
+#else
+                pred += tree_weight * values[safe_idx];
+#endif
+                break;
+            }
+#if __CUDA_ARCH__ >= 350
+            const int feature = __ldg(features + node);
+            const int threshold = __ldg(thresholds + node);
+            const int left = __ldg(lefts + node);
+            const int right = __ldg(rights + node);
+#else
+            const int feature = features[node];
+            const int threshold = thresholds[node];
+            const int left = lefts[node];
+            const int right = rights[node];
+#endif
+            const uint8_t bin = row_bins[feature];
+            const int next = (bin <= threshold) ? left : right;
+            if (next < tree_begin || next >= tree_end) {
+#if __CUDA_ARCH__ >= 350
+                pred += tree_weight * __ldg(values + node);
+#else
+                pred += tree_weight * values[node];
+#endif
+                break;
+            }
+            parent = node;
+            node = next;
+        }
+    }
+
+    out[row] = pred;
+}
+
 }  // namespace
 
 HistogramBuffers build_histograms_cuda(
@@ -1670,6 +1747,162 @@ py::tuple cuda_frontier_evaluate_binding(
         right_offsets_arr,
         left_indices_arr,
         right_indices_arr);
+}
+
+py::array_t<float> cuda_predict_forest_binding(
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast> bins,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> tree_offsets,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> features,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> thresholds,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> lefts,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> rights,
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast> is_leaf,
+    py::array_t<float, py::array::c_style | py::array::forcecast> values,
+    double tree_weight,
+    double initial_prediction)
+{
+    py::buffer_info bins_info = bins.request();
+    py::buffer_info offsets_info = tree_offsets.request();
+    py::buffer_info feat_info = features.request();
+    py::buffer_info thresh_info = thresholds.request();
+    py::buffer_info left_info = lefts.request();
+    py::buffer_info right_info = rights.request();
+    py::buffer_info leaf_info = is_leaf.request();
+    py::buffer_info value_info = values.request();
+
+    if (bins_info.ndim != 2) {
+        throw std::invalid_argument("bins must be 2D");
+    }
+    if (offsets_info.ndim != 1) {
+        throw std::invalid_argument("tree_offsets must be 1D");
+    }
+    if (feat_info.ndim != 1 || thresh_info.ndim != 1 || left_info.ndim != 1 ||
+        right_info.ndim != 1 || leaf_info.ndim != 1 || value_info.ndim != 1) {
+        throw std::invalid_argument("forest arrays must be 1D");
+    }
+
+    const std::size_t n_rows = static_cast<std::size_t>(bins_info.shape[0]);
+    const std::size_t n_features = static_cast<std::size_t>(bins_info.shape[1]);
+    const std::size_t offsets_len = static_cast<std::size_t>(offsets_info.shape[0]);
+    if (offsets_len == 0) {
+        throw std::invalid_argument("tree_offsets must contain at least one element");
+    }
+    const std::size_t total_nodes = static_cast<std::size_t>(feat_info.shape[0]);
+    if (static_cast<std::size_t>(thresh_info.shape[0]) != total_nodes ||
+        static_cast<std::size_t>(left_info.shape[0]) != total_nodes ||
+        static_cast<std::size_t>(right_info.shape[0]) != total_nodes ||
+        static_cast<std::size_t>(leaf_info.shape[0]) != total_nodes ||
+        static_cast<std::size_t>(value_info.shape[0]) != total_nodes) {
+        throw std::invalid_argument("forest arrays must have matching lengths");
+    }
+
+    const int n_rows_i = static_cast<int>(n_rows);
+    const int n_features_i = static_cast<int>(n_features);
+    const int n_trees = static_cast<int>(offsets_len - 1);
+
+    std::vector<py::ssize_t> out_shape = {static_cast<py::ssize_t>(n_rows)};
+    py::array_t<float> out(out_shape);
+    if (n_rows == 0) {
+        return out;
+    }
+
+    const std::size_t bins_bytes = n_rows * n_features * sizeof(uint8_t);
+    const std::size_t offsets_bytes = offsets_len * sizeof(int32_t);
+    const std::size_t node_bytes = total_nodes * sizeof(int32_t);
+    const std::size_t leaf_bytes = total_nodes * sizeof(uint8_t);
+    const std::size_t value_bytes = total_nodes * sizeof(float);
+
+    thrust::device_vector<uint8_t> d_bins(n_rows * n_features);
+    thrust::device_vector<int32_t> d_offsets(offsets_len);
+    thrust::device_vector<int32_t> d_features(total_nodes);
+    thrust::device_vector<int32_t> d_thresholds(total_nodes);
+    thrust::device_vector<int32_t> d_lefts(total_nodes);
+    thrust::device_vector<int32_t> d_rights(total_nodes);
+    thrust::device_vector<uint8_t> d_is_leaf(total_nodes);
+    thrust::device_vector<float> d_values(total_nodes);
+    thrust::device_vector<float> d_out(n_rows);
+
+    check(cudaMemcpy(
+              thrust::raw_pointer_cast(d_bins.data()),
+              bins_info.ptr,
+              bins_bytes,
+              cudaMemcpyHostToDevice),
+          "cudaMemcpy bins");
+    check(cudaMemcpy(
+              thrust::raw_pointer_cast(d_offsets.data()),
+              offsets_info.ptr,
+              offsets_bytes,
+              cudaMemcpyHostToDevice),
+          "cudaMemcpy offsets");
+    if (total_nodes > 0) {
+        check(cudaMemcpy(
+                  thrust::raw_pointer_cast(d_features.data()),
+                  feat_info.ptr,
+                  node_bytes,
+                  cudaMemcpyHostToDevice),
+              "cudaMemcpy features");
+        check(cudaMemcpy(
+                  thrust::raw_pointer_cast(d_thresholds.data()),
+                  thresh_info.ptr,
+                  node_bytes,
+                  cudaMemcpyHostToDevice),
+              "cudaMemcpy thresholds");
+        check(cudaMemcpy(
+                  thrust::raw_pointer_cast(d_lefts.data()),
+                  left_info.ptr,
+                  node_bytes,
+                  cudaMemcpyHostToDevice),
+              "cudaMemcpy lefts");
+        check(cudaMemcpy(
+                  thrust::raw_pointer_cast(d_rights.data()),
+                  right_info.ptr,
+                  node_bytes,
+                  cudaMemcpyHostToDevice),
+              "cudaMemcpy rights");
+        check(cudaMemcpy(
+                  thrust::raw_pointer_cast(d_is_leaf.data()),
+                  leaf_info.ptr,
+                  leaf_bytes,
+                  cudaMemcpyHostToDevice),
+              "cudaMemcpy is_leaf");
+        check(cudaMemcpy(
+                  thrust::raw_pointer_cast(d_values.data()),
+                  value_info.ptr,
+                  value_bytes,
+                  cudaMemcpyHostToDevice),
+              "cudaMemcpy values");
+    }
+
+    const int threads = 256;
+    const int blocks = (n_rows_i + threads - 1) / threads;
+    if (blocks > 0) {
+        predict_forest_kernel<<<blocks, threads>>>(
+            thrust::raw_pointer_cast(d_bins.data()),
+            n_rows_i,
+            n_features_i,
+            thrust::raw_pointer_cast(d_offsets.data()),
+            n_trees,
+            thrust::raw_pointer_cast(d_features.data()),
+            thrust::raw_pointer_cast(d_thresholds.data()),
+            thrust::raw_pointer_cast(d_lefts.data()),
+            thrust::raw_pointer_cast(d_rights.data()),
+            thrust::raw_pointer_cast(d_is_leaf.data()),
+            thrust::raw_pointer_cast(d_values.data()),
+            static_cast<float>(tree_weight),
+            static_cast<float>(initial_prediction),
+            thrust::raw_pointer_cast(d_out.data()));
+        check(cudaGetLastError(), "predict_forest_kernel launch");
+        check(cudaDeviceSynchronize(), "predict_forest_kernel sync");
+    }
+
+    check(cudaMemcpy(
+              out.mutable_data(),
+              thrust::raw_pointer_cast(d_out.data()),
+              n_rows * sizeof(float),
+              cudaMemcpyDeviceToHost),
+          "cudaMemcpy predictions");
+
+    return out;
 }
 
 void bind_cuda_workspace(py::module_& m) {
