@@ -1,6 +1,7 @@
 #include "backend.hpp"
 
 #include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 
@@ -20,6 +21,7 @@ namespace packboost {
 namespace {
 
 constexpr int WARP_SIZE = 32;
+constexpr float NEG_INF_F = -CUDART_INF_F;
 
 inline void check(cudaError_t status, const char* msg) {
     if (status != cudaSuccess) {
@@ -154,7 +156,7 @@ __global__ void frontier_feature_kernel(
     if (node_rows == 0 || thresholds <= 0) {
         if (threadIdx.x == 0) {
             best_threshold_out[feature_slot] = -1;
-            score_out[feature_slot] = -CUDART_INF_F;
+            score_out[feature_slot] = NEG_INF_F;
             agreement_out[feature_slot] = 0.0f;
             left_value_out[feature_slot] = 0.0f;
             right_value_out[feature_slot] = 0.0f;
@@ -169,7 +171,7 @@ __global__ void frontier_feature_kernel(
     if (era_begin == era_end) {
         if (threadIdx.x == 0) {
             best_threshold_out[feature_slot] = -1;
-            score_out[feature_slot] = -CUDART_INF_F;
+            score_out[feature_slot] = NEG_INF_F;
             agreement_out[feature_slot] = 0.0f;
             left_value_out[feature_slot] = 0.0f;
             right_value_out[feature_slot] = 0.0f;
@@ -310,7 +312,7 @@ __global__ void frontier_feature_kernel(
     }
 
     if (threadIdx.x == 0) {
-        float best_score = -CUDART_INF_F;
+        float best_score = NEG_INF_F;
         int best_threshold = -1;
         float best_agreement = 0.0f;
         float best_left_value = 0.0f;
@@ -353,7 +355,7 @@ __global__ void frontier_feature_kernel(
 
         if (best_threshold < 0) {
             best_threshold_out[feature_slot] = -1;
-            score_out[feature_slot] = -CUDART_INF_F;
+            score_out[feature_slot] = NEG_INF_F;
             agreement_out[feature_slot] = 0.0f;
             left_value_out[feature_slot] = 0.0f;
             right_value_out[feature_slot] = 0.0f;
@@ -400,7 +402,7 @@ __global__ void frontier_select_kernel(
     const int32_t node_rows = node_offsets[node_idx + 1] - node_offsets[node_idx];
     int best_feature_slot = -1;
     int32_t best_threshold = 0;
-    float best_score = -CUDART_INF_F;
+    float best_score = NEG_INF_F;
     float best_agreement = 0.0f;
     float best_left_value = 0.0f;
     float best_right_value = 0.0f;
@@ -429,7 +431,7 @@ __global__ void frontier_select_kernel(
     if (best_feature_slot < 0) {
         best_feature_out[node_idx] = -1;
         best_threshold_out[node_idx] = 0;
-        score_out[node_idx] = -CUDART_INF_F;
+        score_out[node_idx] = NEG_INF_F;
         agreement_out[node_idx] = 0.0f;
         left_value_out[node_idx] = 0.0f;
         right_value_out[node_idx] = 0.0f;

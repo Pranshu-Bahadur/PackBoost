@@ -100,7 +100,9 @@ booster.fit(X_train, y_train, era_ids_train)
 
 PackBoost now relies on the native frontier evaluator each depth. It raises a
 clear error if `device="cuda"` is requested but the CUDA frontier backend is
-missing or a CUDA device is unavailable.
+missing or a CUDA device is unavailable. You can tune the GPU launch geometry
+via `cuda_threads_per_block` and `cuda_rows_per_thread` in `PackBoostConfig` to
+better fit your hardware.
 
 ## scikit-learn Wrapper
 

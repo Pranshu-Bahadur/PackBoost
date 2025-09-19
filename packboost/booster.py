@@ -148,22 +148,30 @@ class PackBoost:
                 valid_corr = _nan_safe_corr(y_val_array, predictions_valid)
 
             if log_evaluation is not None and log_evaluation > 0 and (round_idx + 1) % log_evaluation == 0:
-                if np.isnan(valid_corr):
-                    print(f"Round {round_idx + 1}: train corr = {train_corr:.4f}")
-                else:
-                    print(
-                        f"Round {round_idx + 1}: train corr = {train_corr:.4f}, "
-                        f"valid corr = {valid_corr:.4f}"
-                    )
+                parts = []
+                if np.isfinite(train_corr):
+                    parts.append(f"train corr = {train_corr:.4f}")
+                if eval_data is not None:
+                    if np.isfinite(valid_corr):
+                        parts.append(f"valid corr = {valid_corr:.4f}")
+                    else:
+                        parts.append("valid corr = nan")
+                message = ", ".join(parts) if parts else "(no metrics)"
+                print(f"Round {round_idx + 1}: {message}")
 
             if callbacks:
+                info_valid_corr = float(valid_corr) if np.isfinite(valid_corr) else float("nan")
                 info = {
                     "round": round_idx + 1,
-                    "train_corr": train_corr,
-                    "valid_corr": valid_corr,
-                    "predictions_train": predictions,
-                    "predictions_valid": predictions_valid,
+                    "train_corr": float(train_corr),
+                    "valid_corr": info_valid_corr,
+                    "predictions_train": predictions.copy(),
+                    "train_targets": y,
                 }
+                if predictions_valid is not None:
+                    info["predictions_valid"] = predictions_valid.copy()
+                if y_val_array is not None:
+                    info["validation_targets"] = y_val_array
                 for callback in callbacks:
                     if hasattr(callback, "on_round"):
                         callback.on_round(self, info)
