@@ -25,6 +25,16 @@
 #include <thrust/scan.h>
 #include <thrust/sort.h>
 
+namespace {
+
+inline void throw_on_cuda(cudaError_t status, const char* msg) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(status));
+    }
+}
+
+}  // namespace
+
 namespace py = pybind11;
 
 namespace packboost {
@@ -32,12 +42,6 @@ namespace packboost {
 namespace {
 
 constexpr float NEG_INF_F = -std::numeric_limits<float>::infinity();
-
-inline void check(cudaError_t status, const char* msg) {
-    if (status != cudaSuccess) {
-        throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(status));
-    }
-}
 
 __global__ void frontier_feature_kernel(
     const uint8_t* __restrict__ bins,
@@ -226,7 +230,7 @@ public:
             throw std::invalid_argument("binned matrix shape mismatch");
         }
         const std::size_t bytes = static_cast<std::size_t>(info.shape[0]) * static_cast<std::size_t>(info.shape[1]) * sizeof(uint8_t);
-        check(cudaMemcpy(thrust::raw_pointer_cast(d_bins_.data()), info.ptr, bytes, cudaMemcpyHostToDevice), "cudaMemcpy bins");
+        throw_on_cuda(cudaMemcpy(thrust::raw_pointer_cast(d_bins_.data()), info.ptr, bytes, cudaMemcpyHostToDevice), "cudaMemcpy bins");
     }
 
     void set_era_ids(py::array_t<int16_t, py::array::c_style | py::array::forcecast> era_ids) {
@@ -238,7 +242,7 @@ public:
             throw std::invalid_argument("era_ids length mismatch");
         }
         const std::size_t bytes = static_cast<std::size_t>(info.shape[0]) * sizeof(int16_t);
-        check(cudaMemcpy(thrust::raw_pointer_cast(d_era_ids_.data()), info.ptr, bytes, cudaMemcpyHostToDevice), "cudaMemcpy era_ids");
+        throw_on_cuda(cudaMemcpy(thrust::raw_pointer_cast(d_era_ids_.data()), info.ptr, bytes, cudaMemcpyHostToDevice), "cudaMemcpy era_ids");
     }
 
     void register_host(py::array array) {
@@ -280,8 +284,8 @@ public:
         }
         register_host_buffer(grad_info.ptr, static_cast<std::size_t>(grad_info.size) * sizeof(float));
         register_host_buffer(hess_info.ptr, static_cast<std::size_t>(hess_info.size) * sizeof(float));
-        check(cudaMemcpy(thrust::raw_pointer_cast(d_gradients_.data()), grad_info.ptr, n_rows_ * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy gradients");
-        check(cudaMemcpy(thrust::raw_pointer_cast(d_hessians_.data()), hess_info.ptr, n_rows_ * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy hessians");
+        throw_on_cuda(cudaMemcpy(thrust::raw_pointer_cast(d_gradients_.data()), grad_info.ptr, n_rows_ * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy gradients");
+        throw_on_cuda(cudaMemcpy(thrust::raw_pointer_cast(d_hessians_.data()), hess_info.ptr, n_rows_ * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy hessians");
 
         std::vector<py::array_t<int32_t, py::array::c_style | py::array::forcecast>> node_arrays;
         node_arrays.reserve(n_nodes);
@@ -330,7 +334,7 @@ public:
                 thrust::raw_pointer_cast(d_era_ids_.data()),
                 thrust::raw_pointer_cast(d_era_keys_.data()),
                 total_indices);
-            check(cudaGetLastError(), "gather_era_kernel launch");
+            throw_on_cuda(cudaGetLastError(), "gather_era_kernel launch");
 
             auto zip_begin = thrust::make_zip_iterator(thrust::make_tuple(d_node_ids_.begin(), d_era_keys_.begin()));
             auto zip_end = zip_begin + total_indices;
@@ -418,7 +422,7 @@ public:
                 lambda,
                 eps,
                 thrust::raw_pointer_cast(d_base_value_.data()));
-            check(cudaGetLastError(), "base_value_kernel launch");
+            throw_on_cuda(cudaGetLastError(), "base_value_kernel launch");
         }
 
         const bool have_features = (n_nodes > 0) && (n_features_subset > 0) && (thresholds > 0);
@@ -465,7 +469,7 @@ public:
                 thrust::raw_pointer_cast(d_right_value_per_feature_.data()),
                 thrust::raw_pointer_cast(d_left_count_per_feature_.data()),
                 thrust::raw_pointer_cast(d_right_count_per_feature_.data()));
-            check(cudaGetLastError(), "frontier_feature_kernel launch");
+            throw_on_cuda(cudaGetLastError(), "frontier_feature_kernel launch");
 
             const int threads_select = threads_per_block_;
             const int blocks_select = static_cast<int>((n_nodes + threads_select - 1) / threads_select);
@@ -489,7 +493,7 @@ public:
                 thrust::raw_pointer_cast(d_right_value_.data()),
                 thrust::raw_pointer_cast(d_left_count_.data()),
                 thrust::raw_pointer_cast(d_right_count_.data()));
-            check(cudaGetLastError(), "frontier_select_kernel launch");
+            throw_on_cuda(cudaGetLastError(), "frontier_select_kernel launch");
         } else {
             std::vector<int32_t> node_rows(n_nodes, 0);
             for (std::size_t node = 0; node < n_nodes; ++node) {
@@ -533,7 +537,7 @@ public:
                 thrust::raw_pointer_cast(d_right_offsets_.data()),
                 thrust::raw_pointer_cast(d_left_indices_.data()),
                 thrust::raw_pointer_cast(d_right_indices_.data()));
-            check(cudaGetLastError(), "partition_rows_kernel launch");
+            throw_on_cuda(cudaGetLastError(), "partition_rows_kernel launch");
         }
 
         std::vector<int32_t> best_feature_host(n_nodes, -1);
@@ -551,24 +555,24 @@ public:
         std::vector<int32_t> right_indices_host(static_cast<std::size_t>(total_right));
 
         if (n_nodes > 0) {
-            check(cudaMemcpy(best_feature_host.data(), thrust::raw_pointer_cast(d_best_feature_.data()), n_nodes * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy best_feature");
-            check(cudaMemcpy(best_threshold_host.data(), thrust::raw_pointer_cast(d_best_threshold_.data()), n_nodes * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy best_threshold");
-            check(cudaMemcpy(score_host.data(), thrust::raw_pointer_cast(d_score_.data()), n_nodes * sizeof(float), cudaMemcpyDeviceToHost), "copy score");
-            check(cudaMemcpy(agreement_host.data(), thrust::raw_pointer_cast(d_agreement_.data()), n_nodes * sizeof(float), cudaMemcpyDeviceToHost), "copy agreement");
-            check(cudaMemcpy(left_value_host.data(), thrust::raw_pointer_cast(d_left_value_.data()), n_nodes * sizeof(float), cudaMemcpyDeviceToHost), "copy left_value");
-            check(cudaMemcpy(right_value_host.data(), thrust::raw_pointer_cast(d_right_value_.data()), n_nodes * sizeof(float), cudaMemcpyDeviceToHost), "copy right_value");
-            check(cudaMemcpy(left_count_host.data(), thrust::raw_pointer_cast(d_left_count_.data()), n_nodes * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy left_count");
-            check(cudaMemcpy(right_count_host.data(), thrust::raw_pointer_cast(d_right_count_.data()), n_nodes * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy right_count");
-            check(cudaMemcpy(base_value_host.data(), thrust::raw_pointer_cast(d_base_value_.data()), n_nodes * sizeof(float), cudaMemcpyDeviceToHost), "copy base_value");
+            throw_on_cuda(cudaMemcpy(best_feature_host.data(), thrust::raw_pointer_cast(d_best_feature_.data()), n_nodes * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy best_feature");
+            throw_on_cuda(cudaMemcpy(best_threshold_host.data(), thrust::raw_pointer_cast(d_best_threshold_.data()), n_nodes * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy best_threshold");
+            throw_on_cuda(cudaMemcpy(score_host.data(), thrust::raw_pointer_cast(d_score_.data()), n_nodes * sizeof(float), cudaMemcpyDeviceToHost), "copy score");
+            throw_on_cuda(cudaMemcpy(agreement_host.data(), thrust::raw_pointer_cast(d_agreement_.data()), n_nodes * sizeof(float), cudaMemcpyDeviceToHost), "copy agreement");
+            throw_on_cuda(cudaMemcpy(left_value_host.data(), thrust::raw_pointer_cast(d_left_value_.data()), n_nodes * sizeof(float), cudaMemcpyDeviceToHost), "copy left_value");
+            throw_on_cuda(cudaMemcpy(right_value_host.data(), thrust::raw_pointer_cast(d_right_value_.data()), n_nodes * sizeof(float), cudaMemcpyDeviceToHost), "copy right_value");
+            throw_on_cuda(cudaMemcpy(left_count_host.data(), thrust::raw_pointer_cast(d_left_count_.data()), n_nodes * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy left_count");
+            throw_on_cuda(cudaMemcpy(right_count_host.data(), thrust::raw_pointer_cast(d_right_count_.data()), n_nodes * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy right_count");
+            throw_on_cuda(cudaMemcpy(base_value_host.data(), thrust::raw_pointer_cast(d_base_value_.data()), n_nodes * sizeof(float), cudaMemcpyDeviceToHost), "copy base_value");
             if (!left_offsets_host.empty()) {
-                check(cudaMemcpy(left_offsets_host.data(), thrust::raw_pointer_cast(d_left_offsets_.data()), (n_nodes + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy left_offsets");
-                check(cudaMemcpy(right_offsets_host.data(), thrust::raw_pointer_cast(d_right_offsets_.data()), (n_nodes + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy right_offsets");
+                throw_on_cuda(cudaMemcpy(left_offsets_host.data(), thrust::raw_pointer_cast(d_left_offsets_.data()), (n_nodes + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy left_offsets");
+                throw_on_cuda(cudaMemcpy(right_offsets_host.data(), thrust::raw_pointer_cast(d_right_offsets_.data()), (n_nodes + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy right_offsets");
             }
             if (total_left > 0) {
-                check(cudaMemcpy(left_indices_host.data(), thrust::raw_pointer_cast(d_left_indices_.data()), total_left * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy left_indices");
+                throw_on_cuda(cudaMemcpy(left_indices_host.data(), thrust::raw_pointer_cast(d_left_indices_.data()), total_left * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy left_indices");
             }
             if (total_right > 0) {
-                check(cudaMemcpy(right_indices_host.data(), thrust::raw_pointer_cast(d_right_indices_.data()), total_right * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy right_indices");
+                throw_on_cuda(cudaMemcpy(right_indices_host.data(), thrust::raw_pointer_cast(d_right_indices_.data()), total_right * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy right_indices");
             }
         }
 
@@ -637,7 +641,7 @@ private:
             cudaGetLastError();
             return;
         }
-        check(status, "cudaHostRegister");
+        throw_on_cuda(status, "cudaHostRegister");
         host_registrations_.push_back({ptr, bytes});
     }
 
@@ -759,7 +763,7 @@ void launch_histogram_kernel(
         bins, gradients, hessians, era_inverse,
         n_rows, n_features, max_bins, n_eras,
         out_grad, out_hess, out_count);
-    check(cudaDeviceSynchronize(), "histogram_kernel launch failed");
+    throw_on_cuda(cudaDeviceSynchronize(), "histogram_kernel launch failed");
 }
 
 __global__ void frontier_feature_kernel(
@@ -1103,6 +1107,8 @@ __global__ void frontier_select_kernel(
     }
 }
 
+
+
 }  // namespace
 
 HistogramBuffers build_histograms_cuda(
@@ -1130,21 +1136,21 @@ HistogramBuffers build_histograms_cuda(
     float* d_out_hess = nullptr;
     int32_t* d_out_count = nullptr;
 
-    check(cudaMalloc(&d_bins, row_bytes), "cudaMalloc bins");
-    check(cudaMalloc(&d_grad, vec_bytes), "cudaMalloc grad");
-    check(cudaMalloc(&d_hess, vec_bytes), "cudaMalloc hess");
-    check(cudaMalloc(&d_era, era_bytes), "cudaMalloc era");
-    check(cudaMalloc(&d_out_grad, hist_bytes_f), "cudaMalloc out_grad");
-    check(cudaMalloc(&d_out_hess, hist_bytes_f), "cudaMalloc out_hess");
-    check(cudaMalloc(&d_out_count, hist_bytes_i), "cudaMalloc out_count");
-    check(cudaMemset(d_out_grad, 0, hist_bytes_f), "cudaMemset out_grad");
-    check(cudaMemset(d_out_hess, 0, hist_bytes_f), "cudaMemset out_hess");
-    check(cudaMemset(d_out_count, 0, hist_bytes_i), "cudaMemset out_count");
+    throw_on_cuda(cudaMalloc(&d_bins, row_bytes), "cudaMalloc bins");
+    throw_on_cuda(cudaMalloc(&d_grad, vec_bytes), "cudaMalloc grad");
+    throw_on_cuda(cudaMalloc(&d_hess, vec_bytes), "cudaMalloc hess");
+    throw_on_cuda(cudaMalloc(&d_era, era_bytes), "cudaMalloc era");
+    throw_on_cuda(cudaMalloc(&d_out_grad, hist_bytes_f), "cudaMalloc out_grad");
+    throw_on_cuda(cudaMalloc(&d_out_hess, hist_bytes_f), "cudaMalloc out_hess");
+    throw_on_cuda(cudaMalloc(&d_out_count, hist_bytes_i), "cudaMalloc out_count");
+    throw_on_cuda(cudaMemset(d_out_grad, 0, hist_bytes_f), "cudaMemset out_grad");
+    throw_on_cuda(cudaMemset(d_out_hess, 0, hist_bytes_f), "cudaMemset out_hess");
+    throw_on_cuda(cudaMemset(d_out_count, 0, hist_bytes_i), "cudaMemset out_count");
 
-    check(cudaMemcpy(d_bins, bins, row_bytes, cudaMemcpyHostToDevice), "cudaMemcpy bins");
-    check(cudaMemcpy(d_grad, gradients, vec_bytes, cudaMemcpyHostToDevice), "cudaMemcpy grad");
-    check(cudaMemcpy(d_hess, hessians, vec_bytes, cudaMemcpyHostToDevice), "cudaMemcpy hess");
-    check(cudaMemcpy(d_era, era_inverse, era_bytes, cudaMemcpyHostToDevice), "cudaMemcpy era");
+    throw_on_cuda(cudaMemcpy(d_bins, bins, row_bytes, cudaMemcpyHostToDevice), "cudaMemcpy bins");
+    throw_on_cuda(cudaMemcpy(d_grad, gradients, vec_bytes, cudaMemcpyHostToDevice), "cudaMemcpy grad");
+    throw_on_cuda(cudaMemcpy(d_hess, hessians, vec_bytes, cudaMemcpyHostToDevice), "cudaMemcpy hess");
+    throw_on_cuda(cudaMemcpy(d_era, era_inverse, era_bytes, cudaMemcpyHostToDevice), "cudaMemcpy era");
 
     launch_histogram_kernel(
         d_bins,
@@ -1164,9 +1170,9 @@ HistogramBuffers build_histograms_cuda(
     buffers.hess.resize(hist_size);
     buffers.count.resize(hist_size);
 
-    check(cudaMemcpy(buffers.grad.data(), d_out_grad, hist_bytes_f, cudaMemcpyDeviceToHost), "cudaMemcpy back grad");
-    check(cudaMemcpy(buffers.hess.data(), d_out_hess, hist_bytes_f, cudaMemcpyDeviceToHost), "cudaMemcpy back hess");
-    check(cudaMemcpy(buffers.count.data(), d_out_count, hist_bytes_i, cudaMemcpyDeviceToHost), "cudaMemcpy back count");
+    throw_on_cuda(cudaMemcpy(buffers.grad.data(), d_out_grad, hist_bytes_f, cudaMemcpyDeviceToHost), "cudaMemcpy back grad");
+    throw_on_cuda(cudaMemcpy(buffers.hess.data(), d_out_hess, hist_bytes_f, cudaMemcpyDeviceToHost), "cudaMemcpy back hess");
+    throw_on_cuda(cudaMemcpy(buffers.count.data(), d_out_count, hist_bytes_i, cudaMemcpyDeviceToHost), "cudaMemcpy back count");
 
     cudaFree(d_bins);
     cudaFree(d_grad);
@@ -1283,7 +1289,7 @@ FrontierEvalResult evaluate_frontier_cuda(
                 *ptr = nullptr;
                 return;
             }
-            check(cudaMalloc(ptr, bytes), msg);
+            throw_on_cuda(cudaMalloc(ptr, bytes), msg);
             allocations.push_back(*ptr);
         };
 
@@ -1291,7 +1297,7 @@ FrontierEvalResult evaluate_frontier_cuda(
             if (bytes == 0) {
                 return;
             }
-            check(cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice), msg);
+            throw_on_cuda(cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice), msg);
         };
 
         const std::size_t bins_bytes = n_rows * n_features_total * sizeof(uint8_t);
@@ -1379,7 +1385,7 @@ FrontierEvalResult evaluate_frontier_cuda(
             d_right_value_per_feature,
             d_left_count_per_feature,
             d_right_count_per_feature);
-        check(cudaDeviceSynchronize(), "frontier_feature_kernel launch failed");
+        throw_on_cuda(cudaDeviceSynchronize(), "frontier_feature_kernel launch failed");
 
         const int threads_select = threads_per_block;
         const int blocks_select = static_cast<int>((n_nodes + threads_select - 1) / threads_select);
@@ -1404,7 +1410,7 @@ FrontierEvalResult evaluate_frontier_cuda(
             d_right_value,
             d_left_count,
             d_right_count);
-        check(cudaDeviceSynchronize(), "frontier_select_kernel launch failed");
+        throw_on_cuda(cudaDeviceSynchronize(), "frontier_select_kernel launch failed");
 
         std::vector<int32_t> best_feature_host(n_nodes);
         std::vector<int32_t> best_threshold_host(n_nodes);
@@ -1415,14 +1421,14 @@ FrontierEvalResult evaluate_frontier_cuda(
         std::vector<int32_t> left_count_host(n_nodes);
         std::vector<int32_t> right_count_host(n_nodes);
 
-        check(cudaMemcpy(best_feature_host.data(), d_best_feature, node_bytes_i, cudaMemcpyDeviceToHost), "cudaMemcpy best_feature");
-        check(cudaMemcpy(best_threshold_host.data(), d_best_threshold, node_bytes_i, cudaMemcpyDeviceToHost), "cudaMemcpy best_threshold");
-        check(cudaMemcpy(score_host.data(), d_score, node_bytes_f, cudaMemcpyDeviceToHost), "cudaMemcpy score");
-        check(cudaMemcpy(agreement_host.data(), d_agreement, node_bytes_f, cudaMemcpyDeviceToHost), "cudaMemcpy agreement");
-        check(cudaMemcpy(left_value_host.data(), d_left_value, node_bytes_f, cudaMemcpyDeviceToHost), "cudaMemcpy left_value");
-        check(cudaMemcpy(right_value_host.data(), d_right_value, node_bytes_f, cudaMemcpyDeviceToHost), "cudaMemcpy right_value");
-        check(cudaMemcpy(left_count_host.data(), d_left_count, node_bytes_i, cudaMemcpyDeviceToHost), "cudaMemcpy left_count");
-        check(cudaMemcpy(right_count_host.data(), d_right_count, node_bytes_i, cudaMemcpyDeviceToHost), "cudaMemcpy right_count");
+        throw_on_cuda(cudaMemcpy(best_feature_host.data(), d_best_feature, node_bytes_i, cudaMemcpyDeviceToHost), "cudaMemcpy best_feature");
+        throw_on_cuda(cudaMemcpy(best_threshold_host.data(), d_best_threshold, node_bytes_i, cudaMemcpyDeviceToHost), "cudaMemcpy best_threshold");
+        throw_on_cuda(cudaMemcpy(score_host.data(), d_score, node_bytes_f, cudaMemcpyDeviceToHost), "cudaMemcpy score");
+        throw_on_cuda(cudaMemcpy(agreement_host.data(), d_agreement, node_bytes_f, cudaMemcpyDeviceToHost), "cudaMemcpy agreement");
+        throw_on_cuda(cudaMemcpy(left_value_host.data(), d_left_value, node_bytes_f, cudaMemcpyDeviceToHost), "cudaMemcpy left_value");
+        throw_on_cuda(cudaMemcpy(right_value_host.data(), d_right_value, node_bytes_f, cudaMemcpyDeviceToHost), "cudaMemcpy right_value");
+        throw_on_cuda(cudaMemcpy(left_count_host.data(), d_left_count, node_bytes_i, cudaMemcpyDeviceToHost), "cudaMemcpy left_count");
+        throw_on_cuda(cudaMemcpy(right_count_host.data(), d_right_count, node_bytes_i, cudaMemcpyDeviceToHost), "cudaMemcpy right_count");
 
         cleanup();
 
@@ -1515,6 +1521,83 @@ FrontierEvalResult evaluate_frontier_cuda(
 }
 
 }  // namespace packboost
+
+__global__ void predict_forest_kernel(
+    const uint8_t* __restrict__ bins,
+    int n_rows,
+    int n_features,
+    const int32_t* __restrict__ tree_offsets,
+    int n_trees,
+    const int32_t* __restrict__ features,
+    const int32_t* __restrict__ thresholds,
+    const int32_t* __restrict__ lefts,
+    const int32_t* __restrict__ rights,
+    const uint8_t* __restrict__ is_leaf,
+    const float* __restrict__ values,
+    float tree_weight,
+    float initial_prediction,
+    float* __restrict__ out)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) {
+        return;
+    }
+
+    const uint8_t* row_bins = bins + static_cast<std::size_t>(row) * n_features;
+    float pred = initial_prediction;
+
+    for (int tree = 0; tree < n_trees; ++tree) {
+        const int tree_begin = tree_offsets[tree];
+        const int tree_end = tree_offsets[tree + 1];
+        int node = tree_begin;
+        int parent = node;
+        while (true) {
+            const bool outside = (node < tree_begin) || (node >= tree_end);
+            bool leaf = false;
+            if (!outside) {
+#if __CUDA_ARCH__ >= 350
+                leaf = __ldg(is_leaf + node) != 0;
+#else
+                leaf = is_leaf[node] != 0;
+#endif
+            }
+            if (outside || leaf) {
+                const int safe_idx = (node >= tree_begin && node < tree_end) ? node : parent;
+#if __CUDA_ARCH__ >= 350
+                pred += tree_weight * __ldg(values + safe_idx);
+#else
+                pred += tree_weight * values[safe_idx];
+#endif
+                break;
+            }
+#if __CUDA_ARCH__ >= 350
+            const int feature = __ldg(features + node);
+            const int threshold = __ldg(thresholds + node);
+            const int left = __ldg(lefts + node);
+            const int right = __ldg(rights + node);
+#else
+            const int feature = features[node];
+            const int threshold = thresholds[node];
+            const int left = lefts[node];
+            const int right = rights[node];
+#endif
+            const uint8_t bin = row_bins[feature];
+            const int next = (bin <= threshold) ? left : right;
+            if (next < tree_begin || next >= tree_end) {
+#if __CUDA_ARCH__ >= 350
+                pred += tree_weight * __ldg(values + node);
+#else
+                pred += tree_weight * values[node];
+#endif
+                break;
+            }
+            parent = node;
+            node = next;
+        }
+    }
+
+    out[row] = pred;
+}
 
 py::tuple cuda_histogram_binding(
     py::array_t<uint8_t, py::array::c_style | py::array::forcecast> bins,
@@ -1670,6 +1753,162 @@ py::tuple cuda_frontier_evaluate_binding(
         right_offsets_arr,
         left_indices_arr,
         right_indices_arr);
+}
+
+py::array_t<float> cuda_predict_forest_binding(
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast> bins,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> tree_offsets,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> features,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> thresholds,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> lefts,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> rights,
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast> is_leaf,
+    py::array_t<float, py::array::c_style | py::array::forcecast> values,
+    double tree_weight,
+    double initial_prediction)
+{
+    py::buffer_info bins_info = bins.request();
+    py::buffer_info offsets_info = tree_offsets.request();
+    py::buffer_info feat_info = features.request();
+    py::buffer_info thresh_info = thresholds.request();
+    py::buffer_info left_info = lefts.request();
+    py::buffer_info right_info = rights.request();
+    py::buffer_info leaf_info = is_leaf.request();
+    py::buffer_info value_info = values.request();
+
+    if (bins_info.ndim != 2) {
+        throw std::invalid_argument("bins must be 2D");
+    }
+    if (offsets_info.ndim != 1) {
+        throw std::invalid_argument("tree_offsets must be 1D");
+    }
+    if (feat_info.ndim != 1 || thresh_info.ndim != 1 || left_info.ndim != 1 ||
+        right_info.ndim != 1 || leaf_info.ndim != 1 || value_info.ndim != 1) {
+        throw std::invalid_argument("forest arrays must be 1D");
+    }
+
+    const std::size_t n_rows = static_cast<std::size_t>(bins_info.shape[0]);
+    const std::size_t n_features = static_cast<std::size_t>(bins_info.shape[1]);
+    const std::size_t offsets_len = static_cast<std::size_t>(offsets_info.shape[0]);
+    if (offsets_len == 0) {
+        throw std::invalid_argument("tree_offsets must contain at least one element");
+    }
+    const std::size_t total_nodes = static_cast<std::size_t>(feat_info.shape[0]);
+    if (static_cast<std::size_t>(thresh_info.shape[0]) != total_nodes ||
+        static_cast<std::size_t>(left_info.shape[0]) != total_nodes ||
+        static_cast<std::size_t>(right_info.shape[0]) != total_nodes ||
+        static_cast<std::size_t>(leaf_info.shape[0]) != total_nodes ||
+        static_cast<std::size_t>(value_info.shape[0]) != total_nodes) {
+        throw std::invalid_argument("forest arrays must have matching lengths");
+    }
+
+    const int n_rows_i = static_cast<int>(n_rows);
+    const int n_features_i = static_cast<int>(n_features);
+    const int n_trees = static_cast<int>(offsets_len - 1);
+
+    std::vector<py::ssize_t> out_shape = {static_cast<py::ssize_t>(n_rows)};
+    py::array_t<float> out(out_shape);
+    if (n_rows == 0) {
+        return out;
+    }
+
+    const std::size_t bins_bytes = n_rows * n_features * sizeof(uint8_t);
+    const std::size_t offsets_bytes = offsets_len * sizeof(int32_t);
+    const std::size_t node_bytes = total_nodes * sizeof(int32_t);
+    const std::size_t leaf_bytes = total_nodes * sizeof(uint8_t);
+    const std::size_t value_bytes = total_nodes * sizeof(float);
+
+    thrust::device_vector<uint8_t> d_bins(n_rows * n_features);
+    thrust::device_vector<int32_t> d_offsets(offsets_len);
+    thrust::device_vector<int32_t> d_features(total_nodes);
+    thrust::device_vector<int32_t> d_thresholds(total_nodes);
+    thrust::device_vector<int32_t> d_lefts(total_nodes);
+    thrust::device_vector<int32_t> d_rights(total_nodes);
+    thrust::device_vector<uint8_t> d_is_leaf(total_nodes);
+    thrust::device_vector<float> d_values(total_nodes);
+    thrust::device_vector<float> d_out(n_rows);
+
+    throw_on_cuda(cudaMemcpy(
+              thrust::raw_pointer_cast(d_bins.data()),
+              bins_info.ptr,
+              bins_bytes,
+              cudaMemcpyHostToDevice),
+          "cudaMemcpy bins");
+    throw_on_cuda(cudaMemcpy(
+              thrust::raw_pointer_cast(d_offsets.data()),
+              offsets_info.ptr,
+              offsets_bytes,
+              cudaMemcpyHostToDevice),
+          "cudaMemcpy offsets");
+    if (total_nodes > 0) {
+        throw_on_cuda(cudaMemcpy(
+                  thrust::raw_pointer_cast(d_features.data()),
+                  feat_info.ptr,
+                  node_bytes,
+                  cudaMemcpyHostToDevice),
+              "cudaMemcpy features");
+        throw_on_cuda(cudaMemcpy(
+                  thrust::raw_pointer_cast(d_thresholds.data()),
+                  thresh_info.ptr,
+                  node_bytes,
+                  cudaMemcpyHostToDevice),
+              "cudaMemcpy thresholds");
+        throw_on_cuda(cudaMemcpy(
+                  thrust::raw_pointer_cast(d_lefts.data()),
+                  left_info.ptr,
+                  node_bytes,
+                  cudaMemcpyHostToDevice),
+              "cudaMemcpy lefts");
+        throw_on_cuda(cudaMemcpy(
+                  thrust::raw_pointer_cast(d_rights.data()),
+                  right_info.ptr,
+                  node_bytes,
+                  cudaMemcpyHostToDevice),
+              "cudaMemcpy rights");
+        throw_on_cuda(cudaMemcpy(
+                  thrust::raw_pointer_cast(d_is_leaf.data()),
+                  leaf_info.ptr,
+                  leaf_bytes,
+                  cudaMemcpyHostToDevice),
+              "cudaMemcpy is_leaf");
+        throw_on_cuda(cudaMemcpy(
+                  thrust::raw_pointer_cast(d_values.data()),
+                  value_info.ptr,
+                  value_bytes,
+                  cudaMemcpyHostToDevice),
+              "cudaMemcpy values");
+    }
+
+    const int threads = 256;
+    const int blocks = (n_rows_i + threads - 1) / threads;
+    if (blocks > 0) {
+        predict_forest_kernel<<<blocks, threads>>>(
+            thrust::raw_pointer_cast(d_bins.data()),
+            n_rows_i,
+            n_features_i,
+            thrust::raw_pointer_cast(d_offsets.data()),
+            n_trees,
+            thrust::raw_pointer_cast(d_features.data()),
+            thrust::raw_pointer_cast(d_thresholds.data()),
+            thrust::raw_pointer_cast(d_lefts.data()),
+            thrust::raw_pointer_cast(d_rights.data()),
+            thrust::raw_pointer_cast(d_is_leaf.data()),
+            thrust::raw_pointer_cast(d_values.data()),
+            static_cast<float>(tree_weight),
+            static_cast<float>(initial_prediction),
+            thrust::raw_pointer_cast(d_out.data()));
+        throw_on_cuda(cudaGetLastError(), "predict_forest_kernel launch");
+        throw_on_cuda(cudaDeviceSynchronize(), "predict_forest_kernel sync");
+    }
+
+    throw_on_cuda(cudaMemcpy(
+              out.mutable_data(),
+              thrust::raw_pointer_cast(d_out.data()),
+              n_rows * sizeof(float),
+              cudaMemcpyDeviceToHost),
+          "cudaMemcpy predictions");
+
+    return out;
 }
 
 void bind_cuda_workspace(py::module_& m) {
