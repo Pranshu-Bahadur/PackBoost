@@ -55,5 +55,5 @@ class PackBoostConfig:
     era_alpha: float = 0.0
     era_tile_size: int = 64
     random_state: int | None = None
-    histogram_subtraction: bool = True
+    histogram_subtraction: bool = False
     device: str = "cpu"
