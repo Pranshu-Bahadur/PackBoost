@@ -87,10 +87,9 @@ def evaluate_frontier_fastpath(
     X_binned_arr = np.asarray(X_binned, dtype=np.uint8)
 
     thresholds_shape = (n_nodes, n_features, thresholds)
-    means = np.zeros(thresholds_shape, dtype=np.float32)
-    m2 = np.zeros_like(means)
-    counts = np.zeros(thresholds_shape, dtype=np.int32)
-    counts_float = np.zeros(thresholds_shape, dtype=np.float32)
+    gain_sum = np.zeros(thresholds_shape, dtype=np.float64)
+    gain_sumsq = np.zeros_like(gain_sum)
+    era_counts = np.zeros(thresholds_shape, dtype=np.int32)
     left_grad_tot = np.zeros(thresholds_shape, dtype=np.float32)
     left_hess_tot = np.zeros(thresholds_shape, dtype=np.float32)
     left_count_tot = np.zeros(thresholds_shape, dtype=np.int32)
@@ -163,41 +162,37 @@ def evaluate_frontier_fastpath(
         parent_gain = 0.5 * (parent_grad_tile ** 2) / np.maximum(safe_parent_hess, 1e-12)
         gains = gain_left + gain_right - parent_gain
 
-        for local_offset in range(tile_len):
-            gains_slice = gains[:, :, :, local_offset]
-            counts += 1
-            counts_float += 1.0
-            delta = gains_slice - means
-            means += delta / counts_float
-            m2 += delta * (gains_slice - means)
+        mask = parent_count_tile > 0
+        mask_float = mask.astype(np.float32, copy=False)
 
-            left_grad_slice = left_grad_tile[:, :, :, local_offset]
-            left_hess_slice = left_hess_tile[:, :, :, local_offset]
-            left_count_slice = left_count_tile[:, :, :, local_offset]
-            left_grad_tot += left_grad_slice
-            left_hess_tot += left_hess_slice
-            left_count_tot += left_count_slice.astype(np.int32, copy=False)
+        gain_sum += np.sum(gains * mask_float, axis=3, dtype=np.float64)
+        gain_sumsq += np.sum((gains * gains) * mask_float, axis=3, dtype=np.float64)
+        era_counts += np.sum(mask, axis=3, dtype=np.int32)
 
-            right_grad_slice = right_grad_tile[:, :, :, local_offset]
-            right_hess_slice = right_hess_tile[:, :, :, local_offset]
+        left_grad_tot += np.sum(left_grad_tile, axis=3)
+        left_hess_tot += np.sum(left_hess_tile, axis=3)
+        left_count_tot += np.sum(left_count_tile, axis=3, dtype=np.int32)
 
-            safe_left = left_hess_slice + lambda_l2
-            safe_right = right_hess_slice + lambda_l2
-            left_pred = -left_grad_slice / np.maximum(safe_left, 1e-12)
-            right_pred = -right_grad_slice / np.maximum(safe_right, 1e-12)
-            direction = np.where(left_pred >= right_pred, 1.0, -1.0)
-            direction_sum += direction
-            direction_count += 1
+        left_pred = -left_grad_tile / np.maximum(safe_left_hess, 1e-12)
+        right_pred = -right_grad_tile / np.maximum(safe_right_hess, 1e-12)
+        direction = np.where(left_pred >= right_pred, 1.0, -1.0) * mask_float
+        direction_sum += np.sum(direction, axis=3)
+        direction_count += np.sum(mask, axis=3, dtype=np.int32)
 
-    valid_counts = counts > 0
-    mean_gain = np.where(valid_counts, means, 0.0)
-    variance = np.zeros_like(means)
-    nonzero_counts = np.where(valid_counts, counts_float, 1.0)
-    variance[valid_counts] = m2[valid_counts] / nonzero_counts[valid_counts]
+    valid_counts = era_counts > 0
+    mean_gain = np.zeros_like(gain_sum, dtype=np.float32)
+    mean_gain[valid_counts] = (
+        gain_sum[valid_counts] / era_counts[valid_counts]
+    ).astype(np.float32)
+    variance = np.zeros_like(mean_gain)
+    variance[valid_counts] = (
+        gain_sumsq[valid_counts] / era_counts[valid_counts]
+    ).astype(np.float32) - mean_gain[valid_counts] ** 2
+    variance = np.maximum(variance, 0.0)
     std = np.sqrt(variance, dtype=np.float32)
     dro_score = mean_gain - lambda_dro * std
 
-    agreement = np.zeros_like(means)
+    agreement = np.zeros_like(mean_gain)
     nonzero_dir = direction_count > 0
     agreement[nonzero_dir] = np.abs(direction_sum[nonzero_dir]) / direction_count[nonzero_dir]
 
