@@ -2023,7 +2023,10 @@ FastpathResult fastpath_frontier_cuda(
     cache.zero_vector(cache.direction_count, total_candidates, "cudaMemset direction_count");
 
     const int threads = 128;
-    const int blocks = std::max<int>(1, static_cast<int>((total_features + threads - 1) / threads));
+    const int blocks = std::max<int>(
+        1,
+        static_cast<int>(total_features)
+    );
     const std::size_t shared_bytes = static_cast<std::size_t>(max_bins) * (sizeof(float) * 2 + sizeof(int));
 
     fastpath_accumulate_kernel<<<blocks, threads, shared_bytes>>>(
