@@ -168,77 +168,17 @@ class PackBoost:
                 if feature_subset.size == 0:
                     break
 
-                next_frontiers: List[List[NodeState]] = [[] for _ in range(self.config.pack_size)]
-                for tree_idx, tree in enumerate(pack_trees):
-                    frontier_states = pack_frontiers[tree_idx]
-                    if not frontier_states:
-                        continue
+                pack_frontiers = self._grow_depth(
+                    feature_subset=feature_subset,
+                    pack_frontiers=pack_frontiers,
+                    pack_trees=pack_trees,
+                    X_binned=X_binned,
+                    gradients=gradients,
+                    hessians=hessians,
+                )
 
-                    decisions = evaluate_frontier_fastpath(
-                        X_binned=X_binned,
-                        gradients=gradients,
-                        hessians=hessians,
-                        node_states=frontier_states,
-                        features=feature_subset,
-                        config=self.config,
-                    )
-
-                    for state, decision in zip(frontier_states, decisions):
-                        node = tree.nodes[state.node_id]
-                        right_count = state.sample_count - decision.left_count
-                        if (
-                            decision.feature is None
-                            or decision.score <= 0
-                            or decision.left_count < self.config.min_samples_leaf
-                            or right_count < self.config.min_samples_leaf
-                        ):
-                            tree.ensure_leaf(state.node_id, decision.base_value)
-                            continue
-
-                        node.feature = decision.feature
-                        node.threshold = decision.threshold
-                        node.is_leaf = False
-
-                        left_node = TreeNode(
-                            is_leaf=False,
-                            prediction=decision.left_value,
-                            depth=state.depth + 1,
-                        )
-                        right_node = TreeNode(
-                            is_leaf=False,
-                            prediction=decision.right_value,
-                            depth=state.depth + 1,
-                        )
-                        left_id = tree.add_node(left_node)
-                        right_id = tree.add_node(right_node)
-                        node.left = left_id
-                        node.right = right_id
-
-                        left_shard, right_shard = split_shard(
-                            state.shard, X_binned, decision.feature, decision.threshold
-                        )
-
-                        left_state = NodeState(
-                            node_id=left_id,
-                            shard=left_shard,
-                            grad_sum=decision.left_grad,
-                            hess_sum=decision.left_hess,
-                            sample_count=decision.left_count,
-                            depth=state.depth + 1,
-                        )
-                        right_state = NodeState(
-                            node_id=right_id,
-                            shard=right_shard,
-                            grad_sum=state.grad_sum - decision.left_grad,
-                            hess_sum=state.hess_sum - decision.left_hess,
-                            sample_count=right_count,
-                            depth=state.depth + 1,
-                        )
-                        next_frontiers[tree_idx].extend([left_state, right_state])
-
-                if not any(next_frontiers):
+                if not any(pack_frontiers):
                     break
-                pack_frontiers = next_frontiers
 
             for tree_idx, tree in enumerate(pack_trees):
                 for state in pack_frontiers[tree_idx]:
@@ -319,6 +259,106 @@ class PackBoost:
     def _sample_features(self, rng: np.random.Generator, n_features: int) -> np.ndarray:
         n_candidates = max(1, int(np.ceil(self.config.layer_feature_fraction * n_features)))
         return np.sort(rng.choice(n_features, size=n_candidates, replace=False))
+
+    def _grow_depth(
+        self,
+        *,
+        feature_subset: np.ndarray,
+        pack_frontiers: List[List[NodeState]],
+        pack_trees: List[Tree],
+        X_binned: np.ndarray,
+        gradients: np.ndarray,
+        hessians: np.ndarray,
+    ) -> List[List[NodeState]]:
+        """Expand all trees in the current pack at the given depth."""
+
+        total_states = sum(len(states) for states in pack_frontiers)
+        if total_states == 0:
+            return [[] for _ in pack_frontiers]
+
+        node_states: list[NodeState] = []
+        slices: list[tuple[int, int, int]] = []
+        for tree_idx, states in enumerate(pack_frontiers):
+            if not states:
+                slices.append((tree_idx, len(node_states), 0))
+                continue
+            start = len(node_states)
+            node_states.extend(states)
+            slices.append((tree_idx, start, len(states)))
+
+        decisions = evaluate_frontier_fastpath(
+            X_binned=X_binned,
+            gradients=gradients,
+            hessians=hessians,
+            node_states=node_states,
+            features=feature_subset,
+            config=self.config,
+        )
+
+        next_frontiers: List[List[NodeState]] = [[] for _ in pack_frontiers]
+
+        for tree_idx, start, count in slices:
+            if count == 0:
+                continue
+            tree = pack_trees[tree_idx]
+            states = pack_frontiers[tree_idx]
+            tree_decisions = decisions[start : start + count]
+
+            for state, decision in zip(states, tree_decisions):
+                node = tree.nodes[state.node_id]
+                right_count = state.sample_count - decision.left_count
+                if (
+                    decision.feature is None
+                    or decision.score <= 0
+                    or decision.left_count < self.config.min_samples_leaf
+                    or right_count < self.config.min_samples_leaf
+                ):
+                    tree.ensure_leaf(state.node_id, decision.base_value)
+                    continue
+
+                node.feature = decision.feature
+                node.threshold = decision.threshold
+                node.is_leaf = False
+
+                left_node = TreeNode(
+                    is_leaf=False,
+                    prediction=decision.left_value,
+                    depth=state.depth + 1,
+                )
+                right_node = TreeNode(
+                    is_leaf=False,
+                    prediction=decision.right_value,
+                    depth=state.depth + 1,
+                )
+                left_id = tree.add_node(left_node)
+                right_id = tree.add_node(right_node)
+                node.left = left_id
+                node.right = right_id
+
+                left_shard, right_shard = split_shard(
+                    state.shard, X_binned, decision.feature, decision.threshold
+                )
+
+                left_state = NodeState(
+                    node_id=left_id,
+                    shard=left_shard,
+                    grad_sum=decision.left_grad,
+                    hess_sum=decision.left_hess,
+                    sample_count=decision.left_count,
+                    depth=state.depth + 1,
+                )
+                right_state = NodeState(
+                    node_id=right_id,
+                    shard=right_shard,
+                    grad_sum=state.grad_sum - decision.left_grad,
+                    hess_sum=state.hess_sum - decision.left_hess,
+                    sample_count=right_count,
+                    depth=state.depth + 1,
+                )
+
+                next_frontiers[tree_idx].extend((left_state, right_state))
+
+        return next_frontiers
 
     # ------------------------------------------------------------------
     # Compatibility helpers for the legacy native bindings interface.

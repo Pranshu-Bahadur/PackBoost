@@ -33,6 +33,18 @@ class EraShard:
     def sample_count(self) -> int:
         return int(sum(int(rows.size) for rows in self.rows_per_era))
 
+    def flatten(self) -> np.ndarray:
+        """Return a concatenated ``int32`` view of all row indices."""
+
+        if not self.rows_per_era:
+            return _EMPTY
+        parts = [rows.astype(np.int32, copy=False) for rows in self.rows_per_era if rows.size]
+        if not parts:
+            return _EMPTY
+        if len(parts) == 1:
+            return parts[0]
+        return np.concatenate(parts).astype(np.int32, copy=False)
+
 
 @dataclass
 class NodeState:

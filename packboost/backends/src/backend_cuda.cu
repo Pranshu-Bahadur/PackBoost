@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <thrust/device_vector.h>
+#include <thrust/fill.h>
 #include <thrust/host_vector.h>
 #include <thrust/iterator/constant_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
@@ -52,14 +53,93 @@ namespace {
 
 constexpr float NEG_INF_F = -std::numeric_limits<float>::infinity();
 
-static void check_contiguous(const py::buffer_info& info, const char* name) {
-    if (info.ndim == 0) {
-        throw std::invalid_argument(std::string(name) + " must be at least 1-D");
+struct FastpathDeviceCache {
+    thrust::device_vector<uint8_t> bins;
+    const uint8_t* host_bins = nullptr;
+
+    thrust::device_vector<float> gradients;
+    thrust::device_vector<float> hessians;
+    thrust::device_vector<int32_t> node_indices;
+    thrust::device_vector<int32_t> node_base_offsets;
+    thrust::device_vector<int32_t> node_era_offsets;
+    thrust::device_vector<int32_t> feature_subset;
+    thrust::device_vector<int32_t> parent_count;
+
+    thrust::device_vector<double> gain_sum;
+    thrust::device_vector<double> gain_sumsq;
+    thrust::device_vector<int32_t> era_counts;
+    thrust::device_vector<double> left_grad;
+    thrust::device_vector<double> left_hess;
+    thrust::device_vector<int64_t> left_count;
+    thrust::device_vector<float> direction_sum;
+    thrust::device_vector<int32_t> direction_count;
+
+    thrust::device_vector<int32_t> best_threshold_per_feature;
+    thrust::device_vector<float> best_score_per_feature;
+    thrust::device_vector<float> agreement_per_feature;
+    thrust::device_vector<float> left_grad_per_feature;
+    thrust::device_vector<float> left_hess_per_feature;
+    thrust::device_vector<int32_t> left_count_per_feature;
+
+    thrust::device_vector<int32_t> best_feature;
+    thrust::device_vector<int32_t> best_threshold;
+    thrust::device_vector<float> best_score;
+    thrust::device_vector<float> best_agreement;
+    thrust::device_vector<float> best_left_grad;
+    thrust::device_vector<float> best_left_hess;
+    thrust::device_vector<int32_t> best_left_count;
+
+    void ensure_bins(const uint8_t* src, std::size_t total_elements) {
+        if (bins.size() != total_elements) {
+            bins.resize(total_elements);
+            host_bins = nullptr;
+        }
+        if (total_elements == 0) {
+            host_bins = nullptr;
+            return;
+        }
+        if (src != host_bins) {
+            throw_on_cuda(
+                cudaMemcpy(
+                    thrust::raw_pointer_cast(bins.data()),
+                    src,
+                    total_elements * sizeof(uint8_t),
+                    cudaMemcpyHostToDevice),
+                "cudaMemcpy bins");
+            host_bins = src;
+        }
     }
-    if (info.strides.back() != info.itemsize) {
-        throw std::invalid_argument(std::string(name) + " must be C-contiguous");
+
+    template <typename T>
+    void copy_vector(thrust::device_vector<T>& dst, const T* src, std::size_t count, const char* label) {
+        dst.resize(count);
+        if (count == 0) {
+            return;
+        }
+        throw_on_cuda(
+            cudaMemcpy(
+                thrust::raw_pointer_cast(dst.data()),
+                src,
+                count * sizeof(T),
+                cudaMemcpyHostToDevice),
+            label);
     }
-}
+
+    template <typename Vector>
+    void zero_vector(Vector& vec, std::size_t count, const char* label) {
+        using T = typename Vector::value_type;
+        vec.resize(count);
+        if (count == 0) {
+            return;
+        }
+        throw_on_cuda(
+            cudaMemset(
+                thrust::raw_pointer_cast(vec.data()),
+                0,
+                count * sizeof(T)),
+            label);
+    }
+};
 
 __global__ void frontier_feature_kernel(
     const uint8_t* __restrict__ bins,
@@ -1910,7 +1990,7 @@ FastpathResult fastpath_frontier_cuda(
     result.left_hess.assign(n_nodes, 0.0f);
     result.left_count.assign(n_nodes, 0);
 
-    if (n_nodes == 0 || n_features_subset == 0 || max_bins <= 1) {
+    if (n_nodes == 0 || n_features_subset == 0 || max_bins <= 1 || n_rows == 0) {
         return result;
     }
 
@@ -1919,130 +1999,186 @@ FastpathResult fastpath_frontier_cuda(
     const std::size_t total_candidates = total_features * thresholds;
     const std::size_t total_indices = static_cast<std::size_t>(node_base_offsets[n_nodes]);
 
-    thrust::device_vector<uint8_t> d_bins(bins, bins + n_rows * n_features_total);
-    thrust::device_vector<float> d_gradients(gradients, gradients + n_rows);
-    thrust::device_vector<float> d_hessians(hessians, hessians + n_rows);
-    thrust::device_vector<int32_t> d_node_indices(node_indices, node_indices + total_indices);
-    thrust::device_vector<int32_t> d_node_base_offsets(node_base_offsets, node_base_offsets + n_nodes + 1);
-    thrust::device_vector<int32_t> d_node_era_offsets(node_era_offsets, node_era_offsets + static_cast<std::size_t>(n_nodes) * (n_eras + 1));
-    thrust::device_vector<int32_t> d_feature_subset(feature_subset, feature_subset + n_features_subset);
-    thrust::device_vector<int32_t> d_parent_count(parent_count, parent_count + n_nodes);
+    static FastpathDeviceCache cache;
+    cache.ensure_bins(bins, n_rows * n_features_total);
+    cache.copy_vector(cache.gradients, gradients, n_rows, "cudaMemcpy gradients");
+    cache.copy_vector(cache.hessians, hessians, n_rows, "cudaMemcpy hessians");
+    cache.copy_vector(cache.node_indices, node_indices, total_indices, "cudaMemcpy node_indices");
+    cache.copy_vector(cache.node_base_offsets, node_base_offsets, n_nodes + 1, "cudaMemcpy node_base_offsets");
+    cache.copy_vector(
+        cache.node_era_offsets,
+        node_era_offsets,
+        static_cast<std::size_t>(n_nodes) * static_cast<std::size_t>(n_eras + 1),
+        "cudaMemcpy node_era_offsets");
+    cache.copy_vector(cache.feature_subset, feature_subset, n_features_subset, "cudaMemcpy feature_subset");
+    cache.copy_vector(cache.parent_count, parent_count, n_nodes, "cudaMemcpy parent_count");
 
-    thrust::device_vector<double> d_gain_sum(total_candidates, 0.0);
-    thrust::device_vector<double> d_gain_sumsq(total_candidates, 0.0);
-    thrust::device_vector<int32_t> d_era_counts(total_candidates, 0);
-    thrust::device_vector<double> d_left_grad(total_candidates, 0.0);
-    thrust::device_vector<double> d_left_hess(total_candidates, 0.0);
-    thrust::device_vector<int64_t> d_left_count(total_candidates, 0);
-    thrust::device_vector<float> d_direction_sum(total_candidates, 0.0f);
-    thrust::device_vector<int32_t> d_direction_count(total_candidates, 0);
+    cache.zero_vector(cache.gain_sum, total_candidates, "cudaMemset gain_sum");
+    cache.zero_vector(cache.gain_sumsq, total_candidates, "cudaMemset gain_sumsq");
+    cache.zero_vector(cache.era_counts, total_candidates, "cudaMemset era_counts");
+    cache.zero_vector(cache.left_grad, total_candidates, "cudaMemset left_grad");
+    cache.zero_vector(cache.left_hess, total_candidates, "cudaMemset left_hess");
+    cache.zero_vector(cache.left_count, total_candidates, "cudaMemset left_count");
+    cache.zero_vector(cache.direction_sum, total_candidates, "cudaMemset direction_sum");
+    cache.zero_vector(cache.direction_count, total_candidates, "cudaMemset direction_count");
 
     const int threads = 128;
-    const int blocks = std::max<int>(1, static_cast<int>(total_features));
+    const int blocks = std::max<int>(1, static_cast<int>((total_features + threads - 1) / threads));
     const std::size_t shared_bytes = static_cast<std::size_t>(max_bins) * (sizeof(float) * 2 + sizeof(int));
 
     fastpath_accumulate_kernel<<<blocks, threads, shared_bytes>>>(
-        thrust::raw_pointer_cast(d_bins.data()),
-        thrust::raw_pointer_cast(d_gradients.data()),
-        thrust::raw_pointer_cast(d_hessians.data()),
-        thrust::raw_pointer_cast(d_node_indices.data()),
-        thrust::raw_pointer_cast(d_node_base_offsets.data()),
-        thrust::raw_pointer_cast(d_node_era_offsets.data()),
+        thrust::raw_pointer_cast(cache.bins.data()),
+        thrust::raw_pointer_cast(cache.gradients.data()),
+        thrust::raw_pointer_cast(cache.hessians.data()),
+        thrust::raw_pointer_cast(cache.node_indices.data()),
+        thrust::raw_pointer_cast(cache.node_base_offsets.data()),
+        thrust::raw_pointer_cast(cache.node_era_offsets.data()),
         static_cast<int>(n_rows),
         static_cast<int>(n_features_total),
-        thrust::raw_pointer_cast(d_feature_subset.data()),
+        thrust::raw_pointer_cast(cache.feature_subset.data()),
         static_cast<int>(n_features_subset),
         static_cast<int>(n_nodes),
         n_eras,
         max_bins,
-        thrust::raw_pointer_cast(d_gain_sum.data()),
-        thrust::raw_pointer_cast(d_gain_sumsq.data()),
-        thrust::raw_pointer_cast(d_era_counts.data()),
-        thrust::raw_pointer_cast(d_left_grad.data()),
-        thrust::raw_pointer_cast(d_left_hess.data()),
-        thrust::raw_pointer_cast(d_left_count.data()),
-        thrust::raw_pointer_cast(d_direction_sum.data()),
-        thrust::raw_pointer_cast(d_direction_count.data()),
+        thrust::raw_pointer_cast(cache.gain_sum.data()),
+        thrust::raw_pointer_cast(cache.gain_sumsq.data()),
+        thrust::raw_pointer_cast(cache.era_counts.data()),
+        thrust::raw_pointer_cast(cache.left_grad.data()),
+        thrust::raw_pointer_cast(cache.left_hess.data()),
+        thrust::raw_pointer_cast(cache.left_count.data()),
+        thrust::raw_pointer_cast(cache.direction_sum.data()),
+        thrust::raw_pointer_cast(cache.direction_count.data()),
         lambda_l2);
     throw_on_cuda(cudaGetLastError(), "fastpath_accumulate_kernel");
     throw_on_cuda(cudaDeviceSynchronize(), "fastpath_accumulate_kernel sync");
 
-    thrust::device_vector<int32_t> d_best_threshold_per_feature(total_features, -1);
-    thrust::device_vector<float> d_best_score_per_feature(total_features, NEG_INF_F);
-    thrust::device_vector<float> d_agreement_per_feature(total_features, 0.0f);
-    thrust::device_vector<float> d_left_grad_per_feature(total_features, 0.0f);
-    thrust::device_vector<float> d_left_hess_per_feature(total_features, 0.0f);
-    thrust::device_vector<int32_t> d_left_count_per_feature(total_features, 0);
+    cache.best_threshold_per_feature.resize(total_features);
+    cache.best_score_per_feature.resize(total_features);
+    cache.agreement_per_feature.resize(total_features);
+    cache.left_grad_per_feature.resize(total_features);
+    cache.left_hess_per_feature.resize(total_features);
+    cache.left_count_per_feature.resize(total_features);
+
+    thrust::fill(cache.best_threshold_per_feature.begin(), cache.best_threshold_per_feature.end(), -1);
+    thrust::fill(cache.best_score_per_feature.begin(), cache.best_score_per_feature.end(), NEG_INF_F);
+    thrust::fill(cache.agreement_per_feature.begin(), cache.agreement_per_feature.end(), 0.0f);
+    thrust::fill(cache.left_grad_per_feature.begin(), cache.left_grad_per_feature.end(), 0.0f);
+    thrust::fill(cache.left_hess_per_feature.begin(), cache.left_hess_per_feature.end(), 0.0f);
+    cache.zero_vector(cache.left_count_per_feature, total_features, "cudaMemset left_count_per_feature");
 
     const int feature_blocks = (static_cast<int>(total_features) + threads - 1) / threads;
     fastpath_select_feature_kernel<<<feature_blocks, threads>>>(
         static_cast<int>(n_nodes),
         static_cast<int>(n_features_subset),
         thresholds,
-        thrust::raw_pointer_cast(d_gain_sum.data()),
-        thrust::raw_pointer_cast(d_gain_sumsq.data()),
-        thrust::raw_pointer_cast(d_era_counts.data()),
-        thrust::raw_pointer_cast(d_left_grad.data()),
-        thrust::raw_pointer_cast(d_left_hess.data()),
-        thrust::raw_pointer_cast(d_left_count.data()),
-        thrust::raw_pointer_cast(d_direction_sum.data()),
-        thrust::raw_pointer_cast(d_direction_count.data()),
-        thrust::raw_pointer_cast(d_parent_count.data()),
+        thrust::raw_pointer_cast(cache.gain_sum.data()),
+        thrust::raw_pointer_cast(cache.gain_sumsq.data()),
+        thrust::raw_pointer_cast(cache.era_counts.data()),
+        thrust::raw_pointer_cast(cache.left_grad.data()),
+        thrust::raw_pointer_cast(cache.left_hess.data()),
+        thrust::raw_pointer_cast(cache.left_count.data()),
+        thrust::raw_pointer_cast(cache.direction_sum.data()),
+        thrust::raw_pointer_cast(cache.direction_count.data()),
+        thrust::raw_pointer_cast(cache.parent_count.data()),
         lambda_dro,
         direction_weight,
         min_samples_leaf,
-        thrust::raw_pointer_cast(d_best_threshold_per_feature.data()),
-        thrust::raw_pointer_cast(d_best_score_per_feature.data()),
-        thrust::raw_pointer_cast(d_agreement_per_feature.data()),
-        thrust::raw_pointer_cast(d_left_grad_per_feature.data()),
-        thrust::raw_pointer_cast(d_left_hess_per_feature.data()),
-        thrust::raw_pointer_cast(d_left_count_per_feature.data()));
+        thrust::raw_pointer_cast(cache.best_threshold_per_feature.data()),
+        thrust::raw_pointer_cast(cache.best_score_per_feature.data()),
+        thrust::raw_pointer_cast(cache.agreement_per_feature.data()),
+        thrust::raw_pointer_cast(cache.left_grad_per_feature.data()),
+        thrust::raw_pointer_cast(cache.left_hess_per_feature.data()),
+        thrust::raw_pointer_cast(cache.left_count_per_feature.data()));
     throw_on_cuda(cudaGetLastError(), "fastpath_select_feature_kernel");
     throw_on_cuda(cudaDeviceSynchronize(), "fastpath_select_feature_kernel sync");
 
-    thrust::device_vector<int32_t> d_best_feature(n_nodes, -1);
-    thrust::device_vector<int32_t> d_best_threshold(n_nodes, 0);
-    thrust::device_vector<float> d_best_score(n_nodes, NEG_INF_F);
-    thrust::device_vector<float> d_best_agreement(n_nodes, 0.0f);
-    thrust::device_vector<float> d_best_left_grad(n_nodes, 0.0f);
-    thrust::device_vector<float> d_best_left_hess(n_nodes, 0.0f);
-    thrust::device_vector<int32_t> d_best_left_count(n_nodes, 0);
+    cache.best_feature.resize(n_nodes);
+    cache.best_threshold.resize(n_nodes);
+    cache.best_score.resize(n_nodes);
+    cache.best_agreement.resize(n_nodes);
+    cache.best_left_grad.resize(n_nodes);
+    cache.best_left_hess.resize(n_nodes);
+    cache.best_left_count.resize(n_nodes);
+
+    thrust::fill(cache.best_feature.begin(), cache.best_feature.end(), -1);
+    thrust::fill(cache.best_threshold.begin(), cache.best_threshold.end(), 0);
+    thrust::fill(cache.best_score.begin(), cache.best_score.end(), NEG_INF_F);
+    thrust::fill(cache.best_agreement.begin(), cache.best_agreement.end(), 0.0f);
+    thrust::fill(cache.best_left_grad.begin(), cache.best_left_grad.end(), 0.0f);
+    thrust::fill(cache.best_left_hess.begin(), cache.best_left_hess.end(), 0.0f);
+    cache.zero_vector(cache.best_left_count, n_nodes, "cudaMemset best_left_count");
 
     const int node_blocks = (static_cast<int>(n_nodes) + threads - 1) / threads;
     fastpath_select_node_kernel<<<node_blocks, threads>>>(
         static_cast<int>(n_nodes),
         static_cast<int>(n_features_subset),
-        thrust::raw_pointer_cast(d_best_threshold_per_feature.data()),
-        thrust::raw_pointer_cast(d_best_score_per_feature.data()),
-        thrust::raw_pointer_cast(d_agreement_per_feature.data()),
-        thrust::raw_pointer_cast(d_left_grad_per_feature.data()),
-        thrust::raw_pointer_cast(d_left_hess_per_feature.data()),
-        thrust::raw_pointer_cast(d_left_count_per_feature.data()),
-        thrust::raw_pointer_cast(d_best_feature.data()),
-        thrust::raw_pointer_cast(d_best_threshold.data()),
-        thrust::raw_pointer_cast(d_best_score.data()),
-        thrust::raw_pointer_cast(d_best_agreement.data()),
-        thrust::raw_pointer_cast(d_best_left_grad.data()),
-        thrust::raw_pointer_cast(d_best_left_hess.data()),
-        thrust::raw_pointer_cast(d_best_left_count.data()));
+        thrust::raw_pointer_cast(cache.best_threshold_per_feature.data()),
+        thrust::raw_pointer_cast(cache.best_score_per_feature.data()),
+        thrust::raw_pointer_cast(cache.agreement_per_feature.data()),
+        thrust::raw_pointer_cast(cache.left_grad_per_feature.data()),
+        thrust::raw_pointer_cast(cache.left_hess_per_feature.data()),
+        thrust::raw_pointer_cast(cache.left_count_per_feature.data()),
+        thrust::raw_pointer_cast(cache.best_feature.data()),
+        thrust::raw_pointer_cast(cache.best_threshold.data()),
+        thrust::raw_pointer_cast(cache.best_score.data()),
+        thrust::raw_pointer_cast(cache.best_agreement.data()),
+        thrust::raw_pointer_cast(cache.best_left_grad.data()),
+        thrust::raw_pointer_cast(cache.best_left_hess.data()),
+        thrust::raw_pointer_cast(cache.best_left_count.data()));
     throw_on_cuda(cudaGetLastError(), "fastpath_select_node_kernel");
     throw_on_cuda(cudaDeviceSynchronize(), "fastpath_select_node_kernel sync");
 
-    thrust::host_vector<int32_t> h_best_feature = d_best_feature;
-    thrust::host_vector<int32_t> h_best_threshold = d_best_threshold;
-    thrust::host_vector<float> h_best_score = d_best_score;
-    thrust::host_vector<float> h_best_agreement = d_best_agreement;
-    thrust::host_vector<float> h_best_left_grad = d_best_left_grad;
-    thrust::host_vector<float> h_best_left_hess = d_best_left_hess;
-    thrust::host_vector<int32_t> h_best_left_count = d_best_left_count;
-
-    result.best_feature.assign(h_best_feature.begin(), h_best_feature.end());
-    result.best_threshold.assign(h_best_threshold.begin(), h_best_threshold.end());
-    result.score.assign(h_best_score.begin(), h_best_score.end());
-    result.agreement.assign(h_best_agreement.begin(), h_best_agreement.end());
-    result.left_grad.assign(h_best_left_grad.begin(), h_best_left_grad.end());
-    result.left_hess.assign(h_best_left_hess.begin(), h_best_left_hess.end());
-    result.left_count.assign(h_best_left_count.begin(), h_best_left_count.end());
+    if (n_nodes > 0) {
+        throw_on_cuda(
+            cudaMemcpy(
+                result.best_feature.data(),
+                thrust::raw_pointer_cast(cache.best_feature.data()),
+                n_nodes * sizeof(int32_t),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy best_feature");
+        throw_on_cuda(
+            cudaMemcpy(
+                result.best_threshold.data(),
+                thrust::raw_pointer_cast(cache.best_threshold.data()),
+                n_nodes * sizeof(int32_t),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy best_threshold");
+        throw_on_cuda(
+            cudaMemcpy(
+                result.score.data(),
+                thrust::raw_pointer_cast(cache.best_score.data()),
+                n_nodes * sizeof(float),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy score");
+        throw_on_cuda(
+            cudaMemcpy(
+                result.agreement.data(),
+                thrust::raw_pointer_cast(cache.best_agreement.data()),
+                n_nodes * sizeof(float),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy agreement");
+        throw_on_cuda(
+            cudaMemcpy(
+                result.left_grad.data(),
+                thrust::raw_pointer_cast(cache.best_left_grad.data()),
+                n_nodes * sizeof(float),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy left_grad");
+        throw_on_cuda(
+            cudaMemcpy(
+                result.left_hess.data(),
+                thrust::raw_pointer_cast(cache.best_left_hess.data()),
+                n_nodes * sizeof(float),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy left_hess");
+        throw_on_cuda(
+            cudaMemcpy(
+                result.left_count.data(),
+                thrust::raw_pointer_cast(cache.best_left_count.data()),
+                n_nodes * sizeof(int32_t),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy left_count");
+    }
 
     return result;
 }
