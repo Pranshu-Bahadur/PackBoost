@@ -2049,7 +2049,7 @@ FastpathResult fastpath_frontier_cuda(
 
 }  // namespace packboost
 
-static py::tuple cuda_fastpath_evaluate_binding(
+py::tuple cuda_fastpath_evaluate_binding(
     py::array_t<uint8_t, py::array::c_style | py::array::forcecast> bins,
     py::array_t<float, py::array::c_style | py::array::forcecast> gradients,
     py::array_t<float, py::array::c_style | py::array::forcecast> hessians,
