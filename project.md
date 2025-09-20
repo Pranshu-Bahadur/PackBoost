@@ -219,3 +219,7 @@ setup_native.py
 * **M10. Numerai integration & benchmarks** — end-to-end scripts; throughput and validation metrics logged.
 
 ---
+
+## 10) Changelog
+
+- 2025-09-20 — Applied Milestone 1 audit fixes: global parent direction in DES, weighted Welford with `era_alpha`, histogram subtraction guard, DES regression tests, native backend stubs, and CPU-only documentation updates.

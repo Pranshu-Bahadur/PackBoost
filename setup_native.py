@@ -20,9 +20,12 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise SystemExit("numpy is required: pip install numpy") from exc
 
-SRC_DIR = Path("packboost") / "backends" / "src"
-CPU_SOURCES = [str(SRC_DIR / "backend_cpu.cpp")]
-CUDA_SOURCE = SRC_DIR / "backend_cuda.cu"
+BACKEND_DIR = Path("packboost") / "backends"
+CPU_SOURCES = [
+    str(BACKEND_DIR / "bindings.cpp"),
+    str(BACKEND_DIR / "cpu" / "frontier_cpu.cpp"),
+]
+CUDA_SOURCE = BACKEND_DIR / "cuda" / "frontier_cuda.cu"
 ROOT = Path(__file__).parent.resolve()
 
 
@@ -55,7 +58,7 @@ def build_native_extension() -> Tuple[List[Pybind11Extension], Dict[str, object]
             pybind11.get_include(user=True),
             sysconfig.get_paths()["include"],
             np.get_include(),
-            str(SRC_DIR),
+            str(BACKEND_DIR),
         ]
         arch_list_env = os.environ.get("PACKBOOST_CUDA_ARCHS")
         if arch_list_env:
@@ -113,7 +116,7 @@ def build_native_extension() -> Tuple[List[Pybind11Extension], Dict[str, object]
             "packboost._backend",
             CPU_SOURCES,
             define_macros=macros,
-            include_dirs=[str(SRC_DIR), np.get_include()],
+            include_dirs=[str(BACKEND_DIR), np.get_include()],
             extra_compile_args=["-O3", "-std=c++17", "-fvisibility=hidden", "-fopenmp"],
             extra_link_args=["-fopenmp"],
             library_dirs=cuda_library_dirs,

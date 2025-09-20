@@ -29,6 +29,10 @@ class PackBoostConfig:
         Maximum number of histogram bins per feature (<= 256 for uint8 storage).
     layer_feature_fraction:
         Fraction of features sampled uniformly without replacement per depth.
+    era_alpha:
+        Non-negative pseudo-count blended with per-era sample counts when
+        computing DES weights. ``0`` keeps equal-era weighting while larger
+        values gradually favour eras with more rows.
     era_tile_size:
         Number of eras processed together when streaming DES statistics.
     random_state:
@@ -48,6 +52,7 @@ class PackBoostConfig:
     min_samples_leaf: int = 20
     max_bins: int = 63
     layer_feature_fraction: float = 1.0
+    era_alpha: float = 0.0
     era_tile_size: int = 64
     random_state: int | None = None
     histogram_subtraction: bool = True

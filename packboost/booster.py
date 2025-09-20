@@ -307,6 +307,16 @@ class PackBoost:
         direction_weight = self.config.direction_weight
         num_eras = len(era_rows)
 
+        parent_value_total = -total_grad / (total_hess + lambda_l2)
+        parent_dir = torch.sign(parent_value_total)
+
+        era_counts = torch.tensor(
+            [float(rows.numel()) for rows in era_rows],
+            dtype=torch.float32,
+            device=self._device,
+        )
+        era_weights = self._compute_era_weights(era_counts)
+
         best_decision: SplitDecision | None = None
         thresholds = torch.arange(num_bins - 1, device=self._device, dtype=torch.int64)
 
@@ -316,10 +326,6 @@ class PackBoost:
                 feature_values, grad_all, hess_all, era_ids, num_eras, num_bins
             )
 
-            if counts.sum() < 2 * self.config.min_samples_leaf:
-                continue
-
-            # Per-era prefix stats for Welford aggregates
             prefix_counts = counts[:, :-1].cumsum(dim=1)
             prefix_grad = grad_hist[:, :-1].cumsum(dim=1)
             prefix_hess = hess_hist[:, :-1].cumsum(dim=1)
@@ -329,52 +335,43 @@ class PackBoost:
             total_hess_e = hess_hist.sum(dim=1, keepdim=True)
 
             left_count = prefix_counts
-            right_count = total_count_e - left_count
+            left_grad = prefix_grad
+            left_hess = prefix_hess
+
+            if self.config.histogram_subtraction:
+                right_count = total_count_e - left_count
+                right_grad = total_grad_e - left_grad
+                right_hess = total_hess_e - left_hess
+            else:
+                right_count = counts[:, 1:].flip(dims=(1,)).cumsum(dim=1).flip(dims=(1,))
+                right_grad = grad_hist[:, 1:].flip(dims=(1,)).cumsum(dim=1).flip(dims=(1,))
+                right_hess = hess_hist[:, 1:].flip(dims=(1,)).cumsum(dim=1).flip(dims=(1,))
+
             valid = (left_count > 0) & (right_count > 0)
             if not torch.any(valid):
                 continue
-
-            left_grad = prefix_grad
-            right_grad = total_grad_e - left_grad
-            left_hess = prefix_hess
-            right_hess = total_hess_e - left_hess
 
             parent_gain = 0.5 * (total_grad_e**2) / (total_hess_e + lambda_l2)
             gain_left = 0.5 * (left_grad**2) / (left_hess + lambda_l2)
             gain_right = 0.5 * (right_grad**2) / (right_hess + lambda_l2)
             era_gain = gain_left + gain_right - parent_gain
 
-            parent_value = -total_grad_e / (total_hess_e + lambda_l2)
             left_value = -left_grad / (left_hess + lambda_l2)
             right_value = -right_grad / (right_hess + lambda_l2)
-            parent_dir = torch.sign(parent_value)
-            agree_left = (torch.sign(left_value) == parent_dir).to(torch.float32)
-            agree_right = (torch.sign(right_value) == parent_dir).to(torch.float32)
-            era_agreement = 0.5 * (agree_left + agree_right)
 
-            valid_float = valid.to(torch.float32)
-            n = valid_float.sum(dim=0)
-            mean_gain = torch.where(
-                n > 0,
-                (era_gain * valid_float).sum(dim=0) / torch.clamp_min(n, 1.0),
-                torch.zeros(
-                    num_thresholds, device=self._device, dtype=torch.float32
-                ),
+            mean_gain, std_gain, weight_sum = self._weighted_welford(
+                era_gain,
+                valid,
+                era_weights,
             )
 
-            diff = era_gain - mean_gain.unsqueeze(0)
-            sum_sq = (diff.pow(2) * valid_float).sum(dim=0)
-            variance = torch.where(
-                n > 1,
-                sum_sq / torch.clamp_min(n - 1.0, 1.0),
-                torch.zeros_like(sum_sq),
-            )
-            std = torch.sqrt(torch.clamp_min(variance, 0.0))
-
-            agreement_mean = torch.where(
-                n > 0,
-                (era_agreement * valid_float).sum(dim=0) / torch.clamp_min(n, 1.0),
-                torch.zeros_like(mean_gain),
+            agreement_mean = self._directional_agreement(
+                left_value,
+                right_value,
+                valid,
+                era_weights,
+                parent_dir,
+                weight_sum,
             )
 
             agg_count = counts.sum(dim=0)
@@ -393,7 +390,7 @@ class PackBoost:
             if not torch.any(valid_global):
                 continue
 
-            score = mean_gain - lambda_dro * std + direction_weight * agreement_mean
+            score = mean_gain - lambda_dro * std_gain + direction_weight * agreement_mean
             score = torch.where(
                 valid_global,
                 score,
@@ -434,6 +431,97 @@ class PackBoost:
                 best_decision = decision
 
         return best_decision
+
+    def _compute_era_weights(self, counts: torch.Tensor) -> torch.Tensor:
+        weights = torch.zeros_like(counts, dtype=torch.float32)
+        positive = counts > 0
+        if not torch.any(positive):
+            return weights
+        era_alpha = max(0.0, float(self.config.era_alpha))
+        if era_alpha > 0.0:
+            weights[positive] = counts[positive] + era_alpha
+        else:
+            weights[positive] = 1.0
+        return weights
+
+    def _weighted_welford(
+        self,
+        values: torch.Tensor,
+        valid_mask: torch.Tensor,
+        era_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if values.numel() == 0:
+            empty = torch.empty(0, dtype=torch.float32, device=self._device)
+            return empty, empty.clone(), empty.clone()
+
+        num_eras, num_thresholds = values.shape
+        dtype = values.dtype
+        mean = torch.zeros(num_thresholds, dtype=dtype, device=values.device)
+        m2 = torch.zeros_like(mean)
+        weight_sum = torch.zeros_like(mean)
+
+        tile = max(1, int(self.config.era_tile_size))
+        weights = era_weights.to(dtype=dtype)
+        mask_float = valid_mask.to(dtype=dtype)
+
+        for start in range(0, num_eras, tile):
+            end = min(start + tile, num_eras)
+            for era_idx in range(start, end):
+                w = weights[era_idx]
+                if w <= 0:
+                    continue
+                mask = mask_float[era_idx]
+                if torch.all(mask == 0):
+                    continue
+                eff_w = w * mask
+                if torch.all(eff_w == 0):
+                    continue
+                x = values[era_idx]
+                delta = x - mean
+                new_weight_sum = weight_sum + eff_w
+                update = torch.where(
+                    new_weight_sum > 0,
+                    eff_w / torch.clamp_min(new_weight_sum, 1e-12),
+                    torch.zeros_like(new_weight_sum),
+                )
+                mean = mean + delta * update
+                delta2 = x - mean
+                m2 = m2 + eff_w * delta * delta2
+                weight_sum = new_weight_sum
+
+        variance = torch.where(
+            weight_sum > 0,
+            m2 / torch.clamp_min(weight_sum, 1e-12),
+            torch.zeros_like(weight_sum),
+        )
+        std = torch.sqrt(torch.clamp_min(variance, 0.0))
+        return mean.to(torch.float32), std.to(torch.float32), weight_sum.to(torch.float32)
+
+    def _directional_agreement(
+        self,
+        left_values: torch.Tensor,
+        right_values: torch.Tensor,
+        valid_mask: torch.Tensor,
+        era_weights: torch.Tensor,
+        parent_dir: torch.Tensor,
+        weight_sum: torch.Tensor,
+    ) -> torch.Tensor:
+        if parent_dir.item() == 0:
+            return torch.zeros(
+                left_values.shape[1], dtype=torch.float32, device=left_values.device
+            )
+        dtype = left_values.dtype
+        parent = parent_dir.to(dtype)
+        weights = era_weights.to(dtype).unsqueeze(1)
+        mask = valid_mask.to(dtype)
+        left_sign = torch.sign(left_values)
+        right_sign = torch.sign(right_values)
+        agree = 0.5 * (
+            (left_sign == parent).to(dtype) + (right_sign == parent).to(dtype)
+        )
+        weighted = (agree * weights * mask).sum(dim=0)
+        denom = torch.clamp_min(weight_sum.to(dtype), 1e-12)
+        return torch.where(weight_sum > 0, weighted / denom, torch.zeros_like(weight_sum))
 
     def _update_gradients(
         self, predictions: torch.Tensor, targets: torch.Tensor, out: torch.Tensor

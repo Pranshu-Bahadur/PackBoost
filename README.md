@@ -33,7 +33,7 @@ pip install -e .
 
 This installs PackBoost in editable mode so the package stays in sync with local
 source edits. Append `[numerai]` if you also need the Numerai notebook extras.
-CUDA wheels are optional and not required for CPU-only workflows.
+CUDA wheels are not available at milestone 1; everything runs on CPU.
 
 ### CPU-only quickstart
 
@@ -83,19 +83,11 @@ booster.fit(
 )
 ```
 
-### Switching to GPU
+### GPU support (roadmap)
 
-```python
-config = PackBoostConfig(..., device="cuda")
-booster = PackBoost(config)
-booster.fit(X_train, y_train, era_ids_train)
-```
-
-PackBoost now relies on the native frontier evaluator each depth. It raises a
-clear error if `device="cuda"` is requested but the CUDA frontier backend is
-missing or a CUDA device is unavailable. You can tune the GPU launch geometry
-via `cuda_threads_per_block` and `cuda_rows_per_thread` in `PackBoostConfig` to
-better fit your hardware.
+GPU execution will arrive with the CUDA backend in milestone 4. Until then the
+vectorised PyTorch frontier only supports `device="cpu"`; requesting CUDA will
+raise a descriptive error so the training loop stays predictable.
 
 ## scikit-learn Wrapper
 
