@@ -43,6 +43,15 @@ namespace {
 
 constexpr float NEG_INF_F = -std::numeric_limits<float>::infinity();
 
+static void check_contiguous(const py::buffer_info& info, const char* name) {
+    if (info.ndim == 0) {
+        throw std::invalid_argument(std::string(name) + " must be at least 1-D");
+    }
+    if (info.strides.back() != info.itemsize) {
+        throw std::invalid_argument(std::string(name) + " must be C-contiguous");
+    }
+}
+
 __global__ void frontier_feature_kernel(
     const uint8_t* __restrict__ bins,
     const int32_t* __restrict__ node_indices,
@@ -1748,7 +1757,7 @@ __global__ void fastpath_select_feature_kernel(
     const int node = idx / n_features_subset;
     const int32_t parent_total = parent_count[node];
 
-    float best_score = -CUDART_INF_F;
+    float best_score = NEG_INF_F;
     int best_threshold = -1;
     float best_agreement = 0.0f;
     float best_left_grad = 0.0f;
@@ -1821,7 +1830,7 @@ __global__ void fastpath_select_node_kernel(
         return;
     }
 
-    float best_score = -CUDART_INF_F;
+    float best_score = NEG_INF_F;
     int best_feature = -1;
     int best_threshold = 0;
     float best_agreement = 0.0f;
@@ -1950,7 +1959,7 @@ FastpathResult fastpath_frontier_cuda(
     throw_on_cuda(cudaDeviceSynchronize(), "fastpath_accumulate_kernel sync");
 
     thrust::device_vector<int32_t> d_best_threshold_per_feature(total_features, -1);
-    thrust::device_vector<float> d_best_score_per_feature(total_features, -CUDART_INF_F);
+    thrust::device_vector<float> d_best_score_per_feature(total_features, NEG_INF_F);
     thrust::device_vector<float> d_agreement_per_feature(total_features, 0.0f);
     thrust::device_vector<float> d_left_grad_per_feature(total_features, 0.0f);
     thrust::device_vector<float> d_left_hess_per_feature(total_features, 0.0f);
@@ -1984,7 +1993,7 @@ FastpathResult fastpath_frontier_cuda(
 
     thrust::device_vector<int32_t> d_best_feature(n_nodes, -1);
     thrust::device_vector<int32_t> d_best_threshold(n_nodes, 0);
-    thrust::device_vector<float> d_best_score(n_nodes, -CUDART_INF_F);
+    thrust::device_vector<float> d_best_score(n_nodes, NEG_INF_F);
     thrust::device_vector<float> d_best_agreement(n_nodes, 0.0f);
     thrust::device_vector<float> d_best_left_grad(n_nodes, 0.0f);
     thrust::device_vector<float> d_best_left_hess(n_nodes, 0.0f);
