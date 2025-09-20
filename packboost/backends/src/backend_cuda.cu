@@ -37,6 +37,15 @@ inline void throw_on_cuda(cudaError_t status, const char* msg) {
 
 namespace py = pybind11;
 
+static void check_contiguous(const py::buffer_info& info, const char* name) {
+    if (info.ndim == 0) {
+        throw std::invalid_argument(std::string(name) + " must be at least 1-D");
+    }
+    if (info.strides.back() != info.itemsize) {
+        throw std::invalid_argument(std::string(name) + " must be C-contiguous");
+    }
+}
+
 namespace packboost {
 
 namespace {
