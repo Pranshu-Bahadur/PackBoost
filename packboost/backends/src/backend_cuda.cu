@@ -141,6 +141,11 @@ struct FastpathDeviceCache {
     }
 };
 
+FastpathDeviceCache& get_fastpath_cache() {
+    static FastpathDeviceCache* cache = new FastpathDeviceCache();
+    return *cache;
+}
+
 __global__ void frontier_feature_kernel(
     const uint8_t* __restrict__ bins,
     const int32_t* __restrict__ node_indices,
@@ -478,7 +483,7 @@ public:
         d_era_keys_.resize(total_indices);
         d_keys_.resize(total_indices);
         if (total_indices > 0) {
-            const int threads = 256;
+            const int threads = 64;
             const int blocks = (total_indices + threads - 1) / threads;
             gather_era_kernel<<<blocks, threads>>>(
                 thrust::raw_pointer_cast(d_node_indices_.data()),
@@ -910,7 +915,7 @@ void launch_histogram_kernel(
     int32_t* out_count) {
 
     const dim3 grid(n_features);
-    const int threads = 256;
+    const int threads = 64;
     const std::size_t shared = static_cast<std::size_t>(max_bins) * n_eras * (2 * sizeof(float) + sizeof(int32_t));
     histogram_kernel<<<grid, threads, shared>>>(
         bins, gradients, hessians, era_inverse,
@@ -1365,7 +1370,7 @@ FrontierEvalResult evaluate_frontier_cuda(
     (void)era_group_eras;
     (void)era_tile_size;
     if (threads_per_block <= 0 || threads_per_block > 1024) {
-        threads_per_block = 128;
+        threads_per_block = 64;
     }
     if (rows_per_thread <= 0) {
         rows_per_thread = 1;
@@ -1999,7 +2004,7 @@ FastpathResult fastpath_frontier_cuda(
     const std::size_t total_candidates = total_features * thresholds;
     const std::size_t total_indices = static_cast<std::size_t>(node_base_offsets[n_nodes]);
 
-    static FastpathDeviceCache cache;
+    FastpathDeviceCache& cache = get_fastpath_cache();
     cache.ensure_bins(bins, n_rows * n_features_total);
     cache.copy_vector(cache.gradients, gradients, n_rows, "cudaMemcpy gradients");
     cache.copy_vector(cache.hessians, hessians, n_rows, "cudaMemcpy hessians");
@@ -2022,7 +2027,7 @@ FastpathResult fastpath_frontier_cuda(
     cache.zero_vector(cache.direction_sum, total_candidates, "cudaMemset direction_sum");
     cache.zero_vector(cache.direction_count, total_candidates, "cudaMemset direction_count");
 
-    const int threads = 128;
+    const int threads = 64;
     const int blocks = std::max<int>(
         1,
         static_cast<int>(total_features)
@@ -2053,7 +2058,6 @@ FastpathResult fastpath_frontier_cuda(
         thrust::raw_pointer_cast(cache.direction_count.data()),
         lambda_l2);
     throw_on_cuda(cudaGetLastError(), "fastpath_accumulate_kernel");
-    throw_on_cuda(cudaDeviceSynchronize(), "fastpath_accumulate_kernel sync");
 
     cache.best_threshold_per_feature.resize(total_features);
     cache.best_score_per_feature.resize(total_features);
@@ -2093,7 +2097,6 @@ FastpathResult fastpath_frontier_cuda(
         thrust::raw_pointer_cast(cache.left_hess_per_feature.data()),
         thrust::raw_pointer_cast(cache.left_count_per_feature.data()));
     throw_on_cuda(cudaGetLastError(), "fastpath_select_feature_kernel");
-    throw_on_cuda(cudaDeviceSynchronize(), "fastpath_select_feature_kernel sync");
 
     cache.best_feature.resize(n_nodes);
     cache.best_threshold.resize(n_nodes);
@@ -2129,7 +2132,6 @@ FastpathResult fastpath_frontier_cuda(
         thrust::raw_pointer_cast(cache.best_left_hess.data()),
         thrust::raw_pointer_cast(cache.best_left_count.data()));
     throw_on_cuda(cudaGetLastError(), "fastpath_select_node_kernel");
-    throw_on_cuda(cudaDeviceSynchronize(), "fastpath_select_node_kernel sync");
 
     if (n_nodes > 0) {
         throw_on_cuda(
@@ -2649,7 +2651,7 @@ py::array_t<float> cuda_predict_forest_binding(
               "cudaMemcpy values");
     }
 
-    const int threads = 256;
+    const int threads = 64;
     const int blocks = (n_rows_i + threads - 1) / threads;
     if (blocks > 0) {
         predict_forest_kernel<<<blocks, threads>>>(

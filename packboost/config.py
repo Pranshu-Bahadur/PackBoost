@@ -56,8 +56,8 @@ class PackBoostConfig:
     direction_weight: float = 0.0
     era_tile_size: int = 32
     device: str = "cpu"
-    cuda_threads_per_block: int = 128
-    cuda_rows_per_thread: int = 1
+    cuda_threads_per_block: int = 64
+    cuda_rows_per_thread: int = 4
     prebinned: bool = False
 
     def validate(self, n_features: int) -> None:
