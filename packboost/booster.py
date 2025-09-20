@@ -126,6 +126,8 @@ class PackBoost:
         self._trees: list[Tree] = []
         self._era_unique: np.ndarray | None = None
         self._feature_names: list[str] | None = None
+        self._tree_weight: float | None = None
+        self._trained_pack_size: int | None = None
 
     @property
     def trees(self) -> Sequence[Tree]:
@@ -172,6 +174,8 @@ class PackBoost:
         predictions = torch.zeros(num_rows, dtype=torch.float32, device=self._device)
 
         with torch.no_grad():
+            self._tree_weight = None
+            self._trained_pack_size = None
             era_index = build_era_index(era_encoded, num_eras)
             base_era_rows = [rows.to(device=self._device) for rows in era_index]
             self._trees = []
@@ -244,7 +248,12 @@ class PackBoost:
                     tree = tree_builder.build()
                     self._trees.append(tree)
                     pack_predictions += tree.predict_bins(bins)
-                predictions += self.config.learning_rate * pack_predictions
+                per_tree_weight = float(self.config.learning_rate) / float(
+                    self.config.pack_size
+                )
+                predictions += per_tree_weight * pack_predictions
+                self._tree_weight = per_tree_weight
+                self._trained_pack_size = int(self.config.pack_size)
 
         return self
 
@@ -258,9 +267,18 @@ class PackBoost:
             bins = torch.from_numpy(bins_np).to(device=self._device)
             if not self._trees:
                 return np.zeros(bins.shape[0], dtype=np.float32)
+            if self._tree_weight is None:
+                raise RuntimeError("Model missing _tree_weight; call fit() first.")
+            if (
+                self._trained_pack_size is not None
+                and int(self.config.pack_size) != self._trained_pack_size
+            ):
+                raise RuntimeError(
+                    "Config pack_size differs from training; please keep pack_size constant."
+                )
             predictions = torch.zeros(bins.shape[0], dtype=torch.float32, device=self._device)
             for tree in self._trees:
-                predictions += self.config.learning_rate * tree.predict_bins(bins)
+                predictions += self._tree_weight * tree.predict_bins(bins)
         return predictions.cpu().numpy()
 
     # ------------------------------------------------------------------
@@ -359,20 +377,42 @@ class PackBoost:
             left_value = -left_grad / (left_hess + lambda_l2)
             right_value = -right_grad / (right_hess + lambda_l2)
 
-            mean_gain, std_gain, weight_sum = self._weighted_welford(
-                era_gain,
-                valid,
-                era_weights,
-            )
+            mean_gain: torch.Tensor
+            std_gain: torch.Tensor
+            agreement_mean: torch.Tensor
+            if lambda_dro == 0.0 and direction_weight == 0.0:
+                weights_eff = era_weights.to(era_gain.dtype).unsqueeze(1) * valid.to(
+                    era_gain.dtype
+                )
+                weight_sum = weights_eff.sum(dim=0)
+                safe = torch.clamp_min(weight_sum, 1e-12)
+                weighted_gain = (weights_eff * era_gain).sum(dim=0)
+                mean_gain = torch.where(
+                    weight_sum > 0,
+                    weighted_gain / safe,
+                    torch.zeros_like(weight_sum),
+                ).to(torch.float32)
+                std_gain = torch.zeros_like(mean_gain)
+                agreement_mean = torch.zeros_like(mean_gain)
+                weight_sum = weight_sum.to(torch.float32)
+            else:
+                mean_gain, std_gain, weight_sum = self._weighted_welford(
+                    era_gain,
+                    valid,
+                    era_weights,
+                )
 
-            agreement_mean = self._directional_agreement(
-                left_value,
-                right_value,
-                valid,
-                era_weights,
-                parent_dir,
-                weight_sum,
-            )
+                if direction_weight != 0.0:
+                    agreement_mean = self._directional_agreement(
+                        left_value,
+                        right_value,
+                        valid,
+                        era_weights,
+                        parent_dir,
+                        weight_sum,
+                    )
+                else:
+                    agreement_mean = torch.zeros_like(mean_gain)
 
             agg_count = counts.sum(dim=0)
             agg_grad = grad_hist.sum(dim=0)
@@ -454,46 +494,22 @@ class PackBoost:
             empty = torch.empty(0, dtype=torch.float32, device=self._device)
             return empty, empty.clone(), empty.clone()
 
-        num_eras, num_thresholds = values.shape
         dtype = values.dtype
-        mean = torch.zeros(num_thresholds, dtype=dtype, device=values.device)
-        m2 = torch.zeros_like(mean)
-        weight_sum = torch.zeros_like(mean)
+        weights = era_weights.to(dtype).unsqueeze(1)
+        mask = valid_mask.to(dtype)
+        effective_weights = weights * mask
 
-        tile = max(1, int(self.config.era_tile_size))
-        weights = era_weights.to(dtype=dtype)
-        mask_float = valid_mask.to(dtype=dtype)
+        weight_sum = effective_weights.sum(dim=0)
+        safe_weight_sum = torch.clamp_min(weight_sum, 1e-12)
 
-        for start in range(0, num_eras, tile):
-            end = min(start + tile, num_eras)
-            for era_idx in range(start, end):
-                w = weights[era_idx]
-                if w <= 0:
-                    continue
-                mask = mask_float[era_idx]
-                if torch.all(mask == 0):
-                    continue
-                eff_w = w * mask
-                if torch.all(eff_w == 0):
-                    continue
-                x = values[era_idx]
-                delta = x - mean
-                new_weight_sum = weight_sum + eff_w
-                update = torch.where(
-                    new_weight_sum > 0,
-                    eff_w / torch.clamp_min(new_weight_sum, 1e-12),
-                    torch.zeros_like(new_weight_sum),
-                )
-                mean = mean + delta * update
-                delta2 = x - mean
-                m2 = m2 + eff_w * delta * delta2
-                weight_sum = new_weight_sum
+        weighted_values = effective_weights * values
+        mean = weighted_values.sum(dim=0) / safe_weight_sum
+        mean = torch.where(weight_sum > 0, mean, torch.zeros_like(mean))
 
-        variance = torch.where(
-            weight_sum > 0,
-            m2 / torch.clamp_min(weight_sum, 1e-12),
-            torch.zeros_like(weight_sum),
-        )
+        diff = values - mean.unsqueeze(0)
+        variance = (effective_weights * diff * diff).sum(dim=0) / safe_weight_sum
+        variance = torch.where(weight_sum > 0, variance, torch.zeros_like(variance))
+
         std = torch.sqrt(torch.clamp_min(variance, 0.0))
         return mean.to(torch.float32), std.to(torch.float32), weight_sum.to(torch.float32)
 
