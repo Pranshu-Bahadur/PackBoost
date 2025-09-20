@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,10 +36,18 @@ class PackBoostConfig:
         values gradually favour eras with more rows.
     era_tile_size:
         Number of eras processed together when streaming DES statistics.
+    histogram_mode:
+        Policy for deriving right child histograms. ``"rebuild"`` recomputes
+        them via reverse scans, ``"subtract"`` reuses parent totals minus left
+        aggregates, and ``"auto"`` picks the faster option per node.
+    feature_block_size:
+        Maximum number of features scored together for a node batch. ``0``
+        processes the entire feature subset at once.
+    enable_node_batching:
+        Toggle for the depth-synchronous node batching frontier. When ``False``
+        nodes are processed sequentially (useful for debugging).
     random_state:
         Optional seed controlling RNG for feature subsampling.
-    histogram_subtraction:
-        If ``True`` reuse cumulative histograms to derive right child stats.
     device:
         Torch device identifier (``"cpu"`` or ``"cuda"``) for tensor ops.
     """
@@ -54,6 +63,8 @@ class PackBoostConfig:
     layer_feature_fraction: float = 1.0
     era_alpha: float = 0.0
     era_tile_size: int = 64
+    histogram_mode: Literal["rebuild", "subtract", "auto"] = "rebuild"
+    feature_block_size: int = 64
+    enable_node_batching: bool = True
     random_state: int | None = None
-    histogram_subtraction: bool = False
     device: str = "cpu"

@@ -119,7 +119,7 @@ illustrates how to:
 
 1. Install dependencies inside Colab (including the native backend)
 2. Download the Numerai dataset via `numerapi`
-3. Train/evaluate PackBoost on CPU or GPU (Numerai features are already binned)
+3. Train/evaluate PackBoost on CPU (GPU support arrives with the CUDA backend in Milestone 4)
 4. Upload diagnostics back to Numerai
 
 Open the notebook in Google Colab and follow the step-by-step cells. For a local

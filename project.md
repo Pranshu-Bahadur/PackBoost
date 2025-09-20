@@ -206,6 +206,31 @@ setup_native.py
 
 ## 9) Milestones (acceptance criteria)
 
+### M1: Design Foundations
+
+* **Node-batched frontier.** Depth-synchronous batching processes all active
+  nodes in feature tiles, reusing a single multinode histogram gather and
+  emitting per-depth instrumentation (`nodes_processed`, `feature_blocks`,
+  timings, histogram mode, block size).
+* **Pack-average learning rate (NB1).** Pack updates apply a stable
+  `learning_rate / pack_size` step in both fit and predict, decoupling tree
+  weight from pack size and preventing drift when `pack_size` changes.
+* **Global validity guards (NB2).** Split feasibility is determined by
+  aggregate left/right counts across eras; per-era DES metrics only influence
+  scoring.
+* **Deterministic sampling (NB3).** The RNG generator is shared across
+  node-batched and sequential paths so feature subsets and resulting splits are
+  reproducible given `(seed, pack_size, layer_feature_fraction)`.
+* **Histogram modes (HS0–HS3).** Configurable `histogram_mode` (`rebuild`,
+  `subtract`, `auto`) with per-node fallbacks ensures subtraction parity and
+  guards against negative counts/hessians. Auto currently uses an L2-cache
+  budget heuristic plus child-ratio check.
+* **Regression tests.** New suites cover pack averaging, histogram subtraction
+  invariants, DES parity, and node batching vs. sequential execution to freeze
+  the Python oracle ahead of native backends.
+
+---
+
 * **M0. Baseline Python frontier (DONE)** — vectorised per-era histograms; Newton split gain; DES aggregation. *Tests:* small synthetic; improves MSE over mean baseline.
 * **M1. Correctness hardening (CURRENT)** — use **global parent direction**; add **weighted Welford** (supports `era_alpha>0`); parity vs NumPy reference. *Deliverables:* `tests/test_des.py`, `tests/test_hist.py`. (+Histogram subtraction & sibling reuse — reuse parent hist for children; ablation shows speedup.)
 * **M2. CPU backend (OpenMP+SIMD)** — `frontier_cpu.cpp` with per-tile hist + Welford; stable partitions. *Perf:* ≥2× Python frontier on 1e6×256×32.
@@ -222,5 +247,9 @@ setup_native.py
 
 ## 10) Changelog
 
+- 2025-09-22 — Locked M1 design guardrails: enabled node-batched frontier with
+  pack-average updates, configurable histogram policies (`rebuild`/`subtract`/`auto`),
+  per-depth instrumentation, and regression tests covering pack weighting,
+  histogram subtraction invariants, and batching parity.
 - 2025-09-21 — Implemented batched histogram builder and vectorized split scoring for faster Milestone 1 training.
 - 2025-09-20 — Applied Milestone 1 audit fixes: global parent direction in DES, weighted Welford with `era_alpha`, histogram subtraction guard, DES regression tests, native backend stubs, and CPU-only documentation updates.

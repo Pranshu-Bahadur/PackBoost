@@ -102,7 +102,7 @@ if __name__ == "__main__":
 
     # PackBoost configuration
     pack_config = PackBoostConfig(
-        pack_size=1,
+        pack_size=2,
         max_depth=MAX_DEPTH,
         learning_rate=LEARNING_RATE,
         lambda_l2=1e-6,
