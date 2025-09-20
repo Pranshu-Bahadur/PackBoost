@@ -41,36 +41,78 @@ For a candidate split (feature \(k\), threshold \(\tau\)) on node sample set \(S
 5. Automated hyper-parameter search tuned for Numerai objectives.
 6. Multi-GPU sharding across packs for >200 tree/s throughput goals.
 
-## 4. Implementation Steps (current status)
-1. **Repository scaffolding**: pure Python booster with CPU fallback.
-2. **CUDA backend**: histogram and frontier kernels, pybind11 bindings (`packboost/backends/src`).
-3. **Workspace abstraction**: `CudaFrontierWorkspace` persists device buffers and rebuilds node/era groupings with thrust.
-4. **Booster integration**: GPU path leverages workspace when available; gradients/hessians pinned for reuse.
-5. **Packaging**: `setup_native.py` handles optional CUDA compile, `setup.py` re-exports build helper, and `pyproject.toml` supplies build requirements.
-6. **Testing/CI**: pytest suite covers DES scoring equivalence and sklearn wrapper.
-7. **Torch frontier**: vectorised per-era histogram builds and modular gradient/hessian
-   helpers replace Python loops for the milestone 1 booster.
+## 4. Blueprint Alignment
+ExtraFastBooster remains the design compass. It grows an entire pack of trees layer-by-layer, samples a common feature slice per depth, and encodes each level of every tree into compact arrays. Before histogramming, those encodings are rearranged so that feature-major access is contiguous, letting the GPU kernels `_prep_vars`, `_repack_trees_for_features`, and `_unweighted_featureless_histogram` stride through the frontier with minimal divergence. The offline predictor follows the same depth-wise packed layout, advancing leaf slots and summing logits without synchronising with the host. PackBoost inherits the orchestration, DES-first scoring, and histogram flow while replacing the exploratory notebooks with production-grade Python plus native backends that understand DES-era tiling.
 
-## 5. Workflow Log (recent milestones)
-- **Mar 2025**: Introduced CUDA workspace, device-resident frontier evaluation, and python-side integration.
-- **Mar 2025**: Packaging overhaul; editable install builds native backend, optional CUDA.
-- **Mar 2025**: Debugged namespace linkage to expose CUDA bindings; added runtime diagnostics for backend load failures.
+## 5. Target Architecture
+**Python package layout**
 
-## 6. Current Optimisations
-- Device-side concatenation of node samples and era grouping using thrust reduces CPU bottleneck.
-- Gradients/hessians reused in-place (`np.subtract` + pinned registration) to avoid allocations each depth.
-- Shared feature subset across pack to reduce histogram builds.
-- Configurable kernel launch parameters (`threads_per_block`, `rows_per_thread`).
-- Prebin detection (integers in range) skips quantile binning.
-- Torch histogramming mirrors WarpGBM's flattened-bin trick (`era * bins + value`),
-  allowing `torch.bincount` to accumulate per-era statistics without Python loops.
+- `packboost/config.py`: frozen dataclasses covering pack size, depth, DES regularisation, tiling knobs, device choice, RNG seed, and related hyperparameters.
+- `packboost/data.py`: preprocessing toolkit that detects prebinned matrices, performs quantile binning into `uint8` buckets when needed, groups rows by era, samples features, and provides gradient/hessian materialisation.
+- `packboost/core.py`: public PackBoost estimator that coordinates boosting rounds and mirrors the interface used in the README, benchmarks, and notebooks so existing entry points continue to function.
+- `packboost/frontier.py`: dispatcher choosing between CPU and CUDA frontiers, marshalling numpy/cupy buffers, and returning split decisions.
+- `packboost/workspace.py`: persistent scratch buffers for histograms, prefix scans, and per-era temporaries—mirroring ExtraFastBooster’s GPU workspaces but with maintainable host/device abstractions.
+- `packboost/predict.py`: shared inference utilities for both CPU and GPU plus a serialisable predictor class for quick-start usage.
 
-## 7. Future Work Plan
-1. **Performance Profiling**: integrate Nsight/torch.profiler traces to target hotspots (shared memory limits, atomic contention).
-2. **Memory Optimisation**: compress indices, reuse temporary device vectors, adopt pooling allocator.
-3. **Era-aware batching**: dynamic tiling sized to warp occupancy.
-4. **Model features**: support monotonic constraints, categorical splits, early stopping, custom objective interfaces.
-5. **User experience**: CLI/Notebook utilities, richer logging, comparison notebooks vs CatBoost/LightGBM.
-6. **Benchmarking**: automated runs on Numerai dataset, track depth-7 throughput vs target (200 trees/s).
+**Native extension layout**
 
-This document should be updated alongside significant architectural or algorithmic changes; treat `README.md` as user-facing quickstart, while `project.md` remains the engineering compass.
+- `packboost/backends/cpu/frontier.cpp`: OpenMP + AVX era-tiled DES evaluator.
+- `packboost/backends/cuda/frontier.cu`: CUDA frontier kernel with cooperative group synchronisation and shared-memory histograms.
+- `packboost/backends/bindings.cpp`: pybind11 surface exposing the CPU and CUDA entry points along with helper routines for inference.
+
+Build integration remains in `setup_native.py`, controlled by environment variables as described in the README so CPU-only users can opt out cleanly.
+
+## 6. Training Round Walkthrough
+1. **Root preparation**: Detect prebinned inputs; otherwise quantile-bin once on the CPU (no bit-packing). Build an `EraShardIndex` that records row indices per era per node starting at the root. Allocate prediction, gradient, and hessian buffers as `float32`.
+2. **Depth loop**: For each level, sample a common feature subset for the entire pack, partition active nodes into `(nodes_tile × features_tile)` blocks sized to respect workspace memory limits, and iterate tile-by-tile.
+3. **Backend invocation**: Each tile call receives node-era views, the feature-major bin matrix (`uint16`), gradient/hessian arrays, and configuration (max bins, L2 lambda, DES lambda, era tile size).
+4. **Backend responsibilities**:
+   - Tile eras to manageable chunks and build `[nodes_tile, features_tile, bins, eras, 2]` histograms in shared buffers.
+   - Prefix-sum histograms to get left/right aggregates per threshold.
+   - For every era, compute Newton gains and feed them into Welford accumulators tracking mean, variance, and directional agreement.
+   - After processing all era tiles, collapse scores to obtain the DES objective (mean − λ·std ± directional penalty) and return the best `(feature, threshold, gain, stats)` per node.
+   - Produce child partitions by performing stable partitions on the CPU or scatter/gather on the GPU without synchronising to the host.
+5. **Python updates**: The orchestrator records split details, caches child era shards, computes leaf values `-G/(H+λ)`, applies the learning rate, updates predictions, and stores compressed structure-of-arrays representations for inference.
+
+## 7. CPU Backend Blueprint (`frontier.cpp`)
+- **Layout**: Consume contiguous `uint16` bins, `float32` grads/hessians, and `int32` row indices.
+- **Tiling**: Use nested OpenMP `parallel for` loops over node and feature tiles; stream eras within inner loops.
+- **Histogramming**: Prefer AVX-512 gathers when present, otherwise fall back to manual unrolled loops; keep histograms in `float32` and flush after each era tile.
+- **DES aggregation**: Implement an aligned struct storing count, mean, M2, and agreement counters to run Welford updates efficiently.
+- **Partitioning**: Execute stable partitions per era with prefix sums to compute offsets and write child row indices into reusable buffers exposed to Python via capsules or workspace handles.
+- **Threading**: Provide thread-local histograms and reduce them to avoid locks; the entire path stays synchronous.
+
+## 8. CUDA Backend Blueprint (`frontier.cu`)
+- **Scheduling**: Launch grids over node and feature tiles; within blocks, iterate era tiles while coordinating threads via cooperative groups or `cuda::std::barrier`.
+- **Histogram kernel**: Load row indices into shared memory chunks, accumulate `[bins, 2]` grad/hess stats with warp reductions, and reuse shared memory across era tiles.
+- **Prefix and scoring**: Perform warp-level exclusive scans to compute cumulative sums, evaluate Newton gains, and update Welford statistics kept in registers.
+- **Directional agreement**: Track the sign of child predictions per era inline, updating agreement counters without extra passes.
+- **Output**: Store best splits in shared memory and commit once per block. Build child partitions through segmented scatters using warp scans and write to device workspaces. Return compact descriptors to Python using async copies or stream-ordered events—never `cudaDeviceSynchronize`.
+- **Memory reuse**: Maintain `CudaFrontierWorkspace` with persistent row-index pools, histogram scratch, and Welford buffers sized from configuration and reused every depth.
+
+## 9. Python Orchestrator Responsibilities
+`PackBoost.fit` keeps a deterministic RNG for feature and row sampling, delegates frontier evaluation to the backend, vectorises prediction updates, and surfaces hooks for callbacks, logging, and optional early stopping. `PackBoost.save/load` serialises tree packs and metadata, while `PackBoost.predict` reuses the packed arrays to traverse trees depth-by-depth on CPU or via optional CUDA kernels.
+
+## 10. Throughput Targets and Optimisations
+- Aim for ≈200 trees/second on the Numerai workload (2.7M rows × 2,376 features × 5 bins on A100).
+- Use `uint16` bins with `float32` stats to balance bandwidth and precision.
+- Size era tiles (e.g., 64) to keep shared-memory usage within hardware limits (≈96 KB).
+- Allow configurable launch geometry (threads/block, rows/thread) with future auto-tuning.
+- Exploit `cp.async` where available to overlap global memory reads with computation.
+- Keep Welford accumulators in registers and flush once per `(node, feature)`.
+- Build partitions via warp scans or CUB primitives to avoid divergence.
+- Pin gradient/hessian memory for asynchronous updates and rely on stream events rather than global device syncs.
+
+## 11. Testing & Benchmarking Strategy
+- **Unit tests**: DES/Welford correctness against NumPy baselines, partition stability per era, CPU vs GPU prediction parity, configuration serialisation round-trips.
+- **Integration tests**: Exercise `examples/synthetic_benchmark.py` and a trimmed Numerai pipeline to ensure API compatibility and reproducible outputs.
+- **Performance harness**: Provide `benchmarks/numerai_throughput.py` to measure trees/s on pre-binned Numerai samples, logging that the implementation meets or exceeds the throughput goal on target hardware.
+
+## 12. Milestone Roadmap
+1. Scaffold the Python package, configuration system, and pure Python pack booster that mirrors ExtraFastBooster logic without native dependencies.
+2. Deliver the CPU frontier backend with DES-era tiling and validate it against the Python baseline through tests.
+3. Implement the CUDA frontier kernel to match the CPU algorithm, ensuring deterministic outputs and independence from device-wide synchronisation.
+4. Optimise memory layouts and kernel behaviour, then benchmark on Numerai-scale data to hit the throughput target.
+5. Finalise documentation, notebooks, and examples to reflect the new PackBoost pipeline.
+
+This compass should be refreshed whenever the architecture or algorithm evolves; treat `README.md` as the user-facing quickstart, while `project.md` remains the engineering blueprint.
