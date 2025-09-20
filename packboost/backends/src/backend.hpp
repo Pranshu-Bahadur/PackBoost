@@ -26,6 +26,16 @@ struct FrontierEvalResult {
     std::vector<int32_t> right_indices;
 };
 
+struct FastpathResult {
+    std::vector<int32_t> best_feature;
+    std::vector<int32_t> best_threshold;
+    std::vector<float> score;
+    std::vector<float> agreement;
+    std::vector<float> left_grad;
+    std::vector<float> left_hess;
+    std::vector<int32_t> left_count;
+};
+
 HistogramBuffers build_histograms_cpu(
     const uint8_t* bins,
     const float* gradients,
@@ -73,6 +83,28 @@ FrontierEvalResult evaluate_frontier_cpu(
     double direction_weight,
     int era_tile_size);
 
+FastpathResult fastpath_frontier_cpu(
+    const uint8_t* bins,
+    const float* gradients,
+    const float* hessians,
+    const int32_t* node_indices,
+    const int32_t* node_base_offsets,
+    const int32_t* node_era_offsets,
+    std::size_t n_rows,
+    std::size_t n_features_total,
+    std::size_t n_nodes,
+    int n_eras,
+    const int32_t* feature_subset,
+    std::size_t n_features_subset,
+    int max_bins,
+    const float* parent_grad,
+    const float* parent_hess,
+    const int32_t* parent_count,
+    float lambda_l2,
+    float lambda_dro,
+    int min_samples_leaf,
+    float direction_weight);
+
 #ifdef PACKBOOST_ENABLE_CUDA
 HistogramBuffers build_histograms_cuda(
     const uint8_t* bins,
@@ -107,6 +139,28 @@ FrontierEvalResult evaluate_frontier_cuda(
     int era_tile_size,
     int threads_per_block,
     int rows_per_thread);
+
+FastpathResult fastpath_frontier_cuda(
+    const uint8_t* bins,
+    const float* gradients,
+    const float* hessians,
+    const int32_t* node_indices,
+    const int32_t* node_base_offsets,
+    const int32_t* node_era_offsets,
+    std::size_t n_rows,
+    std::size_t n_features_total,
+    std::size_t n_nodes,
+    int n_eras,
+    const int32_t* feature_subset,
+    std::size_t n_features_subset,
+    int max_bins,
+    const float* parent_grad,
+    const float* parent_hess,
+    const int32_t* parent_count,
+    float lambda_l2,
+    float lambda_dro,
+    int min_samples_leaf,
+    float direction_weight);
 #endif
 
 }  // namespace packboost

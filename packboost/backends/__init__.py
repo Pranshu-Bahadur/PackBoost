@@ -5,10 +5,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any, Optional
 
-cpu_histogram: Optional[Any]
-cpu_frontier_histogram: Optional[Any]
 cpu_frontier_evaluate: Optional[Any]
-cuda_histogram: Optional[Any]
 cuda_frontier_evaluate: Optional[Any]
 cuda_predict_forest: Optional[Any]
 CudaFrontierWorkspace: Optional[Any]
@@ -16,19 +13,13 @@ CudaFrontierWorkspace: Optional[Any]
 try:  # pragma: no cover - optional extension
     backend = import_module("packboost._backend")
     backend_load_error: ImportError | None = None
-    cpu_histogram = getattr(backend, "cpu_histogram", None)
-    cpu_frontier_histogram = getattr(backend, "cpu_frontier_histogram", None)
-    cpu_frontier_evaluate = getattr(backend, "cpu_frontier_evaluate", None)
-    cuda_histogram = getattr(backend, "cuda_histogram", None)
-    cuda_frontier_evaluate = getattr(backend, "cuda_frontier_evaluate", None)
+    cpu_frontier_evaluate = getattr(backend, "cpu_fastpath_evaluate", None)
+    cuda_frontier_evaluate = getattr(backend, "cuda_fastpath_evaluate", None)
     cuda_predict_forest = getattr(backend, "cuda_predict_forest", None)
     CudaFrontierWorkspace = getattr(backend, "CudaFrontierWorkspace", None)
 except ImportError as exc:  # pragma: no cover - extension not built
     backend_load_error = exc
-    cpu_histogram = None
-    cpu_frontier_histogram = None
     cpu_frontier_evaluate = None
-    cuda_histogram = None
     cuda_frontier_evaluate = None
     cuda_predict_forest = None
     CudaFrontierWorkspace = None
@@ -36,19 +27,16 @@ except ImportError as exc:  # pragma: no cover - extension not built
 
 def cpu_available() -> bool:
     """Return ``True`` if the compiled CPU backend is available."""
-    return cpu_histogram is not None or cpu_frontier_histogram is not None or cpu_frontier_evaluate is not None
+    return cpu_frontier_evaluate is not None
 
 
 def cuda_available() -> bool:
     """Return ``True`` if the compiled CUDA backend is available."""
-    return cuda_histogram is not None or cuda_frontier_evaluate is not None
+    return cuda_frontier_evaluate is not None
 
 
 __all__ = [
-    "cpu_histogram",
-    "cpu_frontier_histogram",
     "cpu_frontier_evaluate",
-    "cuda_histogram",
     "cuda_frontier_evaluate",
     "cuda_predict_forest",
     "CudaFrontierWorkspace",

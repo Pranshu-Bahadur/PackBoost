@@ -1575,7 +1575,565 @@ FrontierEvalResult evaluate_frontier_cuda(
     return result;
 }
 
+namespace {
+
+__global__ void fastpath_accumulate_kernel(
+    const uint8_t* __restrict__ bins,
+    const float* __restrict__ gradients,
+    const float* __restrict__ hessians,
+    const int32_t* __restrict__ node_indices,
+    const int32_t* __restrict__ node_base_offsets,
+    const int32_t* __restrict__ node_era_offsets,
+    int n_rows,
+    int n_features_total,
+    const int32_t* __restrict__ feature_subset,
+    int n_features_subset,
+    int n_nodes,
+    int n_eras,
+    int max_bins,
+    double* __restrict__ gain_sum,
+    double* __restrict__ gain_sumsq,
+    int32_t* __restrict__ era_counts,
+    double* __restrict__ left_grad_total,
+    double* __restrict__ left_hess_total,
+    int64_t* __restrict__ left_count_total,
+    float* __restrict__ direction_sum,
+    int32_t* __restrict__ direction_count,
+    float lambda_l2)
+{
+    const int feature_slot = blockIdx.x % n_features_subset;
+    const int node = blockIdx.x / n_features_subset;
+    if (node >= n_nodes || feature_slot >= n_features_subset || max_bins <= 1) {
+        return;
+    }
+
+    const int thresholds = max_bins - 1;
+    const int32_t feature = feature_subset[feature_slot];
+    if (feature < 0 || feature >= n_features_total) {
+        return;
+    }
+
+    extern __shared__ unsigned char shared[];
+    float* hist_grad = reinterpret_cast<float*>(shared);
+    float* hist_hess = hist_grad + max_bins;
+    int* hist_count = reinterpret_cast<int*>(hist_hess + max_bins);
+
+    const int32_t base_offset = node_base_offsets[node];
+    const int32_t* era_offsets = node_era_offsets + node * (n_eras + 1);
+
+    double* gain_sum_ptr = gain_sum + ((static_cast<std::size_t>(node) * n_features_subset + feature_slot) * thresholds);
+    double* gain_sumsq_ptr = gain_sumsq + ((static_cast<std::size_t>(node) * n_features_subset + feature_slot) * thresholds);
+    int32_t* era_counts_ptr = era_counts + ((static_cast<std::size_t>(node) * n_features_subset + feature_slot) * thresholds);
+    double* left_grad_ptr = left_grad_total + ((static_cast<std::size_t>(node) * n_features_subset + feature_slot) * thresholds);
+    double* left_hess_ptr = left_hess_total + ((static_cast<std::size_t>(node) * n_features_subset + feature_slot) * thresholds);
+    int64_t* left_count_ptr = left_count_total + ((static_cast<std::size_t>(node) * n_features_subset + feature_slot) * thresholds);
+    float* direction_sum_ptr = direction_sum + ((static_cast<std::size_t>(node) * n_features_subset + feature_slot) * thresholds);
+    int32_t* direction_count_ptr = direction_count + ((static_cast<std::size_t>(node) * n_features_subset + feature_slot) * thresholds);
+
+    for (int era = 0; era < n_eras; ++era) {
+        for (int bin = threadIdx.x; bin < max_bins; bin += blockDim.x) {
+            hist_grad[bin] = 0.0f;
+            hist_hess[bin] = 0.0f;
+            hist_count[bin] = 0;
+        }
+        __syncthreads();
+
+        const int32_t start = base_offset + era_offsets[era];
+        const int32_t end = base_offset + era_offsets[era + 1];
+        const int32_t era_size = end - start;
+        if (era_size <= 0) {
+            __syncthreads();
+            continue;
+        }
+
+        for (int idx = threadIdx.x; idx < era_size; idx += blockDim.x) {
+            const int32_t row = node_indices[start + idx];
+            if (row < 0 || row >= n_rows) {
+                continue;
+            }
+            const uint8_t bin = bins[static_cast<std::size_t>(row) * n_features_total + feature];
+            if (bin >= max_bins) {
+                continue;
+            }
+            const float g = gradients[row];
+            const float h = hessians[row];
+            atomicAdd(&hist_grad[bin], g);
+            atomicAdd(&hist_hess[bin], h);
+            atomicAdd(&hist_count[bin], 1);
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            float total_grad = 0.0f;
+            float total_hess = 0.0f;
+            int total_count = 0;
+            for (int bin = 0; bin < max_bins; ++bin) {
+                total_grad += hist_grad[bin];
+                total_hess += hist_hess[bin];
+                total_count += hist_count[bin];
+            }
+            if (total_count == 0) {
+                continue;
+            }
+
+            const float eps = 1e-12f;
+            const float parent_gain = 0.5f * (total_grad * total_grad) / (total_hess + lambda_l2 + eps);
+            float left_grad_running = 0.0f;
+            float left_hess_running = 0.0f;
+            int left_count_running = 0;
+
+            for (int thr = 0; thr < thresholds; ++thr) {
+                left_grad_running += hist_grad[thr];
+                left_hess_running += hist_hess[thr];
+                left_count_running += hist_count[thr];
+
+                const int right_count = total_count - left_count_running;
+                const float right_grad = total_grad - left_grad_running;
+                const float right_hess = total_hess - left_hess_running;
+
+                const float left_gain = (left_count_running > 0)
+                    ? 0.5f * (left_grad_running * left_grad_running) / (left_hess_running + lambda_l2 + eps)
+                    : 0.0f;
+                const float right_gain = (right_count > 0)
+                    ? 0.5f * (right_grad * right_grad) / (right_hess + lambda_l2 + eps)
+                    : 0.0f;
+                const float gain = left_gain + right_gain - parent_gain;
+
+                const std::size_t offset = static_cast<std::size_t>(thr);
+                gain_sum_ptr[offset] += static_cast<double>(gain);
+                gain_sumsq_ptr[offset] += static_cast<double>(gain) * static_cast<double>(gain);
+                era_counts_ptr[offset] += 1;
+                left_grad_ptr[offset] += static_cast<double>(left_grad_running);
+                left_hess_ptr[offset] += static_cast<double>(left_hess_running);
+                left_count_ptr[offset] += static_cast<int64_t>(left_count_running);
+                direction_count_ptr[offset] += 1;
+                const float left_pred = -left_grad_running / (left_hess_running + lambda_l2 + eps);
+                const float right_pred = -right_grad / (right_hess + lambda_l2 + eps);
+                direction_sum_ptr[offset] += (left_pred >= right_pred) ? 1.0f : -1.0f;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void fastpath_select_feature_kernel(
+    int n_nodes,
+    int n_features_subset,
+    int thresholds,
+    const double* __restrict__ gain_sum,
+    const double* __restrict__ gain_sumsq,
+    const int32_t* __restrict__ era_counts,
+    const double* __restrict__ left_grad_total,
+    const double* __restrict__ left_hess_total,
+    const int64_t* __restrict__ left_count_total,
+    const float* __restrict__ direction_sum,
+    const int32_t* __restrict__ direction_count,
+    const int32_t* __restrict__ parent_count,
+    float lambda_dro,
+    float direction_weight,
+    int min_samples_leaf,
+    int32_t* __restrict__ best_threshold_out,
+    float* __restrict__ best_score_out,
+    float* __restrict__ agreement_out,
+    float* __restrict__ left_grad_out,
+    float* __restrict__ left_hess_out,
+    int32_t* __restrict__ left_count_out)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_features = n_nodes * n_features_subset;
+    if (idx >= total_features || thresholds <= 0) {
+        return;
+    }
+
+    const int node = idx / n_features_subset;
+    const int32_t parent_total = parent_count[node];
+
+    float best_score = -CUDART_INF_F;
+    int best_threshold = -1;
+    float best_agreement = 0.0f;
+    float best_left_grad = 0.0f;
+    float best_left_hess = 0.0f;
+    int32_t best_left_count = 0;
+
+    const std::size_t base = static_cast<std::size_t>(idx) * thresholds;
+
+    for (int thr = 0; thr < thresholds; ++thr) {
+        const std::size_t offset = base + static_cast<std::size_t>(thr);
+        const int32_t eras = era_counts[offset];
+        if (eras <= 0) {
+            continue;
+        }
+        const int32_t left_total = static_cast<int32_t>(left_count_total[offset]);
+        const int32_t right_total = parent_total - left_total;
+        if (left_total < min_samples_leaf || right_total < min_samples_leaf) {
+            continue;
+        }
+
+        const double mean = gain_sum[offset] / static_cast<double>(eras);
+        double variance = gain_sumsq[offset] / static_cast<double>(eras) - mean * mean;
+        if (variance < 0.0) {
+            variance = 0.0;
+        }
+        const float std = sqrtf(static_cast<float>(variance));
+        const float dro = static_cast<float>(mean) - lambda_dro * std;
+
+        const int32_t dir_total = direction_count[offset];
+        const float agreement = dir_total > 0 ? fabsf(direction_sum[offset] / static_cast<float>(dir_total)) : 0.0f;
+        const float score = dro + direction_weight * agreement;
+
+        if (score > best_score) {
+            best_score = score;
+            best_threshold = thr;
+            best_agreement = agreement;
+            best_left_grad = static_cast<float>(left_grad_total[offset]);
+            best_left_hess = static_cast<float>(left_hess_total[offset]);
+            best_left_count = left_total;
+        }
+    }
+
+    best_threshold_out[idx] = best_threshold;
+    best_score_out[idx] = best_score;
+    agreement_out[idx] = best_agreement;
+    left_grad_out[idx] = best_left_grad;
+    left_hess_out[idx] = best_left_hess;
+    left_count_out[idx] = best_left_count;
+}
+
+__global__ void fastpath_select_node_kernel(
+    int n_nodes,
+    int n_features_subset,
+    const int32_t* __restrict__ best_threshold_per_feature,
+    const float* __restrict__ best_score_per_feature,
+    const float* __restrict__ agreement_per_feature,
+    const float* __restrict__ left_grad_per_feature,
+    const float* __restrict__ left_hess_per_feature,
+    const int32_t* __restrict__ left_count_per_feature,
+    int32_t* __restrict__ best_feature_out,
+    int32_t* __restrict__ best_threshold_out,
+    float* __restrict__ best_score_out,
+    float* __restrict__ agreement_out,
+    float* __restrict__ left_grad_out,
+    float* __restrict__ left_hess_out,
+    int32_t* __restrict__ left_count_out)
+{
+    const int node = blockIdx.x * blockDim.x + threadIdx.x;
+    if (node >= n_nodes) {
+        return;
+    }
+
+    float best_score = -CUDART_INF_F;
+    int best_feature = -1;
+    int best_threshold = 0;
+    float best_agreement = 0.0f;
+    float best_left_grad = 0.0f;
+    float best_left_hess = 0.0f;
+    int32_t best_left_count = 0;
+
+    for (int feat = 0; feat < n_features_subset; ++feat) {
+        const int idx = node * n_features_subset + feat;
+        const int threshold = best_threshold_per_feature[idx];
+        const float score = best_score_per_feature[idx];
+        if (threshold < 0 || !isfinite(score)) {
+            continue;
+        }
+        if (score > best_score) {
+            best_score = score;
+            best_feature = feat;
+            best_threshold = threshold;
+            best_agreement = agreement_per_feature[idx];
+            best_left_grad = left_grad_per_feature[idx];
+            best_left_hess = left_hess_per_feature[idx];
+            best_left_count = left_count_per_feature[idx];
+        }
+    }
+
+    best_feature_out[node] = best_feature;
+    best_threshold_out[node] = best_threshold;
+    best_score_out[node] = best_score;
+    agreement_out[node] = best_agreement;
+    left_grad_out[node] = best_left_grad;
+    left_hess_out[node] = best_left_hess;
+    left_count_out[node] = best_left_count;
+}
+
+}  // namespace
+
+FastpathResult fastpath_frontier_cuda(
+    const uint8_t* bins,
+    const float* gradients,
+    const float* hessians,
+    const int32_t* node_indices,
+    const int32_t* node_base_offsets,
+    const int32_t* node_era_offsets,
+    std::size_t n_rows,
+    std::size_t n_features_total,
+    std::size_t n_nodes,
+    int n_eras,
+    const int32_t* feature_subset,
+    std::size_t n_features_subset,
+    int max_bins,
+    const float* parent_grad,
+    const float* parent_hess,
+    const int32_t* parent_count,
+    float lambda_l2,
+    float lambda_dro,
+    int min_samples_leaf,
+    float direction_weight)
+{
+    (void)parent_grad;
+    (void)parent_hess;
+
+    FastpathResult result;
+    result.best_feature.assign(n_nodes, -1);
+    result.best_threshold.assign(n_nodes, 0);
+    result.score.assign(n_nodes, -std::numeric_limits<float>::infinity());
+    result.agreement.assign(n_nodes, 0.0f);
+    result.left_grad.assign(n_nodes, 0.0f);
+    result.left_hess.assign(n_nodes, 0.0f);
+    result.left_count.assign(n_nodes, 0);
+
+    if (n_nodes == 0 || n_features_subset == 0 || max_bins <= 1) {
+        return result;
+    }
+
+    const int thresholds = max_bins - 1;
+    const std::size_t total_features = n_nodes * n_features_subset;
+    const std::size_t total_candidates = total_features * thresholds;
+    const std::size_t total_indices = static_cast<std::size_t>(node_base_offsets[n_nodes]);
+
+    thrust::device_vector<uint8_t> d_bins(bins, bins + n_rows * n_features_total);
+    thrust::device_vector<float> d_gradients(gradients, gradients + n_rows);
+    thrust::device_vector<float> d_hessians(hessians, hessians + n_rows);
+    thrust::device_vector<int32_t> d_node_indices(node_indices, node_indices + total_indices);
+    thrust::device_vector<int32_t> d_node_base_offsets(node_base_offsets, node_base_offsets + n_nodes + 1);
+    thrust::device_vector<int32_t> d_node_era_offsets(node_era_offsets, node_era_offsets + static_cast<std::size_t>(n_nodes) * (n_eras + 1));
+    thrust::device_vector<int32_t> d_feature_subset(feature_subset, feature_subset + n_features_subset);
+    thrust::device_vector<int32_t> d_parent_count(parent_count, parent_count + n_nodes);
+
+    thrust::device_vector<double> d_gain_sum(total_candidates, 0.0);
+    thrust::device_vector<double> d_gain_sumsq(total_candidates, 0.0);
+    thrust::device_vector<int32_t> d_era_counts(total_candidates, 0);
+    thrust::device_vector<double> d_left_grad(total_candidates, 0.0);
+    thrust::device_vector<double> d_left_hess(total_candidates, 0.0);
+    thrust::device_vector<int64_t> d_left_count(total_candidates, 0);
+    thrust::device_vector<float> d_direction_sum(total_candidates, 0.0f);
+    thrust::device_vector<int32_t> d_direction_count(total_candidates, 0);
+
+    const int threads = 128;
+    const int blocks = std::max<int>(1, static_cast<int>(total_features));
+    const std::size_t shared_bytes = static_cast<std::size_t>(max_bins) * (sizeof(float) * 2 + sizeof(int));
+
+    fastpath_accumulate_kernel<<<blocks, threads, shared_bytes>>>(
+        thrust::raw_pointer_cast(d_bins.data()),
+        thrust::raw_pointer_cast(d_gradients.data()),
+        thrust::raw_pointer_cast(d_hessians.data()),
+        thrust::raw_pointer_cast(d_node_indices.data()),
+        thrust::raw_pointer_cast(d_node_base_offsets.data()),
+        thrust::raw_pointer_cast(d_node_era_offsets.data()),
+        static_cast<int>(n_rows),
+        static_cast<int>(n_features_total),
+        thrust::raw_pointer_cast(d_feature_subset.data()),
+        static_cast<int>(n_features_subset),
+        static_cast<int>(n_nodes),
+        n_eras,
+        max_bins,
+        thrust::raw_pointer_cast(d_gain_sum.data()),
+        thrust::raw_pointer_cast(d_gain_sumsq.data()),
+        thrust::raw_pointer_cast(d_era_counts.data()),
+        thrust::raw_pointer_cast(d_left_grad.data()),
+        thrust::raw_pointer_cast(d_left_hess.data()),
+        thrust::raw_pointer_cast(d_left_count.data()),
+        thrust::raw_pointer_cast(d_direction_sum.data()),
+        thrust::raw_pointer_cast(d_direction_count.data()),
+        lambda_l2);
+    throw_on_cuda(cudaGetLastError(), "fastpath_accumulate_kernel");
+    throw_on_cuda(cudaDeviceSynchronize(), "fastpath_accumulate_kernel sync");
+
+    thrust::device_vector<int32_t> d_best_threshold_per_feature(total_features, -1);
+    thrust::device_vector<float> d_best_score_per_feature(total_features, -CUDART_INF_F);
+    thrust::device_vector<float> d_agreement_per_feature(total_features, 0.0f);
+    thrust::device_vector<float> d_left_grad_per_feature(total_features, 0.0f);
+    thrust::device_vector<float> d_left_hess_per_feature(total_features, 0.0f);
+    thrust::device_vector<int32_t> d_left_count_per_feature(total_features, 0);
+
+    const int feature_blocks = (static_cast<int>(total_features) + threads - 1) / threads;
+    fastpath_select_feature_kernel<<<feature_blocks, threads>>>(
+        static_cast<int>(n_nodes),
+        static_cast<int>(n_features_subset),
+        thresholds,
+        thrust::raw_pointer_cast(d_gain_sum.data()),
+        thrust::raw_pointer_cast(d_gain_sumsq.data()),
+        thrust::raw_pointer_cast(d_era_counts.data()),
+        thrust::raw_pointer_cast(d_left_grad.data()),
+        thrust::raw_pointer_cast(d_left_hess.data()),
+        thrust::raw_pointer_cast(d_left_count.data()),
+        thrust::raw_pointer_cast(d_direction_sum.data()),
+        thrust::raw_pointer_cast(d_direction_count.data()),
+        thrust::raw_pointer_cast(d_parent_count.data()),
+        lambda_dro,
+        direction_weight,
+        min_samples_leaf,
+        thrust::raw_pointer_cast(d_best_threshold_per_feature.data()),
+        thrust::raw_pointer_cast(d_best_score_per_feature.data()),
+        thrust::raw_pointer_cast(d_agreement_per_feature.data()),
+        thrust::raw_pointer_cast(d_left_grad_per_feature.data()),
+        thrust::raw_pointer_cast(d_left_hess_per_feature.data()),
+        thrust::raw_pointer_cast(d_left_count_per_feature.data()));
+    throw_on_cuda(cudaGetLastError(), "fastpath_select_feature_kernel");
+    throw_on_cuda(cudaDeviceSynchronize(), "fastpath_select_feature_kernel sync");
+
+    thrust::device_vector<int32_t> d_best_feature(n_nodes, -1);
+    thrust::device_vector<int32_t> d_best_threshold(n_nodes, 0);
+    thrust::device_vector<float> d_best_score(n_nodes, -CUDART_INF_F);
+    thrust::device_vector<float> d_best_agreement(n_nodes, 0.0f);
+    thrust::device_vector<float> d_best_left_grad(n_nodes, 0.0f);
+    thrust::device_vector<float> d_best_left_hess(n_nodes, 0.0f);
+    thrust::device_vector<int32_t> d_best_left_count(n_nodes, 0);
+
+    const int node_blocks = (static_cast<int>(n_nodes) + threads - 1) / threads;
+    fastpath_select_node_kernel<<<node_blocks, threads>>>(
+        static_cast<int>(n_nodes),
+        static_cast<int>(n_features_subset),
+        thrust::raw_pointer_cast(d_best_threshold_per_feature.data()),
+        thrust::raw_pointer_cast(d_best_score_per_feature.data()),
+        thrust::raw_pointer_cast(d_agreement_per_feature.data()),
+        thrust::raw_pointer_cast(d_left_grad_per_feature.data()),
+        thrust::raw_pointer_cast(d_left_hess_per_feature.data()),
+        thrust::raw_pointer_cast(d_left_count_per_feature.data()),
+        thrust::raw_pointer_cast(d_best_feature.data()),
+        thrust::raw_pointer_cast(d_best_threshold.data()),
+        thrust::raw_pointer_cast(d_best_score.data()),
+        thrust::raw_pointer_cast(d_best_agreement.data()),
+        thrust::raw_pointer_cast(d_best_left_grad.data()),
+        thrust::raw_pointer_cast(d_best_left_hess.data()),
+        thrust::raw_pointer_cast(d_best_left_count.data()));
+    throw_on_cuda(cudaGetLastError(), "fastpath_select_node_kernel");
+    throw_on_cuda(cudaDeviceSynchronize(), "fastpath_select_node_kernel sync");
+
+    thrust::host_vector<int32_t> h_best_feature = d_best_feature;
+    thrust::host_vector<int32_t> h_best_threshold = d_best_threshold;
+    thrust::host_vector<float> h_best_score = d_best_score;
+    thrust::host_vector<float> h_best_agreement = d_best_agreement;
+    thrust::host_vector<float> h_best_left_grad = d_best_left_grad;
+    thrust::host_vector<float> h_best_left_hess = d_best_left_hess;
+    thrust::host_vector<int32_t> h_best_left_count = d_best_left_count;
+
+    result.best_feature.assign(h_best_feature.begin(), h_best_feature.end());
+    result.best_threshold.assign(h_best_threshold.begin(), h_best_threshold.end());
+    result.score.assign(h_best_score.begin(), h_best_score.end());
+    result.agreement.assign(h_best_agreement.begin(), h_best_agreement.end());
+    result.left_grad.assign(h_best_left_grad.begin(), h_best_left_grad.end());
+    result.left_hess.assign(h_best_left_hess.begin(), h_best_left_hess.end());
+    result.left_count.assign(h_best_left_count.begin(), h_best_left_count.end());
+
+    return result;
+}
+
 }  // namespace packboost
+
+static py::tuple cuda_fastpath_evaluate_binding(
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast> bins,
+    py::array_t<float, py::array::c_style | py::array::forcecast> gradients,
+    py::array_t<float, py::array::c_style | py::array::forcecast> hessians,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> node_indices,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> node_base_offsets,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> node_era_offsets,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> feature_subset,
+    py::array_t<float, py::array::c_style | py::array::forcecast> parent_grad,
+    py::array_t<float, py::array::c_style | py::array::forcecast> parent_hess,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> parent_count,
+    int max_bins,
+    int n_eras,
+    double lambda_l2,
+    double lambda_dro,
+    int min_samples_leaf,
+    double direction_weight)
+{
+    py::buffer_info bins_info = bins.request();
+    if (bins_info.ndim != 2) {
+        throw std::invalid_argument("bins must be 2D");
+    }
+    check_contiguous(bins_info, "bins");
+
+    py::buffer_info grad_info = gradients.request();
+    py::buffer_info hess_info = hessians.request();
+    py::buffer_info idx_info = node_indices.request();
+    py::buffer_info base_info = node_base_offsets.request();
+    py::buffer_info era_info = node_era_offsets.request();
+    py::buffer_info feature_info = feature_subset.request();
+    py::buffer_info parent_grad_info = parent_grad.request();
+    py::buffer_info parent_hess_info = parent_hess.request();
+    py::buffer_info parent_count_info = parent_count.request();
+
+    check_contiguous(grad_info, "gradients");
+    check_contiguous(hess_info, "hessians");
+    check_contiguous(idx_info, "node_indices");
+    check_contiguous(base_info, "node_base_offsets");
+    check_contiguous(era_info, "node_era_offsets");
+    check_contiguous(feature_info, "feature_subset");
+    check_contiguous(parent_grad_info, "parent_grad");
+    check_contiguous(parent_hess_info, "parent_hess");
+    check_contiguous(parent_count_info, "parent_count");
+
+    const std::size_t n_rows = static_cast<std::size_t>(grad_info.shape[0]);
+    const std::size_t n_features_total = static_cast<std::size_t>(bins_info.shape[1]);
+    const std::size_t n_nodes = static_cast<std::size_t>(base_info.shape[0] > 0 ? base_info.shape[0] - 1 : 0);
+    const std::size_t n_features_subset = static_cast<std::size_t>(feature_info.shape[0]);
+
+    if (n_nodes * static_cast<std::size_t>(n_eras + 1) != static_cast<std::size_t>(era_info.shape[0])) {
+        throw std::invalid_argument("node_era_offsets has invalid length");
+    }
+
+    auto fastpath = packboost::fastpath_frontier_cuda(
+        static_cast<uint8_t*>(bins_info.ptr),
+        static_cast<float*>(grad_info.ptr),
+        static_cast<float*>(hess_info.ptr),
+        static_cast<int32_t*>(idx_info.ptr),
+        static_cast<int32_t*>(base_info.ptr),
+        static_cast<int32_t*>(era_info.ptr),
+        n_rows,
+        n_features_total,
+        n_nodes,
+        n_eras,
+        static_cast<int32_t*>(feature_info.ptr),
+        n_features_subset,
+        max_bins,
+        static_cast<float*>(parent_grad_info.ptr),
+        static_cast<float*>(parent_hess_info.ptr),
+        static_cast<int32_t*>(parent_count_info.ptr),
+        static_cast<float>(lambda_l2),
+        static_cast<float>(lambda_dro),
+        min_samples_leaf,
+        static_cast<float>(direction_weight));
+
+    std::vector<py::ssize_t> shape_nodes = {static_cast<py::ssize_t>(n_nodes)};
+    py::array_t<int32_t> best_feature(shape_nodes);
+    py::array_t<int32_t> best_threshold(shape_nodes);
+    py::array_t<float> score(shape_nodes);
+    py::array_t<float> agreement(shape_nodes);
+    py::array_t<float> left_grad(shape_nodes);
+    py::array_t<float> left_hess(shape_nodes);
+    py::array_t<int32_t> left_count(shape_nodes);
+
+    if (n_nodes > 0) {
+        std::memcpy(best_feature.mutable_data(), fastpath.best_feature.data(), n_nodes * sizeof(int32_t));
+        std::memcpy(best_threshold.mutable_data(), fastpath.best_threshold.data(), n_nodes * sizeof(int32_t));
+        std::memcpy(score.mutable_data(), fastpath.score.data(), n_nodes * sizeof(float));
+        std::memcpy(agreement.mutable_data(), fastpath.agreement.data(), n_nodes * sizeof(float));
+        std::memcpy(left_grad.mutable_data(), fastpath.left_grad.data(), n_nodes * sizeof(float));
+        std::memcpy(left_hess.mutable_data(), fastpath.left_hess.data(), n_nodes * sizeof(float));
+        std::memcpy(left_count.mutable_data(), fastpath.left_count.data(), n_nodes * sizeof(int32_t));
+    }
+
+    return py::make_tuple(
+        best_feature,
+        best_threshold,
+        score,
+        agreement,
+        left_grad,
+        left_hess,
+        left_count);
+}
 
 __global__ void predict_forest_kernel(
     const uint8_t* __restrict__ bins,

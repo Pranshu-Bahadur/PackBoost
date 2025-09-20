@@ -53,9 +53,6 @@ class PackBoost:
         if X_array.ndim != 2:
             raise ValueError("X must be a 2D array")
 
-        if self.config.device != "cpu":
-            raise RuntimeError("FAST PATH reference implementation currently supports device='cpu' only")
-
         n_samples, n_features = X_array.shape
         y = np.asarray(y, dtype=np.float32)
         if era_ids is None:
