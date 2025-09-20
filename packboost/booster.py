@@ -177,8 +177,8 @@ class PackBoost:
             self._trees = []
 
             for round_idx in range(num_rounds):
-                grad.copy_(predictions - y_t)
-                hess.fill_(1.0)
+                self._update_gradients(predictions, y_t, grad)
+                self._update_hessians(hess)
                 pack_trees = [TreeBuilder() for _ in range(self.config.pack_size)]
                 frontier: list[NodeShard] = []
                 for tree_id in range(self.config.pack_size):
@@ -196,7 +196,7 @@ class PackBoost:
                         pack_trees[tree_id].set_leaf(0, leaf_value)
 
                 for depth in range(self.config.max_depth):
-                    active_nodes = [node for node in frontier if self._node_has_capacity(node, grad)]
+                    active_nodes = [node for node in frontier if self._node_has_capacity(node)]
                     if not active_nodes:
                         break
                     feat_subset = self._sample_features(num_features)
@@ -274,9 +274,9 @@ class PackBoost:
         perm = torch.randperm(num_features, generator=self._rng)
         return perm[:k]
 
-    def _node_has_capacity(self, node: NodeShard, grad: torch.Tensor) -> bool:
-        rows = torch.cat([r for r in node.era_rows if r.numel() > 0], dim=0)
-        return rows.numel() >= 2 * self.config.min_samples_leaf
+    def _node_has_capacity(self, node: NodeShard) -> bool:
+        total = sum(int(rows.numel()) for rows in node.era_rows)
+        return total >= 2 * self.config.min_samples_leaf
 
     def _find_best_split(
         self,
@@ -290,124 +290,214 @@ class PackBoost:
         num_thresholds = num_bins - 1
         if num_thresholds <= 0:
             return None
+
         era_rows = node.era_rows
-        all_rows = torch.cat([rows for rows in era_rows if rows.numel() > 0], dim=0)
+        all_rows, era_ids = self._stack_node_rows(era_rows)
         if all_rows.numel() < 2 * self.config.min_samples_leaf:
             return None
-        total_grad = grad[all_rows].sum()
-        total_hess = hess[all_rows].sum()
+
+        grad_all = grad[all_rows]
+        hess_all = hess[all_rows]
+        total_grad = grad_all.sum()
+        total_hess = hess_all.sum()
         total_count = all_rows.numel()
-        best_decision: SplitDecision | None = None
+
         lambda_l2 = self.config.lambda_l2
         lambda_dro = self.config.lambda_dro
         direction_weight = self.config.direction_weight
+        num_eras = len(era_rows)
+
+        best_decision: SplitDecision | None = None
+        thresholds = torch.arange(num_bins - 1, device=self._device, dtype=torch.int64)
+
         for feature in feature_subset.tolist():
-            agg_grad_hist = torch.zeros(num_bins, dtype=torch.float32, device=self._device)
-            agg_hess_hist = torch.zeros(num_bins, dtype=torch.float32, device=self._device)
-            agg_count_hist = torch.zeros(num_bins, dtype=torch.float32, device=self._device)
-            n = torch.zeros(num_thresholds, dtype=torch.float32, device=self._device)
-            mean = torch.zeros_like(n)
-            m2 = torch.zeros_like(n)
-            agree = torch.zeros_like(n)
-            for rows in era_rows:
-                if rows.numel() == 0:
-                    continue
-                feature_values = bins[rows, feature]
-                grad_rows = grad[rows]
-                hess_rows = hess[rows]
-                counts = torch.bincount(feature_values, minlength=num_bins).to(torch.float32)
-                grad_hist = torch.bincount(feature_values, weights=grad_rows, minlength=num_bins)
-                hess_hist = torch.bincount(feature_values, weights=hess_rows, minlength=num_bins)
-                agg_count_hist += counts
-                agg_grad_hist += grad_hist
-                agg_hess_hist += hess_hist
-                if counts.sum() == 0:
-                    continue
-                prefix_counts = torch.cumsum(counts, dim=0)[:-1]
-                prefix_grad = torch.cumsum(grad_hist, dim=0)[:-1]
-                prefix_hess = torch.cumsum(hess_hist, dim=0)[:-1]
-                total_grad_e = grad_hist.sum()
-                total_hess_e = hess_hist.sum()
-                left_count = prefix_counts
-                right_count = counts.sum() - prefix_counts
-                valid = (left_count > 0) & (right_count > 0)
-                if not torch.any(valid):
-                    continue
-                left_grad = prefix_grad
-                right_grad = total_grad_e - left_grad
-                left_hess = prefix_hess
-                right_hess = total_hess_e - left_hess
-                parent_gain = 0.5 * (total_grad_e ** 2) / (total_hess_e + lambda_l2)
-                gain_left = 0.5 * (left_grad ** 2) / (left_hess + lambda_l2)
-                gain_right = 0.5 * (right_grad ** 2) / (right_hess + lambda_l2)
-                era_gain = gain_left + gain_right - parent_gain
-                parent_value = -total_grad_e / (total_hess_e + lambda_l2)
-                left_value = -left_grad / (left_hess + lambda_l2)
-                right_value = -right_grad / (right_hess + lambda_l2)
-                parent_dir = torch.sign(parent_value)
-                agree_left = (torch.sign(left_value) == parent_dir).to(torch.float32)
-                agree_right = (torch.sign(right_value) == parent_dir).to(torch.float32)
-                era_agreement = 0.5 * (agree_left + agree_right)
-                valid_f = valid.to(torch.float32)
-                delta = era_gain - mean
-                new_n = n + valid_f
-                inv_new_n = torch.where(new_n > 0, 1.0 / new_n, torch.zeros_like(new_n))
-                updated_mean = mean + delta * inv_new_n
-                updated_m2 = m2 + (era_gain - updated_mean) * delta
-                mean = torch.where(valid, updated_mean, mean)
-                m2 = torch.where(valid, updated_m2, m2)
-                n = new_n
-                agree = agree + era_agreement * valid_f
-            if agg_count_hist.sum() < 2 * self.config.min_samples_leaf:
+            feature_values = bins[all_rows, feature].to(dtype=torch.int64)
+            counts, grad_hist, hess_hist = self._compute_histograms(
+                feature_values, grad_all, hess_all, era_ids, num_eras, num_bins
+            )
+
+            if counts.sum() < 2 * self.config.min_samples_leaf:
                 continue
-            prefix_counts = torch.cumsum(agg_count_hist, dim=0)[:-1]
-            prefix_grad = torch.cumsum(agg_grad_hist, dim=0)[:-1]
-            prefix_hess = torch.cumsum(agg_hess_hist, dim=0)[:-1]
+
+            # Per-era prefix stats for Welford aggregates
+            prefix_counts = counts[:, :-1].cumsum(dim=1)
+            prefix_grad = grad_hist[:, :-1].cumsum(dim=1)
+            prefix_hess = hess_hist[:, :-1].cumsum(dim=1)
+
+            total_count_e = counts.sum(dim=1, keepdim=True)
+            total_grad_e = grad_hist.sum(dim=1, keepdim=True)
+            total_hess_e = hess_hist.sum(dim=1, keepdim=True)
+
             left_count = prefix_counts
-            right_count = total_count - prefix_counts
-            valid_global = (left_count >= self.config.min_samples_leaf) & (
-                right_count >= self.config.min_samples_leaf
+            right_count = total_count_e - left_count
+            valid = (left_count > 0) & (right_count > 0)
+            if not torch.any(valid):
+                continue
+
+            left_grad = prefix_grad
+            right_grad = total_grad_e - left_grad
+            left_hess = prefix_hess
+            right_hess = total_hess_e - left_hess
+
+            parent_gain = 0.5 * (total_grad_e**2) / (total_hess_e + lambda_l2)
+            gain_left = 0.5 * (left_grad**2) / (left_hess + lambda_l2)
+            gain_right = 0.5 * (right_grad**2) / (right_hess + lambda_l2)
+            era_gain = gain_left + gain_right - parent_gain
+
+            parent_value = -total_grad_e / (total_hess_e + lambda_l2)
+            left_value = -left_grad / (left_hess + lambda_l2)
+            right_value = -right_grad / (right_hess + lambda_l2)
+            parent_dir = torch.sign(parent_value)
+            agree_left = (torch.sign(left_value) == parent_dir).to(torch.float32)
+            agree_right = (torch.sign(right_value) == parent_dir).to(torch.float32)
+            era_agreement = 0.5 * (agree_left + agree_right)
+
+            valid_float = valid.to(torch.float32)
+            n = valid_float.sum(dim=0)
+            mean_gain = torch.where(
+                n > 0,
+                (era_gain * valid_float).sum(dim=0) / torch.clamp_min(n, 1.0),
+                torch.zeros(
+                    num_thresholds, device=self._device, dtype=torch.float32
+                ),
+            )
+
+            diff = era_gain - mean_gain.unsqueeze(0)
+            sum_sq = (diff.pow(2) * valid_float).sum(dim=0)
+            variance = torch.where(
+                n > 1,
+                sum_sq / torch.clamp_min(n - 1.0, 1.0),
+                torch.zeros_like(sum_sq),
+            )
+            std = torch.sqrt(torch.clamp_min(variance, 0.0))
+
+            agreement_mean = torch.where(
+                n > 0,
+                (era_agreement * valid_float).sum(dim=0) / torch.clamp_min(n, 1.0),
+                torch.zeros_like(mean_gain),
+            )
+
+            agg_count = counts.sum(dim=0)
+            agg_grad = grad_hist.sum(dim=0)
+            agg_hess = hess_hist.sum(dim=0)
+
+            prefix_count_total = agg_count.cumsum(dim=0)[:-1]
+            prefix_grad_total = agg_grad.cumsum(dim=0)[:-1]
+            prefix_hess_total = agg_hess.cumsum(dim=0)[:-1]
+
+            left_count_total = prefix_count_total
+            right_count_total = total_count - left_count_total
+            valid_global = (left_count_total >= self.config.min_samples_leaf) & (
+                right_count_total >= self.config.min_samples_leaf
             )
             if not torch.any(valid_global):
                 continue
-            variance = torch.where(n > 1.0, m2 / (n - 1.0), torch.zeros_like(m2))
-            std = torch.sqrt(torch.clamp(variance, min=0.0))
-            mean_score = mean
-            agreement_mean = torch.where(n > 0, agree / torch.clamp_min(n, 1.0), torch.zeros_like(agree))
-            score = mean_score - lambda_dro * std + direction_weight * agreement_mean
-            score = torch.where(valid_global, score, torch.full_like(score, float("-inf")))
+
+            score = mean_gain - lambda_dro * std + direction_weight * agreement_mean
+            score = torch.where(
+                valid_global,
+                score,
+                torch.full_like(score, float("-inf")),
+            )
+
             best_score, best_idx = torch.max(score, dim=0)
             if not torch.isfinite(best_score):
                 continue
-            left_grad = prefix_grad[best_idx]
-            left_hess = prefix_hess[best_idx]
-            right_grad = total_grad - left_grad
-            right_hess = total_hess - left_hess
-            chosen_threshold = int(best_idx.item())
-            left_rows: list[torch.Tensor] = []
-            right_rows: list[torch.Tensor] = []
-            for rows in era_rows:
-                if rows.numel() == 0:
-                    left_rows.append(torch.empty(0, dtype=torch.int64, device=self._device))
-                    right_rows.append(torch.empty(0, dtype=torch.int64, device=self._device))
-                    continue
-                feature_values = bins[rows, feature]
-                mask = feature_values <= chosen_threshold
-                left_rows.append(rows[mask])
-                right_rows.append(rows[~mask])
+
+            chosen_idx = int(best_idx.item())
+            chosen_threshold = int(thresholds[chosen_idx].item())
+
+            left_grad_total = prefix_grad_total[chosen_idx]
+            left_hess_total = prefix_hess_total[chosen_idx]
+            right_grad_total = total_grad - left_grad_total
+            right_hess_total = total_hess - left_hess_total
+
+            left_rows, right_rows = self._partition_rows(
+                bins, era_rows, feature, chosen_threshold
+            )
+
             decision = SplitDecision(
                 feature=int(feature),
                 threshold=chosen_threshold,
                 score=float(best_score.item()),
-                left_grad=float(left_grad.item()),
-                left_hess=float(left_hess.item()),
-                right_grad=float(right_grad.item()),
-                right_hess=float(right_hess.item()),
-                left_count=int(prefix_counts[best_idx].item()),
-                right_count=int(right_count[best_idx].item()),
+                left_grad=float(left_grad_total.item()),
+                left_hess=float(left_hess_total.item()),
+                right_grad=float(right_grad_total.item()),
+                right_hess=float(right_hess_total.item()),
+                left_count=int(left_count_total[chosen_idx].item()),
+                right_count=int(right_count_total[chosen_idx].item()),
                 left_rows=left_rows,
                 right_rows=right_rows,
             )
+
             if best_decision is None or decision.score > best_decision.score:
                 best_decision = decision
+
         return best_decision
+
+    def _update_gradients(
+        self, predictions: torch.Tensor, targets: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        out.copy_(predictions - targets)
+
+    def _update_hessians(self, out: torch.Tensor) -> None:
+        out.fill_(1.0)
+
+    def _stack_node_rows(
+        self, era_rows: Sequence[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        row_chunks: list[torch.Tensor] = []
+        era_chunks: list[torch.Tensor] = []
+        for era_idx, rows in enumerate(era_rows):
+            if rows.numel() == 0:
+                continue
+            row_chunks.append(rows)
+            era_chunks.append(
+                torch.full((rows.numel(),), era_idx, dtype=torch.int64, device=rows.device)
+            )
+        if not row_chunks:
+            empty = torch.empty(0, dtype=torch.int64, device=self._device)
+            return empty, empty.clone()
+        return torch.cat(row_chunks, dim=0), torch.cat(era_chunks, dim=0)
+
+    def _compute_histograms(
+        self,
+        feature_values: torch.Tensor,
+        grad_rows: torch.Tensor,
+        hess_rows: torch.Tensor,
+        era_ids: torch.Tensor,
+        num_eras: int,
+        num_bins: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        flat_index = era_ids * num_bins + feature_values
+        hist_size = num_eras * num_bins
+        counts = torch.bincount(flat_index, minlength=hist_size).reshape(num_eras, num_bins)
+        grad_hist = torch.bincount(
+            flat_index, weights=grad_rows, minlength=hist_size
+        ).reshape(num_eras, num_bins)
+        hess_hist = torch.bincount(
+            flat_index, weights=hess_rows, minlength=hist_size
+        ).reshape(num_eras, num_bins)
+        return counts.to(torch.float32), grad_hist, hess_hist
+
+    def _partition_rows(
+        self,
+        bins: torch.Tensor,
+        era_rows: Sequence[torch.Tensor],
+        feature: int,
+        threshold: int,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        feature_column = bins[:, feature]
+        left_rows: list[torch.Tensor] = []
+        right_rows: list[torch.Tensor] = []
+        for rows in era_rows:
+            if rows.numel() == 0:
+                empty = rows.new_empty(0)
+                left_rows.append(empty)
+                right_rows.append(rows.new_empty(0))
+                continue
+            feature_values = feature_column.index_select(0, rows)
+            mask = feature_values <= threshold
+            left_rows.append(rows[mask])
+            right_rows.append(rows[~mask])
+        return left_rows, right_rows

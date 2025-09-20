@@ -48,6 +48,8 @@ For a candidate split (feature \(k\), threshold \(\tau\)) on node sample set \(S
 4. **Booster integration**: GPU path leverages workspace when available; gradients/hessians pinned for reuse.
 5. **Packaging**: `setup_native.py` handles optional CUDA compile, `setup.py` re-exports build helper, and `pyproject.toml` supplies build requirements.
 6. **Testing/CI**: pytest suite covers DES scoring equivalence and sklearn wrapper.
+7. **Torch frontier**: vectorised per-era histogram builds and modular gradient/hessian
+   helpers replace Python loops for the milestone 1 booster.
 
 ## 5. Workflow Log (recent milestones)
 - **Mar 2025**: Introduced CUDA workspace, device-resident frontier evaluation, and python-side integration.
@@ -60,6 +62,8 @@ For a candidate split (feature \(k\), threshold \(\tau\)) on node sample set \(S
 - Shared feature subset across pack to reduce histogram builds.
 - Configurable kernel launch parameters (`threads_per_block`, `rows_per_thread`).
 - Prebin detection (integers in range) skips quantile binning.
+- Torch histogramming mirrors WarpGBM's flattened-bin trick (`era * bins + value`),
+  allowing `torch.bincount` to accumulate per-era statistics without Python loops.
 
 ## 7. Future Work Plan
 1. **Performance Profiling**: integrate Nsight/torch.profiler traces to target hotspots (shared memory limits, atomic contention).

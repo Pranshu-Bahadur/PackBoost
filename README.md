@@ -12,15 +12,8 @@ across regime shifts.
   feature subsets.
 - **Directional Era Splitting (DES)** – score candidates with
   `mean − λ·std` across eras plus a directional agreement penalty.
-- **CPU & CUDA frontier backends** – native C++/CUDA extensions batch whole
-  depth frontiers, score DES splits, and return child partitions without Python
-  loops.
-- **Era-tiling on CPU** – the CPU backend now streams eras in tiles, reusing
-  histograms and Welford-style statistics to keep memory bounded even for
-  hundreds of eras.
-- **GPU frontier kernels** – CUDA matches the streaming frontier interface,
-  accumulating DES statistics on-device so large era counts no longer fall back
-  to the CPU.
+- **Vectorised torch histograms** – milestone 1 ships a pure PyTorch frontier
+  that bins per-era statistics in parallel without Python loops.
 - **Deterministic by design** – quantile binning, seeded sampling, and pure
   functions keep runs reproducible.
 - **Friendly tooling** – scikit-learn compatible wrapper, standalone
@@ -33,29 +26,28 @@ python -m venv .venv
 source .venv/bin/activate
 git clone https://github.com/Pranshu-Bahadur/PackBoost.git
 cd PackBoost
-pip install -e .[cuda]  # add [cuda] if you plan to build on GPU
-# Optionally include [numerai] to install Numerai notebook dependencies
+python -m pip install --upgrade pip
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -e .
 ```
 
-### Native backends
+This installs PackBoost in editable mode so the package stays in sync with local
+source edits. Append `[numerai]` if you also need the Numerai notebook extras.
+CUDA wheels are optional and not required for CPU-only workflows.
 
-PackBoost ships optional C++/CUDA extensions that provide high-performance
-histogram builders. Build them with `pybind11` and a modern compiler:
+### CPU-only quickstart
 
 ```bash
-pip install pybind11 numpy
-python setup_native.py build_ext --inplace
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -e .
+pytest -q
 ```
 
-CUDA users need `nvcc` in `PATH`. The build script detects it automatically and
-compiles the optimized kernels (including the frontier evaluator) when available.
-Set `PACKBOOST_DISABLE_CUDA=1` before the build to force a CPU-only wheel even on
-GPU machines. You can also override the GPU architectures that `nvcc` targets by
-setting `PACKBOOST_CUDA_ARCHS="80,86"` (default is `70,75,80,86`). Without CUDA the
-script still builds the fast multi-threaded CPU backend, which now streams era tiles
-and accumulates split statistics in O(1) memory. The CUDA frontier kernel mirrors the
-same tiling logic so high-era workloads stay on device. If neither backend is built
-PackBoost falls back to the pure NumPy implementation.
+All milestone 1 functionality runs on CPU thanks to the vectorised PyTorch
+frontier. No native extensions are required to train or evaluate models.
 
 ## Quick Start
 
