@@ -222,4 +222,5 @@ setup_native.py
 
 ## 10) Changelog
 
+- 2025-09-21 — Implemented batched histogram builder and vectorized split scoring for faster Milestone 1 training.
 - 2025-09-20 — Applied Milestone 1 audit fixes: global parent direction in DES, weighted Welford with `era_alpha`, histogram subtraction guard, DES regression tests, native backend stubs, and CPU-only documentation updates.
