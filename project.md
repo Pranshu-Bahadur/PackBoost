@@ -207,16 +207,15 @@ setup_native.py
 ## 9) Milestones (acceptance criteria)
 
 * **M0. Baseline Python frontier (DONE)** — vectorised per-era histograms; Newton split gain; DES aggregation. *Tests:* small synthetic; improves MSE over mean baseline.
-* **M1. Correctness hardening (CURRENT)** — use **global parent direction**; add **weighted Welford** (supports `era_alpha>0`); parity vs NumPy reference. *Deliverables:* `tests/test_des.py`, `tests/test_hist.py`.
+* **M1. Correctness hardening (CURRENT)** — use **global parent direction**; add **weighted Welford** (supports `era_alpha>0`); parity vs NumPy reference. *Deliverables:* `tests/test_des.py`, `tests/test_hist.py`. (+Histogram subtraction & sibling reuse — reuse parent hist for children; ablation shows speedup.)
 * **M2. CPU backend (OpenMP+SIMD)** — `frontier_cpu.cpp` with per-tile hist + Welford; stable partitions. *Perf:* ≥2× Python frontier on 1e6×256×32.
 * **M3. pybind11 wiring** — expose CPU path; CI wheels; Python fallback if backend missing.
 * **M4. CUDA v1 (naive)** — warp per (node,feature); global-mem hist; atomics allowed. *Gate:* correctness parity with CPU for ≤64 bins.
 * **M5. CUDA v2 (shared-mem hist)** — shared-mem hist + warp reductions (no atomics). *Perf:* ≥4× v1 on A100 (2.7M×2,376×5).
 * **M6. CUDA v3 (fused scan+score)** — warp shuffles for scans; inline Welford; segmented scatters. *Perf:* \~200 trees/s at Numerai scale.
-* **M7. Histogram subtraction & sibling reuse** — reuse parent hist for children (CPU+CUDA); ablation shows speedup.
-* **M8. Precision & memory** — `uint8/uint16` bins; `float16` storage with `float32` accumulation; missing-bin column.
-* **M9. Auto-tuner** — search `(nodes_tile,features_tile,era_tile,threads/block,rows/thread)`; cache best by dataset signature.
-* **M10. Predictor kernels & serialization** — packed SoA traversal (CPU & CUDA); save/load inference bundles.
-* **M11. Numerai integration & benchmarks** — end-to-end scripts; throughput and validation metrics logged.
+* **M7. Precision & memory** — `uint8` bins; `float16` storage with `float32` accumulation; missing-bin column.
+* **M8. Auto-tuner** — search `(nodes_tile,features_tile,era_tile,threads/block,rows/thread)`; cache best by dataset signature.
+* **M9. Predictor kernels & serialization** — packed SoA traversal (CPU & CUDA); save/load inference bundles.
+* **M10. Numerai integration & benchmarks** — end-to-end scripts; throughput and validation metrics logged.
 
 ---
