@@ -206,28 +206,29 @@ setup_native.py
 
 ## 9) Milestones (acceptance criteria)
 
-### M1: Design Foundations
+### M1 Foundations — Final (Subtract-First Frontier)
 
-* **Node-batched frontier.** Depth-synchronous batching processes all active
-  nodes in feature tiles, reusing a single multinode histogram gather and
-  emitting per-depth instrumentation (`nodes_processed`, `feature_blocks`,
-  timings, histogram mode, block size).
-* **Pack-average learning rate (NB1).** Pack updates apply a stable
-  `learning_rate / pack_size` step in both fit and predict, decoupling tree
-  weight from pack size and preventing drift when `pack_size` changes.
-* **Global validity guards (NB2).** Split feasibility is determined by
-  aggregate left/right counts across eras; per-era DES metrics only influence
-  scoring.
-* **Deterministic sampling (NB3).** The RNG generator is shared across
-  node-batched and sequential paths so feature subsets and resulting splits are
-  reproducible given `(seed, pack_size, layer_feature_fraction)`.
-* **Histogram modes (HS0–HS3).** Configurable `histogram_mode` (`rebuild`,
-  `subtract`, `auto`) with per-node fallbacks ensures subtraction parity and
-  guards against negative counts/hessians. Auto currently uses an L2-cache
-  budget heuristic plus child-ratio check.
-* **Regression tests.** New suites cover pack averaging, histogram subtraction
-  invariants, DES parity, and node batching vs. sequential execution to freeze
-  the Python oracle ahead of native backends.
+**Numerical policy.** Counts/offsets: **int64**. Node/feature ids & thresholds: **int32**. Bins: `uint8/uint16`. Stats: `float32`.
+
+**Histogram strategy.**
+- Modes: `rebuild | subtract | auto`.  
+  `auto` = **subtract-first + validator**; failing nodes rebuild right via reverse-cumsum.
+- One concatenation pass per depth (rows/era/node/grad/hess); reused for all feature tiles.
+
+**Scans & scoring.**
+- Era-wise exclusive prefixes for left; **right by subtraction**.
+- Aggregated prefixes from a single source via `sum(dim=era)`.
+- Global validity guard on aggregate counts; DES only affects scoring.
+- Stable tiebreak: `(gain ↓, sample_count ↓, feature_id ↑, threshold ↑)`.
+
+**Prediction.**
+- Trees compile once per device to flat SoA tensors; routing is fully vectorized.
+- Optional `predict_packwise(block_size_trees)` batches trees for inference throughput while preserving parity.
+
+**Acceptance checks.**
+- Split parity and ≤1e−7 prediction diff vs baseline (4 datasets × 5 seeds).
+- `(nodes_subtract_ok + nodes_rebuild == nodes_processed)` at every depth.
+- `(hist_ms + scan_ms)` improvement ≥20% on medium synthetic benchmark.
 
 ---
 
@@ -243,10 +244,30 @@ setup_native.py
 * **M9. Predictor kernels & serialization** — packed SoA traversal (CPU & CUDA); save/load inference bundles.
 * **M10. Numerai integration & benchmarks** — end-to-end scripts; throughput and validation metrics logged.
 
+#### QA: Subtract-First Frontier & Packed Prediction
+
+- **Parity:** freeze pre-refactor oracle; assert identical `(feature, threshold)` per split and leaf values ±1e−9.
+- **Predictor parity:** `predict()` vs `predict_packwise()` → `max_abs_diff ≤ 1e−7`.
+- **Validator accounting:** depth logs satisfy `nodes_subtract_ok + nodes_rebuild == nodes_processed`.
+- **Perf microbench:** 200k×64 features, depth 6 → report `hist_ms, scan_ms, score_ms, partition_ms`; expect ≥20% drop in `hist_ms + scan_ms`.
+
 ---
 
 ## 10) Changelog
 
+- 2025-09-21 — M1.1: Subtract-First Frontier + Packed Prediction
+  - Refactored `_find_best_splits_batched`:
+    - One-time concat of (rows, era_ids, node_ids, grad, hess) per depth.
+    - Histogram counts remain **int64** end-to-end.
+    - **Subtract-first** policy in `auto`: right = total − left; reverse-cumsum rebuild only if validator fails.
+    - Single era-wise prefix source; aggregated prefixes via `sum(dim=era)`.
+  - Prediction:
+    - Replaced Python DFS with **vectorized per-row routing** (flat SoA cache per device).
+    - Added `predict_packwise(block_size_trees=16)` for faster inference with exact parity.
+  - Determinism & QA:
+    - Stable tiebreak `(gain ↓, sample_count ↓, feature_id ↑, threshold ↑)`.
+    - Depth logs assert `nodes_subtract_ok + nodes_rebuild == nodes_processed`.
+  - Perf (200k×64 @ depth 6): hist_ms=11688.90, scan_ms=171.83, score_ms=632.51, partition_ms=362.26 (hist+scan=11860.72 ms).
 - 2025-09-22 — Locked M1 design guardrails: enabled node-batched frontier with
   pack-average updates, configurable histogram policies (`rebuild`/`subtract`/`auto`),
   per-depth instrumentation, and regression tests covering pack weighting,

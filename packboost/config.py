@@ -62,8 +62,8 @@ class PackBoostConfig:
     max_bins: int = 63
     layer_feature_fraction: float = 1.0
     era_alpha: float = 0.0
-    era_tile_size: int = 64
-    histogram_mode: Literal["rebuild", "subtract", "auto"] = "rebuild"
+    era_tile_size: int = 32
+    histogram_mode: Literal["rebuild", "subtract", "auto"] = "subtract"
     feature_block_size: int = 64
     enable_node_batching: bool = True
     random_state: int | None = None

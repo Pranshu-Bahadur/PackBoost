@@ -102,7 +102,7 @@ if __name__ == "__main__":
 
     # PackBoost configuration
     pack_config = PackBoostConfig(
-        pack_size=2,
+        pack_size=4,
         max_depth=MAX_DEPTH,
         learning_rate=LEARNING_RATE,
         lambda_l2=1e-6,
@@ -112,7 +112,7 @@ if __name__ == "__main__":
         random_state=SEED,
         layer_feature_fraction=1.0,
         direction_weight=0.0,
-        era_tile_size=32,
+        #era_tile_size=32,
     )
     pack_rounds = N_TREES // pack_config.pack_size
     if pack_rounds * pack_config.pack_size != N_TREES:
