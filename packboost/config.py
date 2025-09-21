@@ -64,7 +64,7 @@ class PackBoostConfig:
     era_alpha: float = 0.0
     era_tile_size: int = 32
     histogram_mode: Literal["rebuild", "subtract", "auto"] = "subtract"
-    feature_block_size: int = 64
+    feature_block_size: int = 32
     enable_node_batching: bool = True
     random_state: int | None = None
     device: str = "cpu"
