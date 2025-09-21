@@ -206,50 +206,161 @@ setup_native.py
 
 ## 9) Milestones (acceptance criteria)
 
-### M1 Foundations — Final (Subtract-First Frontier)
+### M1 Foundations — Final (On-the-fly K-cuts + Subtract-First Frontier) (DONE)
 
-**Numerical policy.** Counts/offsets: **int64**. Node/feature ids & thresholds: **int32**. Bins: `uint8/uint16`. Stats: `float32`.
+**Numerical policy.** Counts/offsets: **int64**. Node/feature ids & thresholds: **int32**. Bins: `uint8/uint16`. Stats: **float32**.
 
 **Histogram strategy.**
-- Modes: `rebuild | subtract | auto`.  
-  `auto` = **subtract-first + validator**; failing nodes rebuild right via reverse-cumsum.
-- One concatenation pass per depth (rows/era/node/grad/hess); reused for all feature tiles.
 
-**Scans & scoring.**
-- Era-wise exclusive prefixes for left; **right by subtraction**.
-- Aggregated prefixes from a single source via `sum(dim=era)`.
-- Global validity guard on aggregate counts; DES only affects scoring.
-- Stable tiebreak: `(gain ↓, sample_count ↓, feature_id ↑, threshold ↑)`.
+* Modes: `rebuild | subtract | auto`.
+  `auto` = **subtract-first + validator**; failing nodes rebuild right via reverse-cumsum.
+* **One depth-concat** of `(rows, era_ids, node_ids, grad, hess)` → reused for all feature tiles at that depth.
+* Per feature-block histograms over `(node, era, bin)` via shared `bincount`.
+
+**On-the-fly K-cuts (thermometer lanes).**
+
+* Evaluate only **K** candidate thresholds per feature at each depth (instead of all `bins−1`):
+
+  * `cut_selection = "even"`: evenly spaced bin edges.
+  * `cut_selection = "mass"`: per-feature mass quantiles from the block histogram.
+* Gather left prefixes at the chosen cuts; **right = total − left** (or rebuild in `rebuild` mode).
+* Complexity scales with **K**, not `bins−1`. Works for any `max_bins ≤ 256`.
+
+**Adaptive-K policy (depth-synchronous).**
+
+* `k_cuts = 0` ⇒ full sweep (parity mode).
+* Otherwise choose **K per depth** from median node size (large/medium/small tiers) with optional depth decay (`k_depth_decay`), bounded by `k_cuts`.
+* Preserves pack/EFB behavior: **shared feature subset and shared K** across the pack at a given depth.
+
+**Scans & scoring (DES).**
+
+* Era-wise exclusive prefixes for left; **right by subtraction**.
+* Aggregate prefixes across eras via `sum(dim=era)`.
+* **Pure DES (Welford):** score = `mean_gain − λ_dro · std_gain` (equal-era by default; optional `era_alpha>0` to bias by era mass).
+  Directional term is optional (`direction_weight`, default 0).
+* Global validity guard on aggregated child counts; per-era guards for gain; **stable tie-break:** `(gain ↓, sample_count ↓, feature_id ↑, threshold ↑)`.
+
+**Pack growth & update.**
+
+* **Depth-synchronous packs** (EFB-style): one sampled feature subset per depth, shared across the B trees.
+* After splits, update leaves with Newton values; predictions updated with **pack-average** (`learning_rate / pack_size`).
 
 **Prediction.**
-- Trees compile once per device to flat SoA tensors; routing is fully vectorized.
-- Optional `predict_packwise(block_size_trees)` batches trees for inference throughput while preserving parity.
+
+* Trees compile once per device to flat SoA tensors; routing is fully vectorized.
+* Optional `predict_packwise(block_size_trees)` batches trees for higher throughput with parity.
+
+**Instrumentation.**
+
+* Per-depth JSON log includes: `hist_ms`, `scan_ms`, `score_ms`, `partition_ms`, `feature_block_size`,
+  `nodes_processed`, `nodes_rebuild`, `nodes_subtract_ok`, `nodes_subtract_fallback`, and **`k_cuts_effective`**.
 
 **Acceptance checks.**
-- Split parity and ≤1e−7 prediction diff vs baseline (4 datasets × 5 seeds).
-- `(nodes_subtract_ok + nodes_rebuild == nodes_processed)` at every depth.
-- `(hist_ms + scan_ms)` improvement ≥20% on medium synthetic benchmark.
+
+* **Parity mode:** with `k_cuts=0` and `histogram_mode="subtract"` (or `"auto"` without validator hits),
+  splits and predictions match the baseline within ≤1e−7 on 4 datasets × 5 seeds.
+* **Histogram accounting:** at every depth, `nodes_subtract_ok + nodes_rebuild == nodes_processed`.
+* **Complexity sanity:** with `max_bins` fixed, observed `score_ms` reduces roughly ∝ `K / (bins−1)` when using K-cuts.
+* **Perf floor:** `(hist_ms + scan_ms)` improvement ≥20% vs the pre-M1 Python frontier on the medium synthetic benchmark.
 
 ---
 
-* **M0. Baseline Python frontier (DONE)** — vectorised per-era histograms; Newton split gain; DES aggregation. *Tests:* small synthetic; improves MSE over mean baseline.
-* **M1. Correctness hardening (CURRENT)** — use **global parent direction**; add **weighted Welford** (supports `era_alpha>0`); parity vs NumPy reference. *Deliverables:* `tests/test_des.py`, `tests/test_hist.py`. (+Histogram subtraction & sibling reuse — reuse parent hist for children; ablation shows speedup.)
-* **M2. CPU backend (OpenMP+SIMD)** — `frontier_cpu.cpp` with per-tile hist + Welford; stable partitions. *Perf:* ≥2× Python frontier on 1e6×256×32.
-* **M3. pybind11 wiring** — expose CPU path; CI wheels; Python fallback if backend missing.
-* **M4. CUDA v1 (naive)** — warp per (node,feature); global-mem hist; atomics allowed. *Gate:* correctness parity with CPU for ≤64 bins.
-* **M5. CUDA v2 (shared-mem hist)** — shared-mem hist + warp reductions (no atomics). *Perf:* ≥4× v1 on A100 (2.7M×2,376×5).
-* **M6. CUDA v3 (fused scan+score)** — warp shuffles for scans; inline Welford; segmented scatters. *Perf:* \~200 trees/s at Numerai scale.
-* **M7. Precision & memory** — `uint8` bins; `float16` storage with `float32` accumulation; missing-bin column.
-* **M8. Auto-tuner** — search `(nodes_tile,features_tile,era_tile,threads/block,rows/thread)`; cache best by dataset signature.
-* **M9. Predictor kernels & serialization** — packed SoA traversal (CPU & CUDA); save/load inference bundles.
-* **M10. Numerai integration & benchmarks** — end-to-end scripts; throughput and validation metrics logged.
+### M2. Native CPU backend (OpenMP + SIMD) (CURRENT)
 
-#### QA: Subtract-First Frontier & Packed Prediction
+**Goal:** Replace Torch `bincount` hot path with a C++/SIMD frontier while keeping the same Python API.
 
-- **Parity:** freeze pre-refactor oracle; assert identical `(feature, threshold)` per split and leaf values ±1e−9.
-- **Predictor parity:** `predict()` vs `predict_packwise()` → `max_abs_diff ≤ 1e−7`.
-- **Validator accounting:** depth logs satisfy `nodes_subtract_ok + nodes_rebuild == nodes_processed`.
-- **Perf microbench:** 200k×64 features, depth 6 → report `hist_ms, scan_ms, score_ms, partition_ms`; expect ≥20% drop in `hist_ms + scan_ms`.
+* **Kernel shape:** node-batched × feature-tiled histograms over `(era, bin)` with `int64` counts and `float32` stats; prefix scans per feature; **right by subtraction**; DES (mean − λ·std) in place.
+* **SIMD:** AVX2/AVX-512 gather/scatter for histogram fills; warp-like lane reductions per thread; thread-local histograms → reduce.
+* **Adaptive K:** choose K per **depth** (median node size + optional depth decay), then **gather** left prefixes at K cuts (even or mass).
+* **Partitions:** stable per-era segmented scatter using precomputed offsets (int64).
+* **Artifacts:** `backends/cpu/frontier_cpu.cpp`, `bindings.cpp`.
+* **Perf gate:** ≥ **2×** Torch frontier on `1e6 × 256 × 32` (rows × feats × eras) with `max_bins=64, K=15`.
+* **Correctness gate:** split parity (feature, threshold) and prediction diff ≤ **1e−7** vs Torch path on 4 public datasets × 5 seeds.
+
+---
+
+### M3. pybind11 wiring & packaging
+
+**Goal:** Make the CPU backend the default with seamless fallback.
+
+* **Tasks:** expose `frontier_cpu` through `packboost._backend`; wheel build CI for Linux/macOS (Py3.10+); manylinux images with AVX2; runtime CPU feature check.
+* **Acceptance:** `pip install .` produces wheels; import switches to native backend automatically; unit tests green on both native and Torch fallbacks.
+
+---
+
+### M4. CUDA fused frontier (single milestone)
+
+**Goal:** One high-performance CUDA path that subsumes “naive → shared-mem → fused”.
+
+* **Grid/block mapping:** **one warp = one (node, feature)**; blocks tile features; grid tiles nodes.
+* **Histograms:** shared-mem histogram `[bins, 2]` for `(∑g, ∑h)` per era using warp reductions; global atomics avoided in the steady state.
+* **Scans:** warp shuffles for exclusive prefix over bins; **right = total − left**; optional reverse-cumsum validator in debug builds.
+* **K-cuts on-the-fly:**
+
+  * `even`: select K evenly spaced edges (warp-gather).
+  * `mass`: compute per-feature CDF from shared hist, select K quantile edges (branch-free search in registers).
+* **DES (Welford) in registers:** accumulate mean/std across eras; optional directional term; stable tie-break `(gain ↓, samples ↓, feature ↑, threshold ↑)`.
+* **Partition:** segmented scatters into persistent row pools (global offsets precomputed per (node, era, side)).
+* **Numerics:** counts `int64`, stats `float32`; bins `uint8/uint16`.
+* **Perf gate (A100 or similar):**
+
+  * `2.7M × 2,376 × 5`, `depth=6`, `max_bins=64`, `K=15` ⇒ **≥4×** native CPU path;
+  * Numerai-scale throughput target: **\~200 trees/s** at `pack_size=8` (tunable).
+* **Correctness gate:** parity vs CPU backend within ≤ **1e−7** predictions and identical split choices under parity settings (`K=full`, validator on).
+
+---
+
+### M5. Precision & memory polish
+
+**Goal:** Reduce bandwidth and footprint without hurting accuracy.
+
+* **Storage:** `uint8` bins whenever `max_bins ≤ 256`; optional **FP16** leaf/score storage with FP32 accumulation.
+* **Missing value** support via a dedicated “NaN bin” column or mask lane; predictable routing rule.
+* **Optional precomputed lanes (thermometer ≤16):** fast path for small-K workloads (bit-packed masks on GPU), falling back to on-the-fly K-cuts when `max_bins` or K grow.
+* **Acceptance:** memory drop ≥ **25%** on reference; prediction parity preserved; speed non-regressing vs M4 within ±5%.
+
+---
+
+### M6. Auto-tuner
+
+**Goal:** Pick good launch parameters automatically.
+
+* **Search space:** `(nodes_tile, features_tile, eras_tile, warps_per_block, rows_per_thread, K_policy)`; device + dataset signature cache.
+* **Budget:** ≤ 2–3 seconds warm-up per new signature; reuse thereafter.
+* **Acceptance:** **≥15%** end-to-end fit time reduction on 3 varied workloads vs fixed heuristics.
+
+---
+
+### M7. Predictor kernels & serialization
+
+**Goal:** Fast inference and portable bundles.
+
+* **CPU & CUDA predictors:** packed SoA traversal; **tree-block batching**; optional bit-packed thermometer traversal when ≤16 lanes.
+* **Serialization:** versioned bundle (trees, feature names, bin edges, config & K-policy) + lightweight loader (`.npz` / `.pt`).
+* **Acceptance:** predictor parity vs trainer; inference speedup ≥ **3×** vs Torch router on large batches.
+
+---
+
+### M8. Numerai/Hull integration & benchmarks
+
+**Goal:** Reproducible E2E runs with stability metrics.
+
+* **Pipelines:** training scripts for Numerai and Hull Tactical; DES diagnostics (era mean/std gain, agreement), pack logs (per-depth K, hist/scan/score/partition ms).
+* **Metrics:** correlation, sharpe proxy, drawdown control; ablations for `max_bins∈{16,32,64}`, `K∈{7,15,31}`, DES on/off, pack size.
+* **Acceptance:** artifact repo with CSVs/plots; improvement stories documented.
+
+---
+
+## QA: frontier & prediction (updated)
+
+* **Parity modes:**
+
+  * *Histogram:* `histogram_mode="rebuild"` (validator reference) and `"subtract"` (fast path).
+  * *Thresholds:* `k_cuts=0` → full sweep parity; compare to CPU baseline.
+* **Predictor parity:** `predict()` vs `predict_packwise()` → `max_abs_diff ≤ 1e−7`.
+* **Accounting invariants:** at each depth, `nodes_subtract_ok + nodes_rebuild == nodes_processed`.
+* **Complexity sanity:** with fixed `max_bins`, observed `score_ms ∝ K/(bins−1)` when enabling K-cuts.
+* **Perf microbench:** `200k × 64 feats, depth 6` → log `hist_ms, scan_ms, score_ms, partition_ms`; expect ≥ **20%** drop in `hist_ms + scan_ms` vs pre-M1 Python frontier; ≥ **2×** vs Torch on M2; ≥ **4×** vs M2 on M4 GPU.
 
 ---
 

@@ -102,13 +102,14 @@ if __name__ == "__main__":
 
     # PackBoost configuration
     pack_config = PackBoostConfig(
-        pack_size=4,
+        pack_size=8,
         max_depth=MAX_DEPTH,
         learning_rate=LEARNING_RATE,
         lambda_l2=1e-6,
         lambda_dro=0.0,
         min_samples_leaf=20,
         max_bins=127,
+        k_cuts=0,#127-1,
         random_state=SEED,
         layer_feature_fraction=1.0,
         direction_weight=0.0,
@@ -159,7 +160,7 @@ if __name__ == "__main__":
         random_state=SEED,
         n_jobs=-1,
         verbosity=-1,
-        max_bins=127
+        max_bins=16
     )
     results.append(
         benchmark(

@@ -28,6 +28,14 @@ class PackBoostConfig:
         Minimum number of samples required in each child after a split.
     max_bins:
         Maximum number of histogram bins per feature (<= 256 for uint8 storage).
+    k_cuts:
+        Number of candidate thresholds per feature evaluated per split
+        (on-the-fly thermometer lanes). ``0`` means **use all** (full sweep),
+        otherwise evaluates exactly ``k_cuts`` thresholds.
+    cut_selection:
+        Strategy to choose those K thresholds:
+        - ``"even"``: evenly spaced bin edges,
+        - ``"mass"``: per-feature quantiles based on node mass (counts).
     layer_feature_fraction:
         Fraction of features sampled uniformly without replacement per depth.
     era_alpha:
@@ -60,6 +68,12 @@ class PackBoostConfig:
     direction_weight: float = 0.0
     min_samples_leaf: int = 20
     max_bins: int = 63
+
+    # --- new: on-the-fly K-cut controls ---
+    k_cuts: int = 0  # 0 = full sweep (bins-1); else evaluate exactly k_cuts thresholds
+    cut_selection: Literal["even", "mass"] = "even"
+    # --------------------------------------
+
     layer_feature_fraction: float = 1.0
     era_alpha: float = 0.0
     era_tile_size: int = 32
