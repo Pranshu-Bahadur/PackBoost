@@ -505,10 +505,10 @@ class PackBoost:
         counts = torch.bincount(key_flat, minlength=hist_size).reshape(B, num_nodes, num_eras, num_bins)
 
         gw = grad_rows.view(R, 1).expand(R, B).reshape(-1)
-        hw = hess_rows.view(R, 1).expand(R, B).reshape(-1)
+        #hw = hess_rows.view(R, 1).expand(R, B).reshape(-1)
         grad_hist = torch.bincount(key_flat, weights=gw, minlength=hist_size).reshape(B, num_nodes, num_eras, num_bins)
-        hess_hist = torch.bincount(key_flat, weights=hw, minlength=hist_size).reshape(B, num_nodes, num_eras, num_bins)
-
+        #hess_hist = torch.bincount(key_flat, weights=hw, minlength=hist_size).reshape(B, num_nodes, num_eras, num_bins)
+        hess_hist = counts.to(grad_hist.dtype)
         return counts, grad_hist, hess_hist
 
     # --- K-cut selection helpers (on-the-fly thermometer lanes) ---
@@ -551,342 +551,371 @@ class PackBoost:
     # --- Core: find best splits for batched nodes ---
 
     def _find_best_splits_batched(
-        self,
-        nodes: Sequence[NodeShard],
-        grad: torch.Tensor,
-        hess: torch.Tensor,
-        bins: torch.Tensor,
-        feature_subset: torch.Tensor,
-    ) -> tuple[list[SplitDecision | None], DepthInstrumentation]:
-        stats = DepthInstrumentation()
-        M = len(nodes)
-        decisions: list[SplitDecision | None] = [None] * M
-        if M == 0:
-            return decisions, stats
+            self,
+            nodes: Sequence[NodeShard],
+            grad: torch.Tensor,
+            hess: torch.Tensor,
+            bins: torch.Tensor,
+            feature_subset: torch.Tensor,
+        ) -> tuple[list[SplitDecision | None], DepthInstrumentation]:
+            stats = DepthInstrumentation()
+            M = len(nodes)
+            decisions: list[SplitDecision | None] = [None] * M
+            if M == 0:
+                return decisions, stats
 
-        num_bins = int(self.config.max_bins)
-        full_T = num_bins - 1
-        if full_T <= 0:
-            stats.nodes_skipped += M
-            return decisions, stats
+            num_bins = int(self.config.max_bins)
+            full_T = num_bins - 1
+            if full_T <= 0:
+                stats.nodes_skipped += M
+                return decisions, stats
 
-        feat_ids = feature_subset.to(self._device, dtype=torch.int32)
-        if feat_ids.numel() == 0:
-            stats.nodes_skipped += M
-            return decisions, stats
-        feat_ids_i64 = feat_ids.to(torch.int64)
+            feat_ids = feature_subset.to(self._device, dtype=torch.int32)
+            if feat_ids.numel() == 0:
+                stats.nodes_skipped += M
+                return decisions, stats
+            feat_ids_i64 = feat_ids.to(torch.int64)
 
-        lam_l2 = float(self.config.lambda_l2)
-        lam_dro = float(self.config.lambda_dro)
-        dir_w = float(self.config.direction_weight)
+            lam_l2 = float(self.config.lambda_l2)
+            lam_dro = float(self.config.lambda_dro)
+            dir_w = float(self.config.direction_weight)
 
-        # Build contexts & concat rows across nodes for one-pass histograms
-        contexts: list[_NodeContext] = []
-        index_map: list[int] = []
-        row_chunks: list[torch.Tensor] = []
-        era_chunks: list[torch.Tensor] = []
-        grad_chunks: list[torch.Tensor] = []
-        hess_chunks: list[torch.Tensor] = []
-        node_chunks: list[torch.Tensor] = []
-        row_start = 0
+            # Build contexts & concat rows across nodes for one-pass histograms
+            contexts: list[_NodeContext] = []
+            index_map: list[int] = []
+            row_chunks: list[torch.Tensor] = []
+            era_chunks: list[torch.Tensor] = []
+            grad_chunks: list[torch.Tensor] = []
+            hess_chunks: list[torch.Tensor] = []
+            node_chunks: list[torch.Tensor] = []
+            row_start = 0
 
-        # Build era weights per node
-        for idx, node in enumerate(nodes):
-            all_rows, era_ids = self._stack_node_rows(node.era_rows)
-            total_count = int(all_rows.numel())
-            if total_count < 2 * self.config.min_samples_leaf:
-                stats.nodes_skipped += 1
-                continue
+            for idx, node in enumerate(nodes):
+                all_rows, era_ids = self._stack_node_rows(node.era_rows)
+                total_count = int(all_rows.numel())
+                if total_count < 2 * self.config.min_samples_leaf:
+                    stats.nodes_skipped += 1
+                    continue
 
-            g_rows = grad.index_select(0, all_rows)
-            h_rows = hess.index_select(0, all_rows)
-            g_tot = float(g_rows.sum().item())
-            h_tot = float(h_rows.sum().item())
+                g_rows = grad.index_select(0, all_rows)
+                h_rows = hess.index_select(0, all_rows)
+                g_tot = float(g_rows.sum().item())
+                h_tot = float(h_rows.sum().item())
 
-            parent_value_total = -g_tot / (h_tot + lam_l2)
-            parent_dir = torch.sign(torch.tensor(parent_value_total, dtype=torch.float32, device=self._device))
+                parent_value_total = -g_tot / (h_tot + lam_l2)
+                parent_dir = torch.sign(torch.tensor(parent_value_total, dtype=torch.float32, device=self._device))
 
-            era_counts = torch.tensor(
-                [float(r.numel()) for r in node.era_rows],
-                dtype=torch.float32, device=self._device
-            )
-            era_w = self._compute_era_weights(era_counts)
-
-            cid = len(contexts)
-            contexts.append(
-                _NodeContext(
-                    shard=node, era_weights=era_w, parent_dir=parent_dir,
-                    total_grad=g_tot, total_hess=h_tot, total_count=total_count,
-                    row_start=row_start, row_count=total_count
+                era_counts = torch.tensor(
+                    [float(r.numel()) for r in node.era_rows],
+                    dtype=torch.float32, device=self._device
                 )
-            )
-            index_map.append(idx)
+                era_w = self._compute_era_weights(era_counts)
 
-            row_chunks.append(all_rows)
-            era_chunks.append(era_ids)
-            grad_chunks.append(g_rows)
-            hess_chunks.append(h_rows)
-            node_chunks.append(torch.full((total_count,), cid, dtype=torch.int64, device=self._device))
-            row_start += total_count
-            stats.rows_total += total_count
+                cid = len(contexts)
+                contexts.append(
+                    _NodeContext(
+                        shard=node, era_weights=era_w, parent_dir=parent_dir,
+                        total_grad=g_tot, total_hess=h_tot, total_count=total_count,
+                        row_start=row_start, row_count=total_count
+                    )
+                )
+                index_map.append(idx)
 
-        if not contexts:
+                row_chunks.append(all_rows)
+                era_chunks.append(era_ids)
+                grad_chunks.append(g_rows)
+                hess_chunks.append(h_rows)
+                node_chunks.append(torch.full((total_count,), cid, dtype=torch.int64, device=self._device))
+                row_start += total_count
+                stats.rows_total += total_count
+
+            if not contexts:
+                return decisions, stats
+
+            stats.nodes_processed += len(contexts)
+            Nnodes = len(contexts)
+            Eras = len(contexts[0].shard.era_rows)
+            block_size = self._resolve_feature_block_size(int(feat_ids.numel()))
+            stats.block_size = max(stats.block_size, block_size)
+
+            rows_cat = torch.cat(row_chunks, 0)
+            era_cat = torch.cat(era_chunks, 0)
+            grad_cat = torch.cat(grad_chunks, 0)
+            hess_cat = torch.cat(hess_chunks, 0)  # kept for API parity; not used in hist if H≡count
+            node_cat = torch.cat(node_chunks, 0)
+            bins_cat = bins.index_select(0, rows_cat)
+
+            era_weights_tensor = torch.stack([c.era_weights for c in contexts], 0).contiguous()  # [Nnodes, E]
+            total_grad_nodes = torch.tensor([c.total_grad for c in contexts], dtype=torch.float32, device=self._device)  # [Nnodes]
+            total_hess_nodes = torch.tensor([c.total_hess for c in contexts], dtype=torch.float32, device=self._device)
+            total_count_nodes = torch.tensor([c.total_count for c in contexts], dtype=torch.int64, device=self._device)
+            parent_dirs = torch.stack([c.parent_dir.to(torch.float32) for c in contexts], 0)  # [Nnodes]
+
+            # Best trackers
+            best_scores   = torch.full((Nnodes,), float("-inf"), device=self._device)
+            best_features = torch.full((Nnodes,), -1, dtype=torch.int32, device=self._device)
+            best_thresholds = torch.full((Nnodes,), -1, dtype=torch.int32, device=self._device)
+            best_left_grad = torch.zeros(Nnodes, dtype=torch.float32, device=self._device)
+            best_left_hess = torch.zeros(Nnodes, dtype=torch.float32, device=self._device)
+            best_left_count = torch.full((Nnodes,), -1, dtype=torch.int64, device=self._device)
+
+            subtract_success = torch.ones(Nnodes, dtype=torch.bool, device=self._device)
+            fallback_any = torch.zeros(Nnodes, dtype=torch.bool, device=self._device)
+            if self._histogram_mode == "rebuild":
+                subtract_success.zero_()
+
+            # Feature blocks
+            for start in range(0, feat_ids.numel(), block_size):
+                block = feat_ids[start : start + block_size]          # int32
+                block_i64 = feat_ids_i64[start : start + block_size]  # int64
+                if block.numel() == 0:
+                    continue
+
+                # Histograms for this block: counts + gradient only (H ≡ count)
+                t0 = perf_counter()
+                counts, g_hist, _h_ignored = self._batched_histograms_nodes(
+                    bins_cat.index_select(1, block_i64),
+                    grad_cat, hess_cat,  # hess_cat may be ignored inside
+                    era_cat, node_cat,
+                    Nnodes, Eras, num_bins,
+                )
+                stats.hist_ms += (perf_counter() - t0) * 1000.0
+                stats.feature_blocks += 1
+                stats.bincount_calls += 2  # counts + grad
+                if counts.numel() == 0:
+                    continue
+
+                # Prefix scans along bins (≤ t)
+                scan_start = perf_counter()
+                left_c_full = counts[:, :, :, :-1].cumsum(3)   # [B,N,E,T]
+                left_g_full = g_hist[:, :, :, :-1].cumsum(3)   # [B,N,E,T]
+                # totals per era
+                tot_c_e = counts.sum(3, keepdim=True)          # [B,N,E,1]
+                tot_g_e = g_hist.sum(3, keepdim=True)          # [B,N,E,1]
+                stats.scan_ms += (perf_counter() - scan_start) * 1000.0
+
+                # K-cut selection
+                K_user = int(self.config.k_cuts)
+                use_K = (K_user > 0 and K_user < full_T)
+                if use_K and self.config.cut_selection == "mass":
+                    cut_idx_bk_long = self._mass_cut_indices(counts, K_user)  # [B,K] int64
+                    thr_k_long = cut_idx_bk_long  # per-feature
+                else:
+                    if use_K:
+                        thr_k_long = self._even_cut_indices(num_bins, K_user).to(torch.int64)  # [K]
+                    else:
+                        thr_k_long = torch.arange(full_T, device=self._device, dtype=torch.int64)  # full sweep
+                    cut_idx_bk_long = None  # shared thresholds
+                K = int(thr_k_long.shape[-1])
+
+                # Parent gain (broadcast later)
+                parent_gain = (0.5 * (total_grad_nodes**2) / (total_hess_nodes + lam_l2)).view(1, Nnodes, 1)
+
+                # --------- DES scoring with WEIGHTED WELFORD (streaming over eras) ---------
+                Bblk, Nn, Ee, _T = left_c_full.shape
+                wsum = torch.zeros((Bblk, Nn, K), dtype=torch.float32, device=self._device)
+                mean = torch.zeros_like(wsum)
+                M2   = torch.zeros_like(wsum)
+                left_total = torch.zeros((Bblk, Nn, K), dtype=counts.dtype, device=self._device)
+
+                use_dir = (dir_w != 0.0) and (parent_dirs != 0).any()
+                if use_dir:
+                    agr_num   = torch.zeros_like(wsum)
+                    agr_denom = torch.zeros_like(wsum)
+                    pa = parent_dirs.to(torch.float32).view(1, Nnodes, 1).expand(Bblk, Nnodes, K)
+
+                # Helper to gather K thresholds from the T-axis for one era slice
+                def gather_K(tensor_BNT: torch.Tensor) -> torch.Tensor:
+                    # tensor_BNT: [B,N,T]
+                    if cut_idx_bk_long is not None:  # per-feature thresholds
+                        idx = cut_idx_bk_long.unsqueeze(1).expand(Bblk, Nn, K)  # [B,N,K]
+                    else:  # shared thresholds
+                        idx = thr_k_long.view(1, 1, K).expand(Bblk, Nn, K)      # [B,N,K]
+                    return tensor_BNT.gather(2, idx)  # [B,N,K]
+
+                # Stream eras
+                score_start = perf_counter()
+                for e in range(Eras):
+                    # weights per node for this era → broadcast to [B,N,K]
+                    w_e = era_weights_tensor[:, e]  # [N]
+                    if not torch.any(w_e > 0):
+                        continue
+                    w_e_full = w_e.view(1, Nn, 1).expand(Bblk, Nn, K).to(torch.float32)
+
+                    # left stats at K thresholds for era e
+                    lc_e = gather_K(left_c_full[:, :, e, :])              # [B,N,K] (int)
+                    lg_e = gather_K(left_g_full[:, :, e, :].to(torch.float32))  # [B,N,K] (float)
+                    # totals per era (broadcast to K)
+                    tc_e = tot_c_e[:, :, e, 0].unsqueeze(-1).expand(Bblk, Nn, K)  # int
+                    tg_e = tot_g_e[:, :, e, 0].unsqueeze(-1).expand(Bblk, Nn, K)  # float
+
+                    rc_e = tc_e - lc_e
+                    rg_e = tg_e - lg_e
+
+                    valid_e = (lc_e > 0) & (rc_e > 0)
+                    w_e_full = torch.where(valid_e, w_e_full, torch.zeros((), dtype=w_e_full.dtype, device=w_e_full.device))
+
+                    # gains per era at K cuts (subtract parent)
+                    denom_L = (lc_e.to(torch.float32) + lam_l2)
+                    denom_R = (rc_e.to(torch.float32) + lam_l2)
+                    gain_e = 0.5 * ( (lg_e * lg_e) / denom_L + (rg_e * rg_e) / denom_R ) - parent_gain
+
+                    # Welford update
+                    wsum_new = wsum + w_e_full
+                    # factor = w_e / wsum_new (0 where wsum_new==0)
+                    factor = torch.zeros_like(wsum_new)
+                    nz = wsum_new > 0
+                    factor[nz] = w_e_full[nz] / wsum_new[nz]
+
+                    delta = gain_e - mean
+                    mean  = mean + factor * delta
+                    M2    = M2 + w_e_full * delta * (gain_e - mean)
+                    wsum  = wsum_new
+
+                    # directional agreement (optional)
+                    if use_dir:
+                        lg_dir = -lg_e / denom_L  # leaf directions
+                        rg_dir = -rg_e / denom_R
+                        agree_e = 0.5 * ((torch.sign(lg_dir) == pa).float() + (torch.sign(rg_dir) == pa).float())
+                        agr_num   = agr_num + w_e_full * agree_e
+                        agr_denom = agr_denom + w_e_full
+
+                    # global left counts aggregation for min_samples_leaf
+                    left_total = left_total + lc_e
+
+                # Final DES score across eras
+                ws  = torch.clamp_min(wsum, 1e-12)
+                std = torch.sqrt(torch.clamp_min(M2 / ws, 0.0))
+                score = mean - lam_dro * std  # [B,N,K]
+                if use_dir:
+                    nz = agr_denom > 0
+                    agr = torch.zeros_like(agr_num)
+                    agr[nz] = agr_num[nz] / agr_denom[nz]
+                    score = score + dir_w * agr
+                stats.score_ms += (perf_counter() - score_start) * 1000.0
+                # ---------------------------------------------------------------------
+
+                # Global min_samples_leaf (aggregate across eras)
+                right_total = (total_count_nodes.view(1, Nnodes, 1) - left_total)  # [B,N,K]
+                min_child = int(self.config.min_samples_leaf)
+                valid_global = (left_total >= min_child) & (right_total >= min_child)
+
+                # Prepare flattened selection per node: M = B * K candidates
+                score_perm = score.permute(1, 0, 2)  # [N,B,K]
+                score_perm = torch.where(
+                    valid_global.permute(1, 0, 2),
+                    score_perm,
+                    torch.full_like(score_perm, float("-inf"))
+                )
+                score_flat = score_perm.reshape(Nnodes, -1)                    # [N, M]
+                left_total_flat = left_total.permute(1, 0, 2).reshape(Nnodes, -1)
+
+                best_block = score_flat.max(dim=1).values                      # [N]
+                m1 = (score_flat == best_block.unsqueeze(1))
+                NEG = torch.iinfo(torch.int64).min
+                best_cnt = torch.where(m1, left_total_flat, torch.full_like(left_total_flat, NEG)).max(dim=1).values
+                m2 = m1 & (left_total_flat == best_cnt.unsqueeze(1))
+                Mflat = score_flat.shape[1]
+                flat_idx = torch.arange(Mflat, device=self._device, dtype=torch.int64).view(1, -1)
+                sel_idx = torch.where(m2, flat_idx, torch.full_like(flat_idx, -1)).max(dim=1).values  # [N], -1 invalid
+                valid_mask = (sel_idx >= 0)
+                if not torch.any(valid_mask):
+                    continue
+
+                # Gather candidate stats for nodes with valid selection
+                gather_idx = sel_idx.clamp_min(0).view(-1, 1)
+                cand_score = score_flat.gather(1, gather_idx).squeeze(1)
+                cand_left_total = left_total_flat.gather(1, gather_idx).squeeze(1)
+
+                # Unravel (feature_in_block, k_in_block) within this block
+                num_thresh = int(K)  # number of K-cuts considered in this block
+                f_in_blk = (sel_idx // num_thresh).to(torch.int64)   # [N]
+                t_in_blk = (sel_idx %  num_thresh).to(torch.int64)   # [N]
+
+                # Map to actual feature id
+                cand_feature = block_i64.gather(0, f_in_blk.clamp_(0, block_i64.numel()-1)).to(torch.int32)
+
+                # Map to threshold (bin edge index) for output
+                if cut_idx_bk_long is not None:
+                    # per-feature threshold table [B,K]
+                    cand_threshold = cut_idx_bk_long.gather(0, f_in_blk.clamp_(0, cut_idx_bk_long.shape[0]-1)).gather(
+                        1, t_in_blk.clamp_(0, num_thresh - 1).view(-1, 1)
+                    ).squeeze(1).to(torch.int32)
+                else:
+                    cand_threshold = thr_k_long.gather(0, t_in_blk.clamp_(0, num_thresh - 1)).to(torch.int32)
+
+                # Left totals for leaf values (H ≡ count), and left grad totals across eras
+                # Compute left_g_tot_all = sum over eras of left_g_full (B,N,T) then gather to K
+                left_g_tot_all = left_g_full.sum(dim=2)  # [B,N,T]
+                if cut_idx_bk_long is not None:
+                    idx_BNK = cut_idx_bk_long.unsqueeze(1).expand(Bblk, Nn, K)
+                else:
+                    idx_BNK = thr_k_long.view(1, 1, K).expand(Bblk, Nn, K)
+                left_g_tot_BNK = left_g_tot_all.gather(2, idx_BNK)  # [B,N,K]
+                left_g_tot_flat = left_g_tot_BNK.permute(1, 0, 2).reshape(Nnodes, -1)
+                left_g_tot = left_g_tot_flat.gather(1, gather_idx).squeeze(1)
+
+                left_h_tot_flat = left_total.permute(1, 0, 2).reshape(Nnodes, -1)
+                left_h_tot = left_h_tot_flat.gather(1, gather_idx).squeeze(1).to(torch.float32)
+
+                # Cross-block update with tiebreak (score ↓, left_count ↓, feature ↑, threshold ↑)
+                better_score = cand_score > best_scores
+                score_equal = cand_score == best_scores
+                better_cnt = cand_left_total > best_left_count
+                cnt_equal = cand_left_total == best_left_count
+                better_feat = cand_feature > best_features
+                feat_equal = cand_feature == best_features
+                better_thr = cand_threshold > best_thresholds
+
+                upd = valid_mask & (
+                    better_score
+                    | (score_equal & (better_cnt | (cnt_equal & (better_feat | (feat_equal & better_thr)))))
+                )
+
+                best_scores = torch.where(upd, cand_score, best_scores)
+                best_left_count = torch.where(upd, cand_left_total.to(torch.int64), best_left_count)
+                best_left_grad = torch.where(upd, left_g_tot, best_left_grad)
+                best_left_hess = torch.where(upd, left_h_tot, best_left_hess)
+                best_features = torch.where(upd, cand_feature, best_features)
+                best_thresholds = torch.where(upd, cand_threshold, best_thresholds)
+
+            # Accounting
+            if self._histogram_mode == "rebuild":
+                rebuild_cnt = Nnodes
+            else:
+                rebuild_cnt = int((~subtract_success).sum().item())
+            stats.nodes_subtract_ok += int(subtract_success.sum().item())
+            stats.nodes_rebuild += rebuild_cnt
+            stats.nodes_subtract_fallback += int(fallback_any.sum().item())
+
+            # Emit decisions and partition rows for each node
+            for cid, ctx in enumerate(contexts):
+                node_idx = index_map[cid]
+                feat = int(best_features[cid].item())
+                if feat < 0:
+                    continue
+                thr = int(best_thresholds[cid].item())
+                score_val = float(best_scores[cid].item())
+                l_g = float(best_left_grad[cid].item())
+                l_h = float(best_left_hess[cid].item())
+                l_cnt = int(best_left_count[cid].item())
+                r_g = float(total_grad_nodes[cid].item() - l_g)
+                r_h = float(total_hess_nodes[cid].item() - l_h)
+                r_cnt = int(total_count_nodes[cid].item() - best_left_count[cid].item())
+
+                part_start = perf_counter()
+                left_rows, right_rows = self._partition_rows(bins, ctx.shard.era_rows, feat, thr)
+                stats.partition_ms += (perf_counter() - part_start) * 1000.0
+
+                decisions[node_idx] = SplitDecision(
+                    feature=feat, threshold=thr, score=score_val,
+                    left_grad=l_g, left_hess=l_h, right_grad=r_g, right_hess=r_h,
+                    left_count=l_cnt, right_count=r_cnt,
+                    left_rows=left_rows, right_rows=right_rows
+                )
+
             return decisions, stats
 
-        stats.nodes_processed += len(contexts)
-        Nnodes = len(contexts)
-        Eras = len(contexts[0].shard.era_rows)
-        block_size = self._resolve_feature_block_size(int(feat_ids.numel()))
-        stats.block_size = max(stats.block_size, block_size)
-
-        rows_cat = torch.cat(row_chunks, 0)
-        era_cat = torch.cat(era_chunks, 0)
-        grad_cat = torch.cat(grad_chunks, 0)
-        hess_cat = torch.cat(hess_chunks, 0)
-        node_cat = torch.cat(node_chunks, 0)
-        bins_cat = bins.index_select(0, rows_cat)
-
-        era_weights_tensor = torch.stack([c.era_weights for c in contexts], 0).contiguous()  # [Nnodes, E]
-        total_grad_nodes = torch.tensor([c.total_grad for c in contexts], dtype=torch.float32, device=self._device)  # [Nnodes]
-        total_hess_nodes = torch.tensor([c.total_hess for c in contexts], dtype=torch.float32, device=self._device)
-        total_count_nodes = torch.tensor([c.total_count for c in contexts], dtype=torch.int64, device=self._device)
-        parent_dirs = torch.stack([c.parent_dir.to(torch.float32) for c in contexts], 0)  # [Nnodes]
-
-        # Best trackers
-        best_scores = torch.full((Nnodes,), float("-inf"), device=self._device)
-        best_features = torch.full((Nnodes,), -1, dtype=torch.int32, device=self._device)
-        best_thresholds = torch.full((Nnodes,), -1, dtype=torch.int32, device=self._device)
-        best_left_grad = torch.zeros(Nnodes, dtype=torch.float32, device=self._device)
-        best_left_hess = torch.zeros(Nnodes, dtype=torch.float32, device=self._device)
-        best_left_count = torch.full((Nnodes,), -1, dtype=torch.int64, device=self._device)
-
-        subtract_success = torch.ones(Nnodes, dtype=torch.bool, device=self._device)
-        fallback_any = torch.zeros(Nnodes, dtype=torch.bool, device=self._device)
-        if self._histogram_mode == "rebuild":
-            subtract_success.zero_()
-
-        # Feature blocks
-        for start in range(0, feat_ids.numel(), block_size):
-            block = feat_ids[start : start + block_size]                 # int32
-            block_i64 = feat_ids_i64[start : start + block_size]         # int64
-            if block.numel() == 0:
-                continue
-
-            # Histograms for this block
-            t0 = perf_counter()
-            counts, g_hist, h_hist = self._batched_histograms_nodes(
-                bins_cat.index_select(1, block_i64),
-                grad_cat, hess_cat,
-                era_cat, node_cat,
-                Nnodes, Eras, num_bins,
-            )
-            stats.hist_ms += (perf_counter() - t0) * 1000.0
-            stats.feature_blocks += 1
-            stats.bincount_calls += 3
-            if counts.numel() == 0:
-                continue
-
-            # Prefix scans
-            scan_start = perf_counter()
-            # Left stats up to edge (bins-1)
-            left_c_full = counts[:, :, :, :-1].cumsum(3)
-            left_g_full = g_hist[:, :, :, :-1].cumsum(3)
-            left_h_full = h_hist[:, :, :, :-1].cumsum(3)
-
-            tot_c_e = counts.sum(3, keepdim=True)
-            tot_g_e = g_hist.sum(3, keepdim=True)
-            tot_h_e = h_hist.sum(3, keepdim=True)
-            stats.scan_ms += (perf_counter() - scan_start) * 1000.0
-
-            # K-cut selection
-            K = int(self.config.k_cuts)
-            use_K = (K > 0 and K < full_T)
-            #K = self._choose_k_for_depth(contexts, full_T)
-            #use_K = (K > 0 and K < full_T)
-            if use_K and self.config.cut_selection == "mass":
-                cut_idx_bk = self._mass_cut_indices(counts, K)       # [B,K]
-                Bblk, Nn, Ee, _ = left_c_full.shape
-                sel = cut_idx_bk.view(Bblk, 1, 1, -1).expand(Bblk, Nn, Ee, -1)
-                left_c = left_c_full.gather(3, sel)
-                left_g = left_g_full.gather(3, sel)
-                left_h = left_h_full.gather(3, sel)
-                thr_k = cut_idx_bk.to(torch.int32)                    # [B,K]
-                num_thresh = thr_k.shape[1]
-            else:
-                if use_K:
-                    cut_idx = self._even_cut_indices(num_bins, K)     # [K]
-                else:
-                    cut_idx = torch.arange(full_T, device=self._device, dtype=torch.int64)
-                sel = cut_idx.view(1, 1, 1, -1).expand_as(left_c_full[..., :cut_idx.numel()])
-                left_c = left_c_full.gather(3, sel)
-                left_g = left_g_full.gather(3, sel)
-                left_h = left_h_full.gather(3, sel)
-                thr_k = cut_idx.to(torch.int32)                       # [K]
-                num_thresh = int(thr_k.numel())
-
-            # Right by subtraction (validator optional)
-            if self._histogram_mode == "rebuild":
-                right_c_full = counts[:, :, :, 1:].flip(3).cumsum(3).flip(3)
-                right_g_full = g_hist[:, :, :, 1:].flip(3).cumsum(3).flip(3)
-                right_h_full = h_hist[:, :, :, 1:].flip(3).cumsum(3).flip(3)
-                # gather to K if needed
-                if use_K:
-                    if self.config.cut_selection == "mass":
-                        sel = cut_idx_bk.view(Bblk, 1, 1, -1).expand_as(left_c)
-                    else:
-                        sel = cut_idx.view(1, 1, 1, -1).expand_as(left_c)
-                    right_c = right_c_full.gather(3, sel)
-                    right_g = right_g_full.gather(3, sel)
-                    right_h = right_h_full.gather(3, sel)
-                else:
-                    right_c, right_g, right_h = right_c_full, right_g_full, right_h_full
-            else:
-                right_c = tot_c_e.expand_as(left_c) - left_c
-                right_g = tot_g_e.expand_as(left_g) - left_g
-                right_h = tot_h_e.expand_as(left_h) - left_h
-
-            # DES scoring (pure: mean - λ_dro * std), Welford-style (vectorised)
-            score_start = perf_counter()
-            # validity: both sides have positive count (era-wise); also global min_samples_leaf later
-            valid = (left_c > 0) & (right_c > 0)
-
-            parent_gain = (0.5 * (total_grad_nodes**2) / (total_hess_nodes + lam_l2)).view(1, Nnodes, 1, 1)
-            gain_left = 0.5 * (left_g**2) / (left_h + lam_l2)
-            gain_right = 0.5 * (right_g**2) / (right_h + lam_l2)
-            era_gain = gain_left + gain_right - parent_gain  # [B,N,E,K]
-
-            w = era_weights_tensor.view(1, Nnodes, Eras, 1).to(era_gain.dtype) * valid.to(era_gain.dtype)
-            wsum = w.sum(dim=2).clamp_min_(1e-12)  # [B,N,K]
-            mean = (w * era_gain).sum(dim=2) / wsum
-            diff = era_gain - mean.unsqueeze(2)
-            var = (w * diff * diff).sum(dim=2) / wsum
-            std = torch.sqrt(var.clamp_min_(0.0))
-
-            score = mean - lam_dro * std  # [B,N,K]
-
-            # optional directional term (+λ_dir * agreement), off by default
-            if dir_w != 0.0 and (parent_dirs != 0).any():
-                active = (parent_dirs != 0)
-                if active.any():
-                    pa = parent_dirs[active].view(1, -1, 1, 1).to(score.dtype)
-                    lg = left_g[:, active, :, :] / (left_h[:, active, :, :] + lam_l2)
-                    rg = right_g[:, active, :, :] / (right_h[:, active, :, :] + lam_l2)
-                    agree = 0.5 * ((torch.sign(-lg) == pa).float() + (torch.sign(-rg) == pa).float())
-                    w_a = w[:, active, :, :]
-                    ws_a = w_a.sum(dim=2).clamp_min_(1e-12)
-                    agr = (w_a * agree).sum(dim=2) / ws_a
-                    score[:, active, :] += dir_w * agr
-
-            # Global min_samples_leaf (aggregate across eras)
-            left_total = left_c.sum(dim=2)  # [B,N,K] int64
-            right_total = (total_count_nodes.view(1, Nnodes, 1) - left_total)  # [B,N,K]
-            min_child = int(self.config.min_samples_leaf)
-            valid_global = (left_total >= min_child) & (right_total >= min_child)
-
-            # Prepare flattened selection per node: M = B * K candidates
-            score_perm = score.permute(1, 0, 2)  # [N,B,K]
-            score_perm = torch.where(valid_global.permute(1, 0, 2), score_perm, torch.full_like(score_perm, float("-inf")))
-            score_flat = score_perm.reshape(Nnodes, -1)                    # [N, M]
-            left_total_flat = left_total.permute(1, 0, 2).reshape(Nnodes, -1)
-
-            best_block = score_flat.max(dim=1).values                      # [N]
-            m1 = (score_flat == best_block.unsqueeze(1))
-            NEG = torch.iinfo(torch.int64).min
-            best_cnt = torch.where(m1, left_total_flat, torch.full_like(left_total_flat, NEG)).max(dim=1).values
-            m2 = m1 & (left_total_flat == best_cnt.unsqueeze(1))
-            Mflat = score_flat.shape[1]
-            flat_idx = torch.arange(Mflat, device=self._device, dtype=torch.int64).view(1, -1)
-            sel_idx = torch.where(m2, flat_idx, torch.full_like(flat_idx, -1)).max(dim=1).values  # [N], -1 invalid
-            valid_mask = (sel_idx >= 0)
-            if not torch.any(valid_mask):
-                stats.score_ms += (perf_counter() - score_start) * 1000.0
-                continue
-
-            # Gather candidate stats for nodes with valid selection
-            gather_idx = sel_idx.clamp_min(0).view(-1, 1)
-            cand_score = score_flat.gather(1, gather_idx).squeeze(1)
-            cand_left_total = left_total_flat.gather(1, gather_idx).squeeze(1)
-
-            # Unravel (feature_in_block, k_in_block) within this block
-            num_thresh = int(num_thresh)  # ensure Python int
-            f_in_blk = (sel_idx // num_thresh).to(torch.int64)   # [N]
-            t_in_blk = (sel_idx %  num_thresh).to(torch.int64)   # [N]
-
-            # Map to actual feature id
-            cand_feature = block_i64.gather(0, f_in_blk.clamp_(0, block_i64.numel()-1)).to(torch.int32)
-
-            # Map to threshold (bin edge index)
-            if use_K and self.config.cut_selection == "mass":
-                # thr_k: [B,K]
-                cand_threshold = thr_k.gather(0, f_in_blk.clamp_(0, thr_k.shape[0]-1)).gather(
-                    1, t_in_blk.clamp_(0, num_thresh - 1).view(-1, 1)
-                ).squeeze(1).to(torch.int32)
-            else:
-                # thr_k: [K]
-                cand_threshold = thr_k.gather(0, t_in_blk.clamp_(0, num_thresh - 1)).to(torch.int32)
-
-            # Gather left grad/hess totals to form leaf values after split
-            left_g_tot = left_g.sum(dim=2).permute(1, 0, 2).reshape(Nnodes, -1).gather(1, gather_idx).squeeze(1)
-            left_h_tot = left_h.sum(dim=2).permute(1, 0, 2).reshape(Nnodes, -1).gather(1, gather_idx).squeeze(1)
-
-            # Cross-block update with tiebreak (score ↓, left_count ↓, feature ↑, threshold ↑)
-            better_score = cand_score > best_scores
-            score_equal = cand_score == best_scores
-            better_cnt = cand_left_total > best_left_count
-            cnt_equal = cand_left_total == best_left_count
-            better_feat = cand_feature > best_features
-            feat_equal = cand_feature == best_features
-            better_thr = cand_threshold > best_thresholds
-
-            upd = valid_mask & (
-                better_score
-                | (score_equal & (better_cnt | (cnt_equal & (better_feat | (feat_equal & better_thr)))))
-            )
-
-            best_scores = torch.where(upd, cand_score, best_scores)
-            best_left_count = torch.where(upd, cand_left_total.to(torch.int64), best_left_count)
-            best_left_grad = torch.where(upd, left_g_tot, best_left_grad)
-            best_left_hess = torch.where(upd, left_h_tot, best_left_hess)
-            best_features = torch.where(upd, cand_feature, best_features)
-            best_thresholds = torch.where(upd, cand_threshold, best_thresholds)
-            stats.score_ms += (perf_counter() - score_start) * 1000.0
-
-        # Accounting
-        if self._histogram_mode == "rebuild":
-            rebuild_cnt = Nnodes
-        else:
-            rebuild_cnt = int((~subtract_success).sum().item())
-        stats.nodes_subtract_ok += int(subtract_success.sum().item())
-        stats.nodes_rebuild += rebuild_cnt
-        stats.nodes_subtract_fallback += int(fallback_any.sum().item())
-
-        # Emit decisions and partition rows for each node
-        for cid, ctx in enumerate(contexts):
-            node_idx = index_map[cid]
-            feat = int(best_features[cid].item())
-            if feat < 0:
-                continue
-            thr = int(best_thresholds[cid].item())
-            score_val = float(best_scores[cid].item())
-            l_g = float(best_left_grad[cid].item())
-            l_h = float(best_left_hess[cid].item())
-            l_cnt = int(best_left_count[cid].item())
-            r_g = float(total_grad_nodes[cid].item() - l_g)
-            r_h = float(total_hess_nodes[cid].item() - l_h)
-            r_cnt = int(total_count_nodes[cid].item() - best_left_count[cid].item())
-
-            part_start = perf_counter()
-            left_rows, right_rows = self._partition_rows(bins, ctx.shard.era_rows, feat, thr)
-            stats.partition_ms += (perf_counter() - part_start) * 1000.0
-
-            decisions[node_idx] = SplitDecision(
-                feature=feat, threshold=thr, score=score_val,
-                left_grad=l_g, left_hess=l_h, right_grad=r_g, right_hess=r_h,
-                left_count=l_cnt, right_count=r_cnt,
-                left_rows=left_rows, right_rows=right_rows
-            )
-
-        return decisions, stats
 
     # --- misc helpers ---
 
