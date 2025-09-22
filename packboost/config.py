@@ -70,7 +70,7 @@ class PackBoostConfig:
     max_bins: int = 63
 
     # --- new: on-the-fly K-cut controls ---
-    k_cuts: int = 8  # 0 = full sweep (bins-1); else evaluate exactly k_cuts thresholds
+    k_cuts: int = 0  # 0 = full sweep (bins-1); else evaluate exactly k_cuts thresholds
     cut_selection: Literal["even", "mass"] = "even"
     # --------------------------------------
 
