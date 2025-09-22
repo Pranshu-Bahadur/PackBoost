@@ -265,26 +265,218 @@ setup_native.py
 
 ---
 
-### M2. Native CPU backend (OpenMP + SIMD) (CURRENT)
+### M2. Native CPU backend (OpenMP + SIMD)
 
-**Goal:** Replace Torch `bincount` hot path with a C++/SIMD frontier while keeping the same Python API.
+#### Objective
 
-* **Kernel shape:** node-batched × feature-tiled histograms over `(era, bin)` with `int64` counts and `float32` stats; prefix scans per feature; **right by subtraction**; DES (mean − λ·std) in place.
-* **SIMD:** AVX2/AVX-512 gather/scatter for histogram fills; warp-like lane reductions per thread; thread-local histograms → reduce.
-* **Adaptive K:** choose K per **depth** (median node size + optional depth decay), then **gather** left prefixes at K cuts (even or mass).
-* **Partitions:** stable per-era segmented scatter using precomputed offsets (int64).
-* **Artifacts:** `backends/cpu/frontier_cpu.cpp`, `bindings.cpp`.
-* **Perf gate:** ≥ **2×** Torch frontier on `1e6 × 256 × 32` (rows × feats × eras) with `max_bins=64, K=15`.
-* **Correctness gate:** split parity (feature, threshold) and prediction diff ≤ **1e−7** vs Torch path on 4 public datasets × 5 seeds.
+Implement a drop-in CPU backend that matches the Torch path’s math (K-cuts + DES with weighted Welford) but runs natively using **OpenMP** for threading and **SIMD (AVX2/AVX-512)** for vectorization. It must integrate with the current Python API and pass parity tests against the Torch implementation.
 
 ---
 
-### M3. pybind11 wiring & packaging
+#### Scope (what to build)
 
-**Goal:** Make the CPU backend the default with seamless fallback.
+1. **Core split finder (CPU)**
+   `find_best_splits_batched_cpu(...)` that mirrors `_find_best_splits_batched`:
 
-* **Tasks:** expose `frontier_cpu` through `packboost._backend`; wheel build CI for Linux/macOS (Py3.10+); manylinux images with AVX2; runtime CPU feature check.
-* **Acceptance:** `pip install .` produces wheels; import switches to native backend automatically; unit tests green on both native and Torch fallbacks.
+   * Inputs: `bins[N,F] (uint8)`, `grad[N] (float32 or int16)`, `era_ids[N] (int16)`, active `nodes` (per-era row indices), `feature_subset`, `max_bins`, `k_cuts`, `cut_selection`, `lambda_l2`, `lambda_dro`, `direction_weight`, `min_samples_leaf`.
+   * Output: per active node → `(feature, threshold, score, left_grad, left_hess, right_grad, right_hess, left_count, right_count, left_rows, right_rows)` (same struct as now; rows can be returned as indices or defer partitioning to GPU path—pick one and keep consistent).
+
+2. **Histogram + DES pipeline (CPU)**
+
+   * Build **counts (int32)** and **grad (int32/float)** histograms per *(feature block, node, era)*.
+   * **No separate Hessian hist** (for squared loss: `H ≡ count`).
+   * Prefix-sum (≤t) across bins.
+   * **K-cuts**: even or mass (quantile by counts).
+   * **DES**: per-era gains streamed into **weighted Welford** (keep only `(wsum, mean, M2)` in memory).
+   * **Right** stats via `total − left` (no second cumsum).
+
+3. **Bindings & switch**
+
+   * `pybind11` wrapper exposed as `packboost_cpu.find_best_splits_batched(...)`.
+   * A small Python shim that picks CPU/GPU by config; identical return types.
+
+---
+
+#### Data layout & memory
+
+* **Bins layout**: **column-major** (`[F][N]` contiguous) is preferred to stream a feature across all rows with unit-stride. If your stored tensor is `[N,F]`, create a pinned/NUMA-aware **transposed view** once.
+* **Alignment**: 64-byte aligned allocations (`posix_memalign`/`aligned_alloc`).
+* **Era index**: store `era_rows[e]` as contiguous `int32` vectors.
+* **Quantized grad (optional now, add later)**: store `grad_q[N]` as `int16`, accumulate into `int32`, convert to `float` when computing gains.
+
+---
+
+#### Parallelization plan (OpenMP)
+
+* **Outer**: parallel over *(feature blocks × node blocks)*.
+* **Inner**: sequential over eras (so we can do streaming Welford) with SIMD per row.
+* Use `#pragma omp parallel for schedule(static)` on the outer loop; pin threads with `proc_bind(close)`; set `OMP_NUM_THREADS=physical_cores`.
+* Per thread: local scratch for `counts[B_blk][N_blk][BINS]` and `grads[...]` (avoid false sharing; pad to cache lines).
+
+---
+
+#### SIMD plan (AVX2/AVX-512)
+
+* **Bins** are bytes: load `__m256i` / `__m512i`, compare against 0..4, update **5-bin** hist via masked adds.
+* **Grad gather**: prefer **structure of arrays** so grad is a parallel array of rows → unit-stride loads. Use `_mm256_i32gather_ps` only if necessary (it’s slower).
+* **Popcount** is not needed; we aggregate per-bin directly.
+* **Prefix-sum** on 5 bins is tiny—do scalar or unrolled vector code.
+
+---
+
+#### K-cuts
+
+* **Even**: indices `round(linspace(0, T−1, K))`.
+* **Mass**: from per-feature **marginal counts** aggregated over (node, era). Use int64 cumsum + searchsorted; then ensure uniqueness & clamp to `[0, T−1]`.
+
+---
+
+#### DES (streaming Welford across eras)
+
+For each `(feature, node, cut)` keep:
+
+```
+wsum, mean, M2         # float32
+left_total             # int64 (for min_samples_leaf)
+```
+
+For each era `e`:
+
+1. Build **counts** and **grads** hist for that era only.
+2. Prefix-sum to get left stats at chosen cuts; right via total−left.
+3. Gain per cut: `0.5*(gL^2/(hL+λ) + gR^2/(hR+λ)) − parent_gain`.
+4. Weighted update:
+
+```
+w_new = wsum + w_e
+delta = gain_e - mean
+mean += (w_e / w_new) * delta
+M2   += w_e * delta * (gain_e - mean)
+wsum  = w_new
+left_total += left_count_e
+```
+
+Optional directional term: accumulate `(agreement, weight)` similarly and add at the end.
+
+---
+
+#### API (C++/pybind11) — skeleton
+
+```cpp
+struct SplitDecisionCPU {
+  int32_t feature, threshold;
+  float   score;
+  float   left_grad, right_grad;
+  float   left_hess, right_hess;
+  int64_t left_count, right_count;
+  // optional: vectors of row ids per side per era (if you partition on CPU)
+};
+
+std::vector<std::optional<SplitDecisionCPU>>
+find_best_splits_batched_cpu(
+    span<uint8_t> bins_FxN,     // F-major, contiguous
+    span<float>   grad_N,       // or int16
+    span<int16_t> era_N,
+    const std::vector<NodeShardCPU>& nodes,
+    span<int32_t> feature_subset,
+    int max_bins, int k_cuts,
+    CutSelection cut_sel,       // EVEN or MASS
+    float lambda_l2, float lambda_dro, float dir_w,
+    int   min_samples_leaf,
+    CPUHints hints               // block sizes, threads, simd flags
+);
+```
+
+**Python binding**: expose as `packboost_cpu.find_best_splits_batched(...)` and return the same schema your Torch path returns.
+
+---
+
+#### Implementation steps (do in order)
+
+1. **Project boilerplate**
+
+   * Add `cpp/` with CMake (C++20), OpenMP, optional AVX-512 flags.
+   * `-O3 -march=native -ffast-math -fopenmp`.
+   * Set up `pybind11` module `packboost_cpu`.
+
+2. **Memory prep utils**
+
+   * Transpose helper: `[N,F] uint8 → [F][N]` aligned buffer.
+   * Era index builder: `std::vector<std::vector<int32_t>> era_rows(E)`.
+
+3. **Reference (non-SIMD) splitter**
+
+   * Single-threaded, clean code that matches Torch math exactly.
+   * Unit tests on toy inputs; assert exact parity.
+
+4. **OpenMP parallel version**
+
+   * Parallel over `(feature_block, node_block)`.
+   * Era-streaming loop with local hist buffers; Welford accumulators per candidate.
+
+5. **SIMD inner loops**
+
+   * AVX2 path; optional AVX-512 specialization via `#ifdef`.
+   * Bench microkernels: (a) hist from bins + grad, (b) prefix-sum + K-gather, (c) gain.
+
+6. **Even & mass K-cuts**
+
+   * Implement both; add tests to ensure cut indices match Python helpers.
+
+7. **Directional term (optional)**
+
+   * Implement only if `direction_weight != 0`.
+
+8. **Row partitioning**
+
+   * Either: return row ids (left/right per era) from CPU, or keep current Torch partitioner. (Pick **one**; fewer copies wins.)
+
+9. **Parity tests**
+
+   * Random seeds, various `K` (0 → full, 4, 8, 16), check:
+
+     * chosen `(feature, threshold)`,
+     * `left/right {count, grad, hess}`,
+     * `score` within 1e-6–1e-4 tolerance.
+
+10. **Benchmarks**
+
+* Run Synthetic Benchmark - install all required packages (xgboost, lightgbm, catboost).
+* Vary threads; report `hist_ms`, `scan_ms`, `score_ms`, total.
+* Compare against Torch backend.
+
+---
+
+#### Acceptance criteria
+
+* **Correctness**: parity with Torch path across seeds/configs.
+* **Speed**: ≥2× faster than Torch backend at depth 0 on a 32-core server; ≥1.5× at deeper levels (where node counts shrink).
+* **Scalability**: good to at least `threads = physical cores`; NUMA regression tests if multi-socket.
+* **Stability**: no allocations in hot loops; bounded peak RSS.
+
+---
+
+#### Risks & mitigations
+
+* **NUMA effects**: bind threads to memory; first-touch allocate per-socket.
+* **Gather latency**: avoid gather by using F-major bins; if gather unavoidable, block rows to improve L2 reuse.
+* **False sharing**: pad hist and Welford accumulators to 64B.
+
+---
+
+#### Deliverables
+
+* `cpp/` library + `packboost_cpu` Python module.
+* Unit tests (`pytest`) and parity tests.
+* Microbench harness (`bench_cpu.py`) with CSV outputs.
+* Short README: build flags, environment, expected speed.
+
+---
+
+#### Tiny code hints (SIMD hist for BINS=5, AVX2)
+
+* Compare against constants 0..4 → five masks; convert masks to `int32` and accumulate.
+* Use unrolled loop over bins; maintain `counts[5]` and `grads[5]` in registers; spill once per tile.
 
 ---
 
