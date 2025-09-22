@@ -109,7 +109,7 @@ if __name__ == "__main__":
         lambda_dro=0.0,
         min_samples_leaf=20,
         max_bins=127,
-        k_cuts=32,#127-1,
+        k_cuts=0,#127-1,
         random_state=SEED,
         layer_feature_fraction=1.0,
         direction_weight=0.0,
