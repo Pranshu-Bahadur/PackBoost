@@ -1210,8 +1210,8 @@ class PackBoost:
         block_size = int(feat_ids.numel())
         stats.block_size = max(stats.block_size, block_size)
 
-        rows_cat = torch.cat(row_chunks, 0).contiguous()
-        bins_cat_i8 = bins.index_select(0, rows_cat).to(dtype=torch.int8).contiguous()
+        rows_cat = torch.cat(row_chunks, 0).to(device=self._device)
+        rows_cat_i32 = rows_cat.to(dtype=torch.int32).contiguous()
         grad_cat = torch.cat(grad_chunks, 0).contiguous()
         hess_cat = torch.cat(hess_chunks, 0).contiguous()
 
@@ -1268,9 +1268,10 @@ class PackBoost:
         )
 
         result = self._cuda_backend.find_best_splits_batched_cuda(
-            bins_cat_i8,
+            bins,
             grad_cat,
             hess_cat,
+            rows_cat_i32,
             node_row_splits,
             node_era_splits,
             era_weights_tensor,
@@ -1285,6 +1286,7 @@ class PackBoost:
             float(self.config.lambda_dro),
             float(self.config.direction_weight),
             int(self.config.min_samples_leaf),
+            int(rows_cat_i32.shape[0]),
         )
 
         kernel_ms = float(result.get("kernel_ms", 0.0))

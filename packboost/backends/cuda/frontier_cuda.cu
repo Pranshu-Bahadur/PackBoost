@@ -52,6 +52,7 @@ __global__ void cuda_find_best_splits_kernel(
     int bins_stride,
     const float* __restrict__ grad,            // [rows_total]
     const float* __restrict__ hess,            // [rows_total]
+    const int32_t* __restrict__ row_indices,   // [rows_total]
     const int32_t* __restrict__ node_row_splits,   // [num_nodes + 1]
     const int32_t* __restrict__ node_era_splits,   // [num_nodes * (num_eras + 1)]
     const float* __restrict__ era_weights,         // [num_nodes * num_eras]
@@ -104,8 +105,8 @@ __global__ void cuda_find_best_splits_kernel(
     if (row_start < 0) {
         row_start = 0;
     }
-        if (row_end > rows_total) {
-            row_end = rows_total;
+    if (row_end > rows_total) {
+        row_end = rows_total;
     }
     if (row_start > row_end) {
         row_start = row_end;
@@ -195,7 +196,8 @@ __global__ void cuda_find_best_splits_kernel(
         __syncwarp();
 
         for (int row = row_start + threadIdx.x; row < row_end; row += blockDim.x) {
-            int bin = static_cast<int>(static_cast<unsigned char>(bins[row * bins_stride + feature_id]));
+            int data_row = row_indices[row];
+            int bin = static_cast<int>(static_cast<unsigned char>(bins[data_row * bins_stride + feature_id]));
             if (bin >= 0 && bin < num_bins) {
                 atomicAdd(&count_bins[bin], 1);
             }
@@ -308,7 +310,8 @@ __global__ void cuda_find_best_splits_kernel(
             if (row < row_start || row >= row_end) {
                 continue;
             }
-            int bin = static_cast<int>(static_cast<unsigned char>(bins[row * bins_stride + feature_id]));
+            int data_row = row_indices[row];
+            int bin = static_cast<int>(static_cast<unsigned char>(bins[data_row * bins_stride + feature_id]));
             float g = grad[row];
             float h = hess[row];
             if (bin >= 0 && bin < num_bins) {
@@ -456,6 +459,7 @@ py::dict find_best_splits_batched_cuda(
     py::object bins,
     py::object grad,
     py::object hess,
+    py::object row_indices,
     py::object node_row_splits,
     py::object node_era_splits,
     py::object era_weights,
@@ -469,14 +473,14 @@ py::dict find_best_splits_batched_cuda(
     float lambda_l2,
     float lambda_dro,
     float direction_weight,
-    int min_samples_leaf
+    int min_samples_leaf,
+    int rows_total
 ) {
     if (max_bins > MAX_BINS) {
         throw std::invalid_argument("CUDA backend supports up to 128 bins per feature.");
     }
 
     py::tuple bins_shape = py::tuple(bins.attr("shape"));
-    int64_t rows_total = py::int_(bins_shape[0]);
     int64_t bins_stride = py::int_(bins_shape[1]);
 
     py::tuple node_row_shape = py::tuple(node_row_splits.attr("shape"));
@@ -500,6 +504,7 @@ py::dict find_best_splits_batched_cuda(
     uintptr_t bins_ptr_val = py::int_(bins.attr("data_ptr")());
     uintptr_t grad_ptr_val = py::int_(grad.attr("data_ptr")());
     uintptr_t hess_ptr_val = py::int_(hess.attr("data_ptr")());
+    uintptr_t row_indices_ptr_val = py::int_(row_indices.attr("data_ptr")());
     uintptr_t node_row_ptr_val = py::int_(node_row_splits.attr("data_ptr")());
     uintptr_t node_era_ptr_val = py::int_(node_era_splits.attr("data_ptr")());
     uintptr_t era_weights_ptr_val = py::int_(era_weights.attr("data_ptr")());
@@ -565,6 +570,7 @@ py::dict find_best_splits_batched_cuda(
         static_cast<int>(bins_stride),
         reinterpret_cast<const float*>(grad_ptr_val),
         reinterpret_cast<const float*>(hess_ptr_val),
+        reinterpret_cast<const int32_t*>(row_indices_ptr_val),
         reinterpret_cast<const int32_t*>(node_row_ptr_val),
         reinterpret_cast<const int32_t*>(node_era_ptr_val),
         reinterpret_cast<const float*>(era_weights_ptr_val),
@@ -582,7 +588,7 @@ py::dict find_best_splits_batched_cuda(
         lambda_l2,
         lambda_dro,
         direction_weight,
-        static_cast<int>(rows_total),
+        rows_total,
         reinterpret_cast<float*>(scores_ptr_val),
         reinterpret_cast<int32_t*>(thresholds_ptr_val),
         reinterpret_cast<float*>(left_grad_ptr_val),
@@ -622,6 +628,7 @@ void register_cuda_frontier(py::module_& m) {
         py::arg("bins"),
         py::arg("grad"),
         py::arg("hess"),
+        py::arg("row_indices"),
         py::arg("node_row_splits"),
         py::arg("node_era_splits"),
         py::arg("era_weights"),
@@ -636,6 +643,7 @@ void register_cuda_frontier(py::module_& m) {
         py::arg("lambda_dro"),
         py::arg("direction_weight"),
         py::arg("min_samples_leaf"),
+        py::arg("rows_total"),
         "Find best splits for a batch of nodes using the CUDA backend."
     );
 }
