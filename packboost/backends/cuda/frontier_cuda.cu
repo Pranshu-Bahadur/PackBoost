@@ -48,7 +48,6 @@ __device__ inline int warp_reduce_sum_int(int v) {
 
 // Block-wide Kogge–Stone inclusive scan for <= MAX_BINS elements in shared memory
 __device__ inline void block_scan_prefix_int(float* g, float* h, int* c, int n) {
-    // in-place: after call g[b],h[b],c[b] are prefix sums up to b
     for (int offset = 1; offset < n; offset <<= 1) {
         __syncthreads();
         int b = threadIdx.x;
@@ -207,20 +206,14 @@ __global__ void cuda_find_best_splits_kernel(
     __syncthreads();
 
     // ------------------ Prepass (counts only) for mass cuts -------------------
-    // Build total histogram across ALL eras once (cheap, no grad/hess accumulation)
-    // Using per-warp private histograms in shared memory to reduce contention.
-    // This eliminates the separate "mass" pass in the original code.
     if (k_cuts > 0 && k_cuts < full_thresholds && cut_mode == 1) {
-        // zero per-warp privates
-        for (int b = lane; b < num_bins; b += WARP_SIZE) {
+        for (int b = (threadIdx.x & (WARP_SIZE - 1)); b < num_bins; b += WARP_SIZE) {
             cnt_w[warp_id * num_bins + b] = 0;
         }
         __syncthreads();
 
-        // iterate rows belonging to this node (across all eras)
         for (int r = row_start + threadIdx.x; r < row_end; r += blockDim.x) {
             const int32_t ridx = rows_index[r];
-            // 64-bit index into feature-major bins
             const long long off = (long long)feature_id * (long long)rows_dataset + (long long)ridx;
             const int bin = int((unsigned char)bins_fmajor[off]);
             if (bin >= 0 && bin < num_bins) {
@@ -229,7 +222,6 @@ __global__ void cuda_find_best_splits_kernel(
         }
         __syncthreads();
 
-        // reduce warps -> count_total
         for (int b = threadIdx.x; b < num_bins; b += blockDim.x) {
             int sum = 0;
             #pragma unroll
@@ -238,7 +230,6 @@ __global__ void cuda_find_best_splits_kernel(
         }
         __syncthreads();
 
-        // choose thresholds by mass on count_total (single thread OK)
         if (threadIdx.x == 0) {
             int K = k_cuts;
             if (K <= 0 || K >= full_thresholds) {
@@ -249,10 +240,8 @@ __global__ void cuda_find_best_splits_kernel(
                 for (int b = 0; b < num_bins; ++b) total += (long long)count_total[b];
 
                 if (total <= 0) {
-                    // fallback to even
-                    if (K == 1) {
-                        num_eval = 1; thresholds_sh[0] = 0;
-                    } else {
+                    if (K == 1) { num_eval = 1; thresholds_sh[0] = 0; }
+                    else {
                         num_eval = K;
                         double step = double(full_thresholds - 1) / double(K - 1);
                         for (int t = 0; t < K; ++t) {
@@ -261,8 +250,6 @@ __global__ void cuda_find_best_splits_kernel(
                         }
                     }
                 } else {
-                    // CDF scan
-                    // We have count_total only here; compute K quantiles in bin space
                     int cand = 0;
                     num_eval = K;
                     for (int i = 0; i < K; ++i) {
@@ -290,7 +277,6 @@ __global__ void cuda_find_best_splits_kernel(
         __syncthreads();
         num_eval = __shfl_sync(0xffffffff, num_eval, 0);
     } else {
-        // even / full sweep
         if (threadIdx.x == 0) {
             if (k_cuts <= 0 || k_cuts >= full_thresholds) {
                 num_eval = full_thresholds;
@@ -331,7 +317,7 @@ __global__ void cuda_find_best_splits_kernel(
         if (e_s >= e_e) continue;
 
         // zero per-warp private hists
-        for (int b = lane; b < num_bins; b += WARP_SIZE) {
+        for (int b = (threadIdx.x & (WARP_SIZE - 1)); b < num_bins; b += WARP_SIZE) {
             cnt_w[warp_id * num_bins + b] = 0;
             grd_w[warp_id * num_bins + b] = 0.f;
             hss_w[warp_id * num_bins + b] = 0.f;
@@ -388,8 +374,7 @@ __global__ void cuda_find_best_splits_kernel(
         parent_gain = __shfl_sync(0xffffffff, parent_gain, 0);
 
         // prefix scan over bins => left stats at every bin edge b
-        // after scan, *_bins[b] = sum_{k<=b} *_bins[k]
-        block_scan_prefix_int(grad_bins, hess_bins, count_bins, num_bins - 1); // we don't need last bin for thresholds
+        block_scan_prefix_int(grad_bins, hess_bins, count_bins, num_bins - 1);
 
         // one thread per threshold updates Welford accumulators
         if (threadIdx.x < num_eval) {
@@ -490,7 +475,7 @@ __global__ void cuda_find_best_splits_kernel(
 // ------------------------------- Host wrapper --------------------------------
 
 py::dict find_best_splits_batched_cuda(
-    py::object bins,               // torch.uint8 [N, F] (row-major)
+    py::object bins,               // torch.int8 [N, F] (row-major)
     py::object grad,               // torch.float32 [Rcat]
     py::object hess,               // torch.float32 [Rcat]
     py::object rows_index,         // torch.int32   [Rcat]  (concatenated row ids)
@@ -519,7 +504,6 @@ py::dict find_best_splits_batched_cuda(
     // shapes
     py::tuple bins_shape = py::tuple(bins.attr("shape"));   // [N_dataset, F]
     const long long rows_dataset = (long long)py::int_(bins_shape[0]);
-    const long long features     = (long long)py::int_(bins_shape[1]);
 
     py::tuple node_row_shape = py::tuple(node_row_splits.attr("shape"));
     const int num_nodes = (int)py::int_(node_row_shape[0]) - 1;
@@ -532,7 +516,6 @@ py::dict find_best_splits_batched_cuda(
     py::tuple feature_shape = py::tuple(feature_ids.attr("shape"));
     const int num_features = (int)py::int_(feature_shape[0]);
 
-    // Cut mode
     const int cut_mode = (cut_selection == "mass") ? 1 : 0;
 
     // Pointers
@@ -548,7 +531,6 @@ py::dict find_best_splits_batched_cuda(
     const uintptr_t feat_ids_ptr   = py::int_(feature_ids.attr("data_ptr")());
 
     // Build feature-major view once (GPU-side, keeps API unchanged)
-    // bins_fmajor = bins.t().contiguous()   # [F, N_dataset]
     py::object bins_fmajor = bins.attr("t")().attr("contiguous")();
     const uintptr_t bins_fmajor_ptr = py::int_(bins_fmajor.attr("data_ptr")());
 
@@ -578,18 +560,14 @@ py::dict find_best_splits_batched_cuda(
     dim3 block_dim(THREADS, 1, 1);
     dim3 grid_dim((unsigned)num_features, (unsigned)num_nodes, 1);
 
-    // Shared memory sizing:
-    // per-warp hists: WARPS * num_bins * (4 + 4 + 4)
-    // reduced per-era: num_bins * (4 + 4 + 4)
-    // count_total:     num_bins * 4
-    // thresholds:      num_bins * 4
-    // per-threshold acc: num_bins * (6*4 + 8)
+    // Shared memory sizing uses host-side max_bins
+    const int NB = max_bins;
     size_t shmem =
-        (size_t)WARPS * num_bins * (sizeof(int32_t) + 2*sizeof(float)) +
-        (size_t)num_bins * (3*sizeof(float) + sizeof(int32_t)) +
-        (size_t)num_bins * sizeof(int32_t) +                     // count_total
-        (size_t)num_bins * sizeof(int32_t) +                     // thresholds
-        (size_t)num_bins * (6*sizeof(float) + sizeof(int64_t)) +
+        (size_t)WARPS * NB * (sizeof(int32_t) + 2*sizeof(float)) +   // per-warp hist
+        (size_t)NB * (sizeof(int32_t) + 2*sizeof(float)) +           // reduced per-era (count+grad+hess)
+        (size_t)NB * sizeof(int32_t) +                               // count_total
+        (size_t)NB * sizeof(int32_t) +                               // thresholds
+        (size_t)NB * (6*sizeof(float) + sizeof(int64_t)) +           // per-threshold accums
         (alignof(int64_t) - 1);
 
     // Time the kernel only
@@ -597,6 +575,10 @@ py::dict find_best_splits_batched_cuda(
     CUDA_CHECK(cudaEventCreate(&start_evt));
     CUDA_CHECK(cudaEventCreate(&stop_evt));
     CUDA_CHECK(cudaEventRecord(start_evt));
+
+    // num_eras from era_weights shape
+    const int num_eras =
+        (int)py::int_(py::tuple(era_weights.attr("shape"))[1]);
 
     cuda_find_best_splits_kernel<<<grid_dim, block_dim, shmem>>>(
         reinterpret_cast<const int8_t*>(bins_fmajor_ptr),
@@ -613,8 +595,8 @@ py::dict find_best_splits_batched_cuda(
         reinterpret_cast<const int32_t*>(feat_ids_ptr),
         (int)num_nodes,
         (int)num_features,
-        (int)max_bins,
-        (int)py::int_(py::tuple(era_weights.attr("shape"))[1]),  // num_eras
+        (int)max_bins,                                           // num_bins (<=128)
+        (int)num_eras,
         (int)k_cuts,
         (int)cut_mode,
         (int)min_samples_leaf,
@@ -651,11 +633,11 @@ py::dict find_best_splits_batched_cuda(
 void register_cuda_frontier(py::module_& m) {
     m.def("_cuda_available", []() { return true; }, "Native CUDA backend is available.");
 
-    // IMPORTANT: API matches booster.py (rows_index + rows_total_compact present)
+    // API matches booster.py (rows_index + rows_total_compact present)
     m.def(
         "find_best_splits_batched_cuda",
         &find_best_splits_batched_cuda,
-        py::arg("bins"),               // [N,F] uint8, row-major
+        py::arg("bins"),               // [N,F] int8, row-major
         py::arg("grad"),               // [Rcat]
         py::arg("hess"),               // [Rcat]
         py::arg("rows_index"),         // [Rcat] int32
