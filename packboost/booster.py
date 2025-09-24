@@ -337,6 +337,8 @@ class PackBoost:
         N, F = X_np.shape
         if N != y_np.shape[0]:
             raise ValueError("X and y row mismatch")
+        if self.config.max_bins > 128:
+            raise ValueError("max_bins must be ≤ 128 when using int8 bin storage")
         if era is None:
             # DES-off path: collapse all rows into a single synthetic era
             era_np = np.zeros(N, dtype=np.int64)
@@ -389,7 +391,7 @@ class PackBoost:
                     if not bool(self.config.prebinned):
                         X_eval_bins = apply_bins(X_eval_np, self._binner.bin_edges, self.config.max_bins)
                     else:
-                        X_eval_bins = X_eval_np.astype(np.uint8, copy=False)
+                        X_eval_bins = X_eval_np.astype(np.int8, copy=False)
                     bins_eval = torch.from_numpy(X_eval_bins).to(self._device, dtype=torch.int32)
                     y_eval_np = np.asarray(y_eval, dtype=np.float32)
                     y_eval_tensor = torch.from_numpy(y_eval_np).to(self._device)

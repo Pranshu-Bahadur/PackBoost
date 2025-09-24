@@ -329,7 +329,7 @@ class EFBBundler:
             return None
 
         # boolean nonzero mask on selected features
-        M = (~np.isclose(np.nan_to_num(X_tr[:, sel], copy=False), 0.0)).astype(np.uint8)
+        M = (~np.isclose(np.nan_to_num(X_tr[:, sel], copy=False), 0.0)).astype(np.int8)
         col_nnz = M.sum(axis=0)
         if col_nnz.sum() == 0:
             return None

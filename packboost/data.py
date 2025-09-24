@@ -35,21 +35,25 @@ def detect_prebinned(X: np.ndarray, max_bins: int) -> bool:
         return False
     if X.min(initial=0) < 0:
         return False
-    return int(X.max(initial=0)) < max_bins
+    max_val = int(X.max(initial=0))
+    if max_val >= max_bins:
+        return False
+    return max_val <= 127
 
 
 def quantile_bin(X: np.ndarray, max_bins: int) -> tuple[np.ndarray, np.ndarray]:
-    """Quantile-bin ``X`` column-wise into ``max_bins`` buckets."""
+    """Quantile-bin ``X`` column-wise into ``max_bins`` buckets using ``int8`` bins."""
 
-    if max_bins > 256:
-        raise ValueError("PackBoost currently supports up to 256 bins (uint8 storage)")
+    if max_bins > 128:
+        raise ValueError("PackBoost currently supports up to 128 bins (int8 storage)")
     quantiles = np.linspace(0.0, 1.0, max_bins + 1, dtype=np.float64)[1:-1]
     edges = np.quantile(X, quantiles, axis=0, method="linear").astype(np.float32)
-    bins = np.empty_like(X, dtype=np.uint8)
+    bins = np.empty_like(X, dtype=np.int8)
     for j in range(X.shape[1]):
         column_edges = edges[:, j]
-        bins[:, j] = np.searchsorted(column_edges, X[:, j], side="left").astype(np.uint8)
-    np.clip(bins, 0, max_bins - 1, out=bins)
+        col = np.searchsorted(column_edges, X[:, j], side="left").astype(np.int16)
+        np.clip(col, 0, max_bins - 1, out=col)
+        bins[:, j] = col.astype(np.int8, copy=False)
     return bins, edges
 
 
@@ -59,7 +63,7 @@ def preprocess_features(
     *,
     assume_prebinned: bool = False,
 ) -> BinningResult:
-    """Return (possibly) quantile-binned features stored as ``uint8``.
+    """Return (possibly) quantile-binned features stored as ``int8``.
 
     Parameters
     ----------
@@ -78,11 +82,11 @@ def preprocess_features(
             raise ValueError(
                 "prebinned=True requires X to contain integer bins within [0, max_bins)."
             )
-        bins = X_np.astype(np.uint8, copy=False)
+        bins = X_np.astype(np.int8, copy=False)
         return BinningResult(bins=bins, bin_edges=None, prebinned=True)
 
     if detect_prebinned(X_np, max_bins):
-        bins = X_np.astype(np.uint8, copy=False)
+        bins = X_np.astype(np.int8, copy=False)
         return BinningResult(bins=bins, bin_edges=None, prebinned=True)
 
     bins, edges = quantile_bin(X_np.astype(np.float32, copy=False), max_bins=max_bins)
@@ -96,13 +100,14 @@ def apply_bins(X: np.ndarray, bin_edges: np.ndarray | None, max_bins: int) -> np
     if bin_edges is None:
         if not detect_prebinned(X_np, max_bins):
             raise ValueError("Input must already be prebinned when no edges are provided")
-        return X_np.astype(np.uint8, copy=False)
+        return X_np.astype(np.int8, copy=False)
     X_float = X_np.astype(np.float32, copy=False)
-    bins = np.empty_like(X_float, dtype=np.uint8)
+    bins = np.empty_like(X_float, dtype=np.int8)
     for j in range(X_float.shape[1]):
         column_edges = bin_edges[:, j]
-        bins[:, j] = np.searchsorted(column_edges, X_float[:, j], side="left").astype(np.uint8)
-    np.clip(bins, 0, max_bins - 1, out=bins)
+        col = np.searchsorted(column_edges, X_float[:, j], side="left").astype(np.int16)
+        np.clip(col, 0, max_bins - 1, out=col)
+        bins[:, j] = col.astype(np.int8, copy=False)
     return bins
 
 

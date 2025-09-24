@@ -27,7 +27,7 @@ class PackBoostConfig:
     min_samples_leaf:
         Minimum number of samples required in each child after a split.
     max_bins:
-        Maximum number of histogram bins per feature (<= 256 for uint8 storage).
+        Maximum number of histogram bins per feature (<= 128 for ``int8`` storage).
     k_cuts:
         Number of candidate thresholds per feature evaluated per split
         (on-the-fly thermometer lanes). ``0`` means **use all** (full sweep),

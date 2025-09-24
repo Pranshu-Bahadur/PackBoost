@@ -24,7 +24,7 @@ namespace {
     } while (0)
 
 constexpr int WARP_SIZE = 32;
-constexpr int MAX_BINS = 512;
+constexpr int MAX_BINS = 128;
 __device__ constexpr float NEG_INF = -1.0e30f;
 
 __host__ __device__ inline int max_int(int a, int b) { return a > b ? a : b; }

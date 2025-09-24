@@ -97,7 +97,7 @@ $v\_{L/R}=-,\frac{G\_{L/R}}{H\_{L/R}+\lambda}$
 
 ## 4) Memory Layout & Workspaces
 
-* **Bins** $$X\_b$$: `uint8` if `max_bins ≤ 255`, else `uint16`, row-major.
+* **Bins** $$X\_b$$: `int8` when `max_bins ≤ 128`; values remain in `[0, max_bins)`.
 * **Prebinned fast-path:** set `PackBoostConfig.prebinned=True` when the caller supplies integer bins in `[0, max_bins)` to skip quantile preprocessing.
 * **Row pools:** `int32` contiguous pools per (node, era); SoA offsets per shard.
 * **Histogram scratch:** per-(node,feature) `[bins,2]` for $$(\sum g,\sum h)$$ in shared memory (GPU) or thread-local arrays (CPU).
@@ -218,7 +218,7 @@ setup_native.py
 
 ### M1 Foundations — Final (On-the-fly K-cuts + Subtract-First Frontier) (DONE)
 
-**Numerical policy.** Counts/offsets: **int64**. Node/feature ids & thresholds: **int32**. Bins: `uint8/uint16`. Stats: **float32**.
+**Numerical policy.** Counts/offsets: **int64**. Node/feature ids & thresholds: **int32**. Bins: `int8`. Stats: **float32**.
 
 **Histogram strategy.**
 
@@ -288,7 +288,7 @@ Implement a drop-in CPU backend that matches the Torch path’s math (K-cuts + D
 1. **Core split finder (CPU)**
    `find_best_splits_batched_cpu(...)` that mirrors `_find_best_splits_batched`:
 
-   * Inputs: `bins[N,F] (uint8)`, `grad[N] (float32 or int16)`, `era_ids[N] (int16)`, active `nodes` (per-era row indices), `feature_subset`, `max_bins`, `k_cuts`, `cut_selection`, `lambda_l2`, `lambda_dro`, `direction_weight`, `min_samples_leaf`.
+  * Inputs: `bins[N,F] (int8)`, `grad[N] (float32 or int16)`, `era_ids[N] (int16)`, active `nodes` (per-era row indices), `feature_subset`, `max_bins`, `k_cuts`, `cut_selection`, `lambda_l2`, `lambda_dro`, `direction_weight`, `min_samples_leaf`.
    * Output: per active node → `(feature, threshold, score, left_grad, left_hess, right_grad, right_hess, left_count, right_count, left_rows, right_rows)` (same struct as now; rows can be returned as indices or defer partitioning to GPU path—pick one and keep consistent).
 
 2. **Histogram + DES pipeline (CPU)**
@@ -384,7 +384,7 @@ struct SplitDecisionCPU {
 
 std::vector<std::optional<SplitDecisionCPU>>
 find_best_splits_batched_cpu(
-    span<uint8_t> bins_FxN,     // F-major, contiguous
+    span<int8_t> bins_FxN,      // F-major, contiguous
     span<float>   grad_N,       // or int16
     span<int16_t> era_N,
     const std::vector<NodeShardCPU>& nodes,
@@ -411,7 +411,7 @@ find_best_splits_batched_cpu(
 
 2. **Memory prep utils**
 
-   * Transpose helper: `[N,F] uint8 → [F][N]` aligned buffer.
+   * Transpose helper: `[N,F] int8 → [F][N]` aligned buffer.
    * Era index builder: `std::vector<std::vector<int32_t>> era_rows(E)`.
 
 3. **Reference (non-SIMD) splitter**
@@ -503,7 +503,7 @@ find_best_splits_batched_cpu(
   * `mass`: compute per-feature CDF from shared hist, select K quantile edges (branch-free search in registers).
 * **DES (Welford) in registers:** accumulate mean/std across eras; optional directional term; stable tie-break `(gain ↓, samples ↓, feature ↑, threshold ↑)`.
 * **Partition:** segmented scatters into persistent row pools (global offsets precomputed per (node, era, side)).
-* **Numerics:** counts `int64`, stats `float32`; bins `uint8/uint16`.
+* **Numerics:** counts `int64`, stats `float32`; bins `int8`.
 * **Perf gate (A100 or similar):**
 
   * `2.7M × 2,376 × 5`, `depth=6`, `max_bins=64`, `K=15` ⇒ **≥4×** native CPU path;
@@ -516,7 +516,7 @@ find_best_splits_batched_cpu(
 
 **Goal:** Reduce bandwidth and footprint without hurting accuracy.
 
-* **Storage:** `uint8` bins whenever `max_bins ≤ 256`; optional **FP16** leaf/score storage with FP32 accumulation.
+* **Storage:** `int8` bins whenever `max_bins ≤ 128`; optional **FP16** leaf/score storage with FP32 accumulation.
 * **Missing value** support via a dedicated “NaN bin” column or mask lane; predictable routing rule.
 * **Optional precomputed lanes (thermometer ≤16):** fast path for small-K workloads (bit-packed masks on GPU), falling back to on-the-fly K-cuts when `max_bins` or K grow.
 * **Acceptance:** memory drop ≥ **25%** on reference; prediction parity preserved; speed non-regressing vs M4 within ±5%.
