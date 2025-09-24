@@ -1141,15 +1141,11 @@ class PackBoost:
         for idx, node in enumerate(nodes):
             all_rows, era_ids = self._stack_node_rows(node.era_rows)
             if all_rows.device != self._device:
-                all_rows = all_rows.to(self._device, dtype=torch.int64)
-            else:
-                all_rows = all_rows.to(dtype=torch.int64)
+                all_rows = all_rows.to(self._device)
             if era_ids.device != self._device:
-                era_ids = era_ids.to(self._device, dtype=torch.int16)
-            else:
-                era_ids = era_ids.to(dtype=torch.int16)
-            all_rows = all_rows.contiguous()
-            era_ids = era_ids.contiguous()
+                era_ids = era_ids.to(self._device)
+            all_rows = all_rows.to(dtype=torch.int64).contiguous()
+            era_ids = era_ids.to(dtype=torch.int16).contiguous()
             total_count = int(all_rows.numel())
             if total_count < 2 * self.config.min_samples_leaf:
                 stats.nodes_skipped += 1
@@ -1219,12 +1215,11 @@ class PackBoost:
 
         node_row_offsets: list[int] = [ctx.row_start for ctx in contexts]
         node_row_offsets.append(row_start)
-        node_row_splits_np = np.asarray(node_row_offsets, dtype=np.int32)
-        node_row_splits = (
-            torch.from_numpy(node_row_splits_np)
-            .to(self._device, dtype=torch.int32)
-            .contiguous()
-        )
+        node_row_splits = torch.tensor(
+            node_row_offsets, dtype=torch.int32, device=self._device
+        ).contiguous()
+        if int(node_row_splits[-1].item()) != int(rows_cat.shape[0]):
+            raise RuntimeError("node_row_splits mismatch rows_cat length in CUDA path")
 
         era_offset_rows: list[list[int]] = []
         for ctx in contexts:
@@ -1236,12 +1231,11 @@ class PackBoost:
                 prefix.append(running)
             prefix = [p + ctx.row_start for p in prefix]
             era_offset_rows.append(prefix)
-        node_era_splits_np = np.asarray(era_offset_rows, dtype=np.int32)
-        node_era_splits = (
-            torch.from_numpy(node_era_splits_np)
-            .to(self._device, dtype=torch.int32)
-            .contiguous()
-        )
+        node_era_splits = torch.tensor(
+            era_offset_rows, dtype=torch.int32, device=self._device
+        ).contiguous()
+        if node_era_splits.shape[1] != (Eras + 1):
+            raise RuntimeError("node_era_splits has unexpected width")
 
         era_weights_tensor = (
             torch.stack([c.era_weights.to(dtype=torch.float32) for c in contexts], 0)

@@ -48,7 +48,7 @@ __device__ inline int warp_reduce_sum_int(int value) {
 }
 
 __global__ void cuda_find_best_splits_kernel(
-    const uint8_t* __restrict__ bins,          // [rows_total, bins_stride]
+    const int8_t* __restrict__ bins,           // [rows_total, bins_stride]
     int bins_stride,
     const float* __restrict__ grad,            // [rows_total]
     const float* __restrict__ hess,            // [rows_total]
@@ -114,16 +114,28 @@ __global__ void cuda_find_best_splits_kernel(
     }
 
     extern __shared__ unsigned char shared_raw[];
-    int32_t* count_bins = reinterpret_cast<int32_t*>(shared_raw);
-    float* grad_bins = reinterpret_cast<float*>(count_bins + num_bins);
-    float* hess_bins = grad_bins + num_bins;
-    float* mean_arr = hess_bins + num_bins;
-    float* M2_arr = mean_arr + num_bins;
-    float* weight_arr = M2_arr + num_bins;
-    float* dir_arr = weight_arr + num_bins;
-    float* left_grad_arr = dir_arr + num_bins;
-    float* left_hess_arr = left_grad_arr + num_bins;
-    int64_t* left_count_arr = reinterpret_cast<int64_t*>(left_hess_arr + num_bins);
+    unsigned char* cursor = shared_raw;
+    int32_t* count_bins = reinterpret_cast<int32_t*>(cursor);
+    cursor += sizeof(int32_t) * num_bins;
+    float* grad_bins = reinterpret_cast<float*>(cursor);
+    cursor += sizeof(float) * num_bins;
+    float* hess_bins = reinterpret_cast<float*>(cursor);
+    cursor += sizeof(float) * num_bins;
+    float* mean_arr = reinterpret_cast<float*>(cursor);
+    cursor += sizeof(float) * num_bins;
+    float* M2_arr = reinterpret_cast<float*>(cursor);
+    cursor += sizeof(float) * num_bins;
+    float* weight_arr = reinterpret_cast<float*>(cursor);
+    cursor += sizeof(float) * num_bins;
+    float* dir_arr = reinterpret_cast<float*>(cursor);
+    cursor += sizeof(float) * num_bins;
+    float* left_grad_arr = reinterpret_cast<float*>(cursor);
+    cursor += sizeof(float) * num_bins;
+    float* left_hess_arr = reinterpret_cast<float*>(cursor);
+    cursor += sizeof(float) * num_bins;
+    uintptr_t aligned_ptr = (reinterpret_cast<uintptr_t>(cursor) + alignof(int64_t) - 1) & ~(alignof(int64_t) - 1);
+    int64_t* left_count_arr = reinterpret_cast<int64_t*>(aligned_ptr);
+    cursor = reinterpret_cast<unsigned char*>(left_count_arr + num_bins);
 
     int num_thresholds_full = max_int(num_bins - 1, 1);
 
@@ -160,7 +172,7 @@ __global__ void cuda_find_best_splits_kernel(
         __syncwarp();
 
         for (int row = row_start + threadIdx.x; row < row_end; row += blockDim.x) {
-            int bin = static_cast<int>(bins[row * bins_stride + feature_id]);
+            int bin = static_cast<int>(static_cast<unsigned char>(bins[row * bins_stride + feature_id]));
             if (bin >= 0 && bin < num_bins) {
                 atomicAdd(&count_bins[bin], 1);
             }
@@ -265,7 +277,7 @@ __global__ void cuda_find_best_splits_kernel(
         __syncwarp();
 
         for (int row = start + threadIdx.x; row < end; row += blockDim.x) {
-            int bin = static_cast<int>(bins[row * bins_stride + feature_id]);
+            int bin = static_cast<int>(static_cast<unsigned char>(bins[row * bins_stride + feature_id]));
             float g = grad[row];
             float h = hess[row];
             if (bin >= 0 && bin < num_bins) {
@@ -508,7 +520,8 @@ py::dict find_best_splits_batched_cuda(
 
     dim3 block_dim(WARP_SIZE, 1, 1);
     dim3 grid_dim(static_cast<unsigned int>(num_features), static_cast<unsigned int>(num_nodes), 1);
-    size_t shared_mem = static_cast<size_t>(max_bins) * (sizeof(int32_t) + 8 * sizeof(float) + sizeof(int64_t));
+    size_t per_bin_bytes = sizeof(int32_t) + 8 * sizeof(float) + sizeof(int64_t);
+    size_t shared_mem = static_cast<size_t>(max_bins) * per_bin_bytes + (alignof(int64_t) - 1);
 
     cudaEvent_t start_evt;
     cudaEvent_t stop_evt;
@@ -517,7 +530,7 @@ py::dict find_best_splits_batched_cuda(
     CUDA_CHECK(cudaEventRecord(start_evt));
 
     cuda_find_best_splits_kernel<<<grid_dim, block_dim, shared_mem>>>(
-        reinterpret_cast<const uint8_t*>(bins_ptr_val),
+        reinterpret_cast<const int8_t*>(bins_ptr_val),
         static_cast<int>(bins_stride),
         reinterpret_cast<const float*>(grad_ptr_val),
         reinterpret_cast<const float*>(hess_ptr_val),
