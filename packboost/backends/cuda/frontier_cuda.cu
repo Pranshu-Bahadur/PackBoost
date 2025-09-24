@@ -431,11 +431,12 @@ py::dict find_best_splits_batched_cuda(
         throw std::invalid_argument("CUDA backend supports up to 512 bins per feature.");
     }
 
-    auto bins_shape = bins.attr("shape");
+    py::tuple bins_shape = py::tuple(bins.attr("shape"));
     int64_t rows_total = py::int_(bins_shape[0]);
     int64_t bins_stride = py::int_(bins_shape[1]);
 
-    int64_t num_nodes = py::int_(node_row_splits.attr("shape")[0]) - 1;
+    py::tuple node_row_shape = py::tuple(node_row_splits.attr("shape"));
+    int64_t num_nodes = py::int_(node_row_shape[0]) - 1;
     if (num_nodes <= 0) {
         return py::dict(
             "scores"_a=py::none(),
@@ -447,7 +448,7 @@ py::dict find_best_splits_batched_cuda(
         );
     }
 
-    auto feature_shape = feature_ids.attr("shape");
+    py::tuple feature_shape = py::tuple(feature_ids.attr("shape"));
     int64_t num_features = py::int_(feature_shape[0]);
 
     int cut_mode = (cut_selection == "mass") ? 1 : 0;
@@ -463,7 +464,8 @@ py::dict find_best_splits_batched_cuda(
     uintptr_t total_count_ptr_val = py::int_(total_count.attr("data_ptr")());
     uintptr_t feature_ids_ptr_val = py::int_(feature_ids.attr("data_ptr")());
 
-    int64_t num_eras = py::int_(era_weights.attr("shape")[1]);
+    py::tuple era_shape = py::tuple(era_weights.attr("shape"));
+    int64_t num_eras = py::int_(era_shape[1]);
 
     py::module torch = py::module::import("torch");
     py::object device = bins.attr("device");

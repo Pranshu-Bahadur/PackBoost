@@ -8,7 +8,7 @@ import math
 import os
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import Iterable, List, Sequence, Tuple
+from typing import Callable, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -292,6 +292,7 @@ class PackBoost:
         self._use_native_cuda = False
         self._cuda_backend = None
         self._native_validate = os.getenv("PACKBOOST_NATIVE_VALIDATE") == "1"
+        self._round_metrics: list[dict[str, float]] = []
 
         disable_native = os.getenv("PACKBOOST_DISABLE_NATIVE_CPU") == "1"
         if not disable_native and self._device.type == "cpu":
@@ -325,6 +326,8 @@ class PackBoost:
         *,
         num_rounds: int,
         feature_names: Sequence[str] | None = None,
+        eval_sets: Sequence[tuple[str, np.ndarray, np.ndarray, Iterable[int] | None]] | None = None,
+        round_callback: Callable[[int, dict[str, float]], None] | None = None,
     ) -> "PackBoost":
         """Squared-loss booster with pack-synchronous growth and DES."""
         X_np = np.asarray(X)
@@ -372,11 +375,63 @@ class PackBoost:
             self._depth_logs = []
             self._tree_weight = None
             self._trained_pack_size = None
+            self._round_metrics = []
             era_index = build_era_index(era_encoded, E)  # list[np.ndarray] of row ids per era
             base_era_rows = [r.to(device=self._device, dtype=torch.int64) for r in era_index]
             self._trees = []
 
+            eval_states: list[dict[str, object]] = []
+            if eval_sets:
+                for name, X_eval, y_eval, era_eval in eval_sets:
+                    if y_eval is None:
+                        raise ValueError(f"eval set '{name}' requires y values for correlation logging")
+                    X_eval_np = np.asarray(X_eval)
+                    if not bool(self.config.prebinned):
+                        X_eval_bins = apply_bins(X_eval_np, self._binner.bin_edges, self.config.max_bins)
+                    else:
+                        X_eval_bins = X_eval_np.astype(np.uint8, copy=False)
+                    bins_eval = torch.from_numpy(X_eval_bins).to(self._device, dtype=torch.int32)
+                    y_eval_np = np.asarray(y_eval, dtype=np.float32)
+                    y_eval_tensor = torch.from_numpy(y_eval_np).to(self._device)
+                    if era_eval is None:
+                        era_eval_np = np.zeros(X_eval_bins.shape[0], dtype=np.int64)
+                    else:
+                        era_eval_np = np.asarray(era_eval, dtype=np.int64)
+                        if era_eval_np.shape[0] != X_eval_bins.shape[0]:
+                            raise ValueError(f"eval set '{name}' era ids must align with X rows")
+                    eval_states.append(
+                        {
+                            "name": name,
+                            "bins": bins_eval,
+                            "y_tensor": y_eval_tensor,
+                            "era_np": era_eval_np,
+                            "preds": torch.zeros_like(y_eval_tensor),
+                        }
+                    )
+
+            eval_round_metrics = bool(eval_states)
+
+            def log_metrics(round_idx: int, round_time: float) -> None:
+                preds_np = preds.cpu().numpy()
+                train_corr = self._era_correlation_np(era_encoded, y_np, preds_np)
+                metrics: dict[str, float] = {
+                    "round": round_idx + 1,
+                    "train_corr": train_corr,
+                    "trees_per_second": (self.config.pack_size / round_time) if round_time > 0 else float("inf"),
+                    "round_seconds": round_time,
+                }
+                for state in eval_states:
+                    name = state["name"]
+                    y_eval_np = state["y_tensor"].cpu().numpy()
+                    era_eval_np = state["era_np"]
+                    preds_eval_np = state["preds"].cpu().numpy()
+                    metrics[f"{name}_corr"] = self._era_correlation_np(era_eval_np, y_eval_np, preds_eval_np)
+                self._round_metrics.append(metrics)
+                if round_callback is not None:
+                    round_callback(round_idx + 1, metrics)
+
             for round_idx in range(num_rounds):
+                round_start = perf_counter()
                 self._update_gradients(preds, y_t, grad)
                 self._update_hessians(hess)
 
@@ -475,6 +530,8 @@ class PackBoost:
 
                 # Pack prediction and averaging (lr / B)
                 pack_sum = torch.zeros_like(preds)
+                for state in eval_states:
+                    state["pack_sum"] = torch.zeros_like(state["preds"])  # type: ignore[index]
                 for t_id, tb in enumerate(pack_builders):
                     tr = tb.build()
                     self._trees.append(tr)
@@ -492,10 +549,21 @@ class PackBoost:
                             device=self._device,
                         )
                         pack_sum.index_add_(0, rows_all, contrib)
+                    for state in eval_states:
+                        bins_eval: torch.Tensor = state["bins"]  # type: ignore[assignment]
+                        state_pack_sum: torch.Tensor = state["pack_sum"]  # type: ignore[assignment]
+                        state_pack_sum += tr.predict_bins(bins_eval)
                 per_tree_w = float(self.config.learning_rate) / float(self.config.pack_size)
                 preds += per_tree_w * pack_sum
+                for state in eval_states:
+                    state_pack_sum: torch.Tensor = state["pack_sum"]  # type: ignore[assignment]
+                    preds_eval: torch.Tensor = state["preds"]  # type: ignore[assignment]
+                    preds_eval.add_(per_tree_w * state_pack_sum)
                 self._tree_weight = per_tree_w
                 self._trained_pack_size = int(self.config.pack_size)
+
+                round_elapsed = perf_counter() - round_start
+                log_metrics(round_idx, round_elapsed)
 
         return self
 
@@ -515,6 +583,12 @@ class PackBoost:
             for tr in self._trees:
                 pred += self._tree_weight * tr.predict_bins(bins)
         return pred.cpu().numpy()
+
+    @property
+    def round_metrics(self) -> Sequence[dict[str, float]]:
+        """Per-round metrics recorded during the most recent ``fit`` call."""
+
+        return self._round_metrics
 
     def predict_packwise(self, X: np.ndarray, block_size_trees: int = 800 // 8) -> np.ndarray:
         if block_size_trees <= 0:
@@ -646,6 +720,28 @@ class PackBoost:
         mask = denom > 0
         out[mask] = accum[mask] / denom[mask]
         return out
+
+    @staticmethod
+    def _era_correlation_np(era_ids: np.ndarray, target: np.ndarray, preds: np.ndarray) -> float:
+        if era_ids.shape[0] == 0:
+            return float("nan")
+        unique_eras = np.unique(era_ids)
+        cors: list[float] = []
+        for era in unique_eras:
+            mask = era_ids == era
+            y = target[mask]
+            p = preds[mask]
+            if y.size < 2:
+                continue
+            std_y = y.std(ddof=0)
+            std_p = p.std(ddof=0)
+            if std_y <= 1e-12 or std_p <= 1e-12:
+                continue
+            cov = float(((y - y.mean()) * (p - p.mean())).mean())
+            corr = cov / (std_y * std_p)
+            if math.isfinite(corr):
+                cors.append(corr)
+        return float(np.mean(cors)) if cors else float("nan")
 
     # --- Histogram builders (Torch) ---
 

@@ -91,6 +91,7 @@ $v\_{L/R}=-,\frac{G\_{L/R}}{H\_{L/R}+\lambda}$
 4. **Partition.** Stable segmented scatters produce child shards per (node, era). No host sync on GPU within a depth.
 
 > **DES-off shorthand.** Passing `era_ids=None` to `PackBoost.fit` now collapses the round to a single synthetic era while keeping the frontier batching and instrumentation intact—handy for ablation runs or Hull's DES-off mode.
+> **Per-round telemetry.** Optional `eval_sets` plus `round_callback` let `PackBoost.fit` emit per-round correlation metrics (train + named eval splits) and trees-per-second timing, which are persisted on the estimator via `round_metrics` for downstream notebooks.
 
 ---
 
@@ -573,6 +574,7 @@ find_best_splits_batched_cpu(
   - DES directional term now matches the CUDA `directional_split_kernel`: per-era direction = `sign(left_value - right_value)` with weighted averaging, eliminating the old parent-direction heuristic.
   - First CUDA fused frontier (warp-per-(node,feature)) implemented via `find_best_splits_batched_cuda`; shared-memory histograms with streaming K-cut selection feed a host-side tie-break so Torch and native paths stay isomorphic.
   - `examples/hull_benchmark.py` tightened preprocessing (explicit DES-off path, optional prebinned flag, no-leak era masks) to document the M1/M2 training flow.
+  - `PackBoost.fit` gains `eval_sets`/`round_callback` hooks so notebooks can stream per-round train/validation correlations and trees-per-second, exposed via `booster.round_metrics`.
 
 - 2025-09-21 — M1.1: Subtract-First Frontier + Packed Prediction
   - Refactored `_find_best_splits_batched`:
