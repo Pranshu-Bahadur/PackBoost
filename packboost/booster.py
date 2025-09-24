@@ -392,7 +392,7 @@ class PackBoost:
                         X_eval_bins = apply_bins(X_eval_np, self._binner.bin_edges, self.config.max_bins)
                     else:
                         X_eval_bins = X_eval_np.astype(np.int8, copy=False)
-                    bins_eval = torch.from_numpy(X_eval_bins).to(self._device, dtype=torch.int32)
+                    bins_eval = torch.from_numpy(X_eval_bins).to(self._device, dtype=torch.int8)
                     y_eval_np = np.asarray(y_eval, dtype=np.float32)
                     y_eval_tensor = torch.from_numpy(y_eval_np).to(self._device)
                     if era_eval is None:
@@ -410,8 +410,6 @@ class PackBoost:
                             "preds": torch.zeros_like(y_eval_tensor),
                         }
                     )
-
-            eval_round_metrics = bool(eval_states)
 
             def log_metrics(round_idx: int, round_time: float) -> None:
                 preds_np = preds.cpu().numpy()
@@ -532,8 +530,7 @@ class PackBoost:
 
                 # Pack prediction and averaging (lr / B)
                 pack_sum = torch.zeros_like(preds)
-                for state in eval_states:
-                    state["pack_sum"] = torch.zeros_like(state["preds"])  # type: ignore[index]
+                per_tree_w = float(self.config.learning_rate) / float(self.config.pack_size)
                 for t_id, tb in enumerate(pack_builders):
                     tr = tb.build()
                     self._trees.append(tr)
@@ -553,14 +550,9 @@ class PackBoost:
                         pack_sum.index_add_(0, rows_all, contrib)
                     for state in eval_states:
                         bins_eval: torch.Tensor = state["bins"]  # type: ignore[assignment]
-                        state_pack_sum: torch.Tensor = state["pack_sum"]  # type: ignore[assignment]
-                        state_pack_sum += tr.predict_bins(bins_eval)
-                per_tree_w = float(self.config.learning_rate) / float(self.config.pack_size)
+                        preds_eval: torch.Tensor = state["preds"]  # type: ignore[assignment]
+                        preds_eval.add_(per_tree_w * tr.predict_bins(bins_eval))
                 preds += per_tree_w * pack_sum
-                for state in eval_states:
-                    state_pack_sum: torch.Tensor = state["pack_sum"]  # type: ignore[assignment]
-                    preds_eval: torch.Tensor = state["preds"]  # type: ignore[assignment]
-                    preds_eval.add_(per_tree_w * state_pack_sum)
                 self._tree_weight = per_tree_w
                 self._trained_pack_size = int(self.config.pack_size)
 
