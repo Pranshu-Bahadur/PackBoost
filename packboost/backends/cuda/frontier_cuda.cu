@@ -69,6 +69,7 @@ __global__ void cuda_find_best_splits_kernel(
     float lambda_l2,
     float lambda_dro,
     float direction_weight,
+    int rows_total,
     float* __restrict__ out_scores,            // [num_nodes * num_features]
     int32_t* __restrict__ out_thresholds,      // [num_nodes * num_features]
     float* __restrict__ out_left_grad,         // [num_nodes * num_features]
@@ -103,8 +104,8 @@ __global__ void cuda_find_best_splits_kernel(
     if (row_start < 0) {
         row_start = 0;
     }
-    if (row_end > rows_total) {
-        row_end = rows_total;
+        if (row_end > rows_total) {
+            row_end = rows_total;
     }
     if (row_start > row_end) {
         row_start = row_end;
@@ -581,6 +582,7 @@ py::dict find_best_splits_batched_cuda(
         lambda_l2,
         lambda_dro,
         direction_weight,
+        static_cast<int>(rows_total),
         reinterpret_cast<float*>(scores_ptr_val),
         reinterpret_cast<int32_t*>(thresholds_ptr_val),
         reinterpret_cast<float*>(left_grad_ptr_val),
