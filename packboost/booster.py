@@ -1437,7 +1437,24 @@ class PackBoost:
         if self._use_native_cpu:
             return self._find_best_splits_batched_native(nodes, grad, hess, bins, feature_subset)
         if self._use_native_cuda:
-            return self._find_best_splits_batched_cuda(nodes, grad, hess, bins, feature_subset)
+            try:
+                return self._find_best_splits_batched_cuda(nodes, grad, hess, bins, feature_subset)
+            except RuntimeError as exc:
+                msg = str(exc)
+                if "CUDA error" in msg:
+                    self._logger.warning(
+                        "CUDA frontier failed (%s); falling back to Torch implementation.",
+                        msg,
+                    )
+                    if torch.cuda.is_available():
+                        try:
+                            torch.cuda.synchronize()
+                        except RuntimeError:
+                            pass
+                    self._use_native_cuda = False
+                    self._cuda_backend = None
+                else:
+                    raise
 
         stats = DepthInstrumentation()
         M = len(nodes)
