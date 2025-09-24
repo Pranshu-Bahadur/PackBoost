@@ -1,3 +1,4 @@
+// frontier_cuda.cu
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -24,7 +25,10 @@ namespace {
     } while (0)
 
 constexpr int WARP_SIZE = 32;
-constexpr int MAX_BINS = 128;
+constexpr int MAX_BINS  = 128;
+constexpr int THREADS   = 128;                  // 4 warps per block
+constexpr int WARPS     = THREADS / WARP_SIZE;
+
 __device__ constexpr float NEG_INF = -1.0e30f;
 
 __host__ __device__ inline int max_int(int a, int b) { return a > b ? a : b; }
@@ -33,440 +37,470 @@ __host__ __device__ inline int clamp_int(int v, int low, int high) {
     return v < low ? low : (v > high ? high : v);
 }
 
-__device__ inline float warp_reduce_sum(float value) {
-    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        value += __shfl_down_sync(0xffffffff, value, offset);
-    }
-    return value;
+__device__ inline float warp_reduce_sum(float v) {
+    for (int offs = WARP_SIZE / 2; offs > 0; offs >>= 1) v += __shfl_down_sync(0xffffffff, v, offs);
+    return v;
+}
+__device__ inline int warp_reduce_sum_int(int v) {
+    for (int offs = WARP_SIZE / 2; offs > 0; offs >>= 1) v += __shfl_down_sync(0xffffffff, v, offs);
+    return v;
 }
 
-__device__ inline int warp_reduce_sum_int(int value) {
-    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        value += __shfl_down_sync(0xffffffff, value, offset);
+// Block-wide Kogge–Stone inclusive scan for <= MAX_BINS elements in shared memory
+__device__ inline void block_scan_prefix_int(float* g, float* h, int* c, int n) {
+    // in-place: after call g[b],h[b],c[b] are prefix sums up to b
+    for (int offset = 1; offset < n; offset <<= 1) {
+        __syncthreads();
+        int b = threadIdx.x;
+        if (b < n) {
+            float g_prev = (b >= offset) ? g[b - offset] : 0.0f;
+            float h_prev = (b >= offset) ? h[b - offset] : 0.0f;
+            int   c_prev = (b >= offset) ? c[b - offset] : 0;
+            __syncthreads();
+            g[b] += g_prev;
+            h[b] += h_prev;
+            c[b] += c_prev;
+        }
     }
-    return value;
+    __syncthreads();
 }
 
 __global__ void cuda_find_best_splits_kernel(
-    const int8_t* __restrict__ bins,           // [rows_total, bins_stride]
-    int bins_stride,
-    const float* __restrict__ grad,            // [rows_total]
-    const float* __restrict__ hess,            // [rows_total]
-    const int32_t* __restrict__ row_indices,   // [rows_total]
-    const int32_t* __restrict__ node_row_splits,   // [num_nodes + 1]
-    const int32_t* __restrict__ node_era_splits,   // [num_nodes * (num_eras + 1)]
-    const float* __restrict__ era_weights,         // [num_nodes * num_eras]
-    const float* __restrict__ total_grad_nodes,    // [num_nodes]
-    const float* __restrict__ total_hess_nodes,    // [num_nodes]
-    const int64_t* __restrict__ total_count_nodes, // [num_nodes]
-    const int32_t* __restrict__ feature_ids,       // [num_features]
+    // bins is FEATURE-MAJOR: [num_features, rows_dataset]
+    const int8_t* __restrict__ bins_fmajor,
+    int rows_dataset,                               // equals bins.shape[0] before transpose
+    const float* __restrict__ grad,                 // [rows_total_compact]
+    const float* __restrict__ hess,                 // [rows_total_compact]
+    const int32_t* __restrict__ rows_index,         // [rows_total_compact] -> original row ids
+    const int32_t* __restrict__ node_row_splits,    // [num_nodes + 1] (offsets into rows_index/grad/hess)
+    const int32_t* __restrict__ node_era_splits,    // [num_nodes * (num_eras + 1)] (same indexing space)
+    const float*   __restrict__ era_weights,        // [num_nodes * num_eras]
+    const float*   __restrict__ total_grad_nodes,   // [num_nodes]
+    const float*   __restrict__ total_hess_nodes,   // [num_nodes]
+    const int64_t* __restrict__ total_count_nodes,  // [num_nodes]
+    const int32_t* __restrict__ feature_ids,        // [num_features]
     int num_nodes,
     int num_features,
     int num_bins,
     int num_eras,
     int k_cuts,
-    int cut_mode,  // 0 = even, 1 = mass
+    int cut_mode,                                   // 0 even, 1 mass
     int min_samples_leaf,
     float lambda_l2,
     float lambda_dro,
     float direction_weight,
-    int rows_total,
-    float* __restrict__ out_scores,            // [num_nodes * num_features]
-    int32_t* __restrict__ out_thresholds,      // [num_nodes * num_features]
-    float* __restrict__ out_left_grad,         // [num_nodes * num_features]
-    float* __restrict__ out_left_hess,         // [num_nodes * num_features]
-    int64_t* __restrict__ out_left_count       // [num_nodes * num_features]
+    int rows_total_compact,                         // len(rows_index), also len(grad/hess)
+    // outputs
+    float*   __restrict__ out_scores,               // [num_nodes * num_features]
+    int32_t* __restrict__ out_thresholds,           // [num_nodes * num_features]
+    float*   __restrict__ out_left_grad,            // [num_nodes * num_features]
+    float*   __restrict__ out_left_hess,            // [num_nodes * num_features]
+    int64_t* __restrict__ out_left_count            // [num_nodes * num_features]
 ) {
-    int node_id = blockIdx.y;
-    int feature_offset = blockIdx.x;
-    int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int node_id      = blockIdx.y;
+    const int feature_off  = blockIdx.x;
+    const int lane         = threadIdx.x & (WARP_SIZE - 1);
+    const int warp_id      = threadIdx.x / WARP_SIZE;
 
-    if (node_id >= num_nodes || feature_offset >= num_features) {
-        return;
-    }
+    if (node_id >= num_nodes || feature_off >= num_features) return;
 
-    int feature_id = feature_ids[feature_offset];
-    int out_index = node_id * num_features + feature_offset;
+    const int feature_id   = feature_ids[feature_off];
+    const int out_index    = node_id * num_features + feature_off;
 
-    if (num_bins <= 1) {
-        if (lane == 0) {
-            out_scores[out_index] = NEG_INF;
+    if (feature_id < 0 || feature_id >= num_features || num_bins <= 1) {
+        if (threadIdx.x == 0) {
+            out_scores[out_index]     = NEG_INF;
             out_thresholds[out_index] = -1;
-            out_left_grad[out_index] = 0.0f;
-            out_left_hess[out_index] = 0.0f;
+            out_left_grad[out_index]  = 0.f;
+            out_left_hess[out_index]  = 0.f;
             out_left_count[out_index] = 0;
         }
         return;
     }
 
     const int32_t* era_offsets = node_era_splits + node_id * (num_eras + 1);
+
     int row_start = node_row_splits[node_id];
-    int row_end = node_row_splits[node_id + 1];
-    if (row_start < 0) {
-        row_start = 0;
-    }
-    if (row_end > rows_total) {
-        row_end = rows_total;
-    }
-    if (row_start > row_end) {
-        row_start = row_end;
-    }
-
-    if (feature_id < 0 || feature_id >= bins_stride) {
-        if (lane == 0) {
-            out_scores[out_index] = NEG_INF;
+    int row_end   = node_row_splits[node_id + 1];
+    row_start     = max_int(0, row_start);
+    row_end       = min_int(rows_total_compact, row_end);
+    if (row_start >= row_end) {
+        if (threadIdx.x == 0) {
+            out_scores[out_index]     = NEG_INF;
             out_thresholds[out_index] = -1;
-            out_left_grad[out_index] = 0.0f;
-            out_left_hess[out_index] = 0.0f;
+            out_left_grad[out_index]  = 0.f;
+            out_left_hess[out_index]  = 0.f;
             out_left_count[out_index] = 0;
         }
         return;
     }
 
-    int node_total_rows = row_end - row_start;
-
+    const int node_total_rows = row_end - row_start;
     if (node_total_rows < 2 * min_samples_leaf) {
-        if (lane == 0) {
-            out_scores[out_index] = NEG_INF;
+        if (threadIdx.x == 0) {
+            out_scores[out_index]     = NEG_INF;
             out_thresholds[out_index] = -1;
-            out_left_grad[out_index] = 0.0f;
-            out_left_hess[out_index] = 0.0f;
+            out_left_grad[out_index]  = 0.f;
+            out_left_hess[out_index]  = 0.f;
             out_left_count[out_index] = 0;
         }
         return;
     }
 
+    // ---- Shared memory layout -------------------------------------------------
     extern __shared__ unsigned char shared_raw[];
     unsigned char* cursor = shared_raw;
+
+    // Per-warp private histograms (reduce later): [WARPS][num_bins]
+    int32_t* cnt_w = reinterpret_cast<int32_t*>(cursor);
+    cursor += WARPS * num_bins * sizeof(int32_t);
+    float* grd_w = reinterpret_cast<float*>(cursor);
+    cursor += WARPS * num_bins * sizeof(float);
+    float* hss_w = reinterpret_cast<float*>(cursor);
+    cursor += WARPS * num_bins * sizeof(float);
+
+    // Reduced per-era histogram for the block
     int32_t* count_bins = reinterpret_cast<int32_t*>(cursor);
-    cursor += sizeof(int32_t) * num_bins;
-    float* grad_bins = reinterpret_cast<float*>(cursor);
-    cursor += sizeof(float) * num_bins;
-    float* hess_bins = reinterpret_cast<float*>(cursor);
-    cursor += sizeof(float) * num_bins;
-    float* mean_arr = reinterpret_cast<float*>(cursor);
-    cursor += sizeof(float) * num_bins;
-    float* M2_arr = reinterpret_cast<float*>(cursor);
-    cursor += sizeof(float) * num_bins;
-    float* weight_arr = reinterpret_cast<float*>(cursor);
-    cursor += sizeof(float) * num_bins;
-    float* dir_arr = reinterpret_cast<float*>(cursor);
-    cursor += sizeof(float) * num_bins;
-    float* left_grad_arr = reinterpret_cast<float*>(cursor);
-    cursor += sizeof(float) * num_bins;
-    float* left_hess_arr = reinterpret_cast<float*>(cursor);
-    cursor += sizeof(float) * num_bins;
+    cursor += num_bins * sizeof(int32_t);
+    float*   grad_bins = reinterpret_cast<float*>(cursor);
+    cursor += num_bins * sizeof(float);
+    float*   hess_bins = reinterpret_cast<float*>(cursor);
+    cursor += num_bins * sizeof(float);
+
+    // Total (across eras) histogram for mass-cut selection
+    int32_t* count_total = reinterpret_cast<int32_t*>(cursor);
+    cursor += num_bins * sizeof(int32_t);
+
+    // Threshold list (<= MAX_BINS-1, but we size to num_bins for simplicity)
+    int32_t* thresholds_sh = reinterpret_cast<int32_t*>(cursor);
+    cursor += num_bins * sizeof(int32_t);
+
+    // Per-threshold accumulators (DES/Welford)
+    float* mean_arr       = reinterpret_cast<float*>(cursor); cursor += num_bins * sizeof(float);
+    float* M2_arr         = reinterpret_cast<float*>(cursor); cursor += num_bins * sizeof(float);
+    float* weight_arr     = reinterpret_cast<float*>(cursor); cursor += num_bins * sizeof(float);
+    float* dir_arr        = reinterpret_cast<float*>(cursor); cursor += num_bins * sizeof(float);
+    float* left_grad_arr  = reinterpret_cast<float*>(cursor); cursor += num_bins * sizeof(float);
+    float* left_hess_arr  = reinterpret_cast<float*>(cursor); cursor += num_bins * sizeof(float);
+
+    // align to 8 for int64
     uintptr_t aligned_ptr = (reinterpret_cast<uintptr_t>(cursor) + alignof(int64_t) - 1) & ~(alignof(int64_t) - 1);
     int64_t* left_count_arr = reinterpret_cast<int64_t*>(aligned_ptr);
     cursor = reinterpret_cast<unsigned char*>(left_count_arr + num_bins);
+    // ---------------------------------------------------------------------------
 
-    int num_thresholds_full = max_int(num_bins - 1, 1);
-
+    const int full_thresholds = max_int(num_bins - 1, 1);
     int num_eval = 0;
-    int thresholds_local[MAX_BINS];
 
-    if (lane == 0) {
-        if (k_cuts <= 0 || k_cuts >= num_thresholds_full) {
-            num_eval = num_thresholds_full;
-            for (int t = 0; t < num_eval; ++t) {
-                thresholds_local[t] = t;
-            }
-        } else if (cut_mode == 0) {  // even
-            num_eval = k_cuts;
-            if (k_cuts == 1) {
-                thresholds_local[0] = 0;
-            } else {
-                double step = static_cast<double>(num_thresholds_full - 1) / static_cast<double>(k_cuts - 1);
-                for (int t = 0; t < k_cuts; ++t) {
-                    double raw = step * static_cast<double>(t);
-                    int thr = static_cast<int>(raw + 0.5);
-                    thr = clamp_int(thr, 0, num_thresholds_full - 1);
-                    thresholds_local[t] = thr;
-                }
-            }
-        }
+    // Zero per-threshold accumulators
+    for (int i = threadIdx.x; i < num_bins; i += blockDim.x) {
+        mean_arr[i]      = 0.f;
+        M2_arr[i]        = 0.f;
+        weight_arr[i]    = 0.f;
+        dir_arr[i]       = 0.f;
+        left_grad_arr[i] = 0.f;
+        left_hess_arr[i] = 0.f;
+        left_count_arr[i]= 0;
     }
-    __syncwarp();
-    num_eval = __shfl_sync(0xffffffff, num_eval, 0);
+    // Zero the all-era total counts (for mass)
+    for (int i = threadIdx.x; i < num_bins; i += blockDim.x) count_total[i] = 0;
+    __syncthreads();
 
-    if (k_cuts > 0 && k_cuts < num_thresholds_full && cut_mode == 1) {
-        for (int idx = threadIdx.x; idx < num_bins; idx += blockDim.x) {
-            count_bins[idx] = 0;
+    // ------------------ Prepass (counts only) for mass cuts -------------------
+    // Build total histogram across ALL eras once (cheap, no grad/hess accumulation)
+    // Using per-warp private histograms in shared memory to reduce contention.
+    // This eliminates the separate "mass" pass in the original code.
+    if (k_cuts > 0 && k_cuts < full_thresholds && cut_mode == 1) {
+        // zero per-warp privates
+        for (int b = lane; b < num_bins; b += WARP_SIZE) {
+            cnt_w[warp_id * num_bins + b] = 0;
         }
-        __syncwarp();
+        __syncthreads();
 
-        for (int row = row_start + threadIdx.x; row < row_end; row += blockDim.x) {
-            int data_row = row_indices[row];
-            int bin = static_cast<int>(static_cast<unsigned char>(bins[data_row * bins_stride + feature_id]));
+        // iterate rows belonging to this node (across all eras)
+        for (int r = row_start + threadIdx.x; r < row_end; r += blockDim.x) {
+            const int32_t ridx = rows_index[r];
+            // 64-bit index into feature-major bins
+            const long long off = (long long)feature_id * (long long)rows_dataset + (long long)ridx;
+            const int bin = int((unsigned char)bins_fmajor[off]);
             if (bin >= 0 && bin < num_bins) {
-                atomicAdd(&count_bins[bin], 1);
+                atomicAdd(&cnt_w[warp_id * num_bins + bin], 1);
             }
         }
-        __syncwarp();
+        __syncthreads();
 
-        if (lane == 0) {
-            num_eval = 0;
-            int total = 0;
-            for (int b = 0; b < num_bins; ++b) {
-                total += count_bins[b];
-            }
-            if (total <= 0) {
-                if (k_cuts == 1) {
-                    thresholds_local[0] = 0;
-                    num_eval = 1;
-                } else {
-                    num_eval = k_cuts;
-                    double step = static_cast<double>(num_thresholds_full - 1) / static_cast<double>(k_cuts - 1);
-                    for (int t = 0; t < k_cuts; ++t) {
-                        double raw = step * static_cast<double>(t);
-                        int thr = static_cast<int>(raw + 0.5);
-                        thr = clamp_int(thr, 0, num_thresholds_full - 1);
-                        thresholds_local[t] = thr;
-                    }
-                }
+        // reduce warps -> count_total
+        for (int b = threadIdx.x; b < num_bins; b += blockDim.x) {
+            int sum = 0;
+            #pragma unroll
+            for (int w = 0; w < WARPS; ++w) sum += cnt_w[w * num_bins + b];
+            count_total[b] = sum;
+        }
+        __syncthreads();
+
+        // choose thresholds by mass on count_total (single thread OK)
+        if (threadIdx.x == 0) {
+            int K = k_cuts;
+            if (K <= 0 || K >= full_thresholds) {
+                num_eval = full_thresholds;
+                for (int t = 0; t < num_eval; ++t) thresholds_sh[t] = t;
             } else {
-                double upper = static_cast<double>(total) * (1.0 - 1e-12);
-                int cand_count = 0;
-                for (int i = 0; i < k_cuts; ++i) {
-                    double alpha = (k_cuts == 1) ? 0.0 : static_cast<double>(i) / static_cast<double>(k_cuts - 1);
-                    double target = upper * alpha;
-                    int64_t running = 0;
-                    int selected = 0;
-                    for (int b = 0; b < num_bins; ++b) {
-                        running += count_bins[b];
-                        if (running >= target) {
-                            selected = b;
-                            break;
+                long long total = 0;
+                for (int b = 0; b < num_bins; ++b) total += (long long)count_total[b];
+
+                if (total <= 0) {
+                    // fallback to even
+                    if (K == 1) {
+                        num_eval = 1; thresholds_sh[0] = 0;
+                    } else {
+                        num_eval = K;
+                        double step = double(full_thresholds - 1) / double(K - 1);
+                        for (int t = 0; t < K; ++t) {
+                            int thr = int(std::round(step * t));
+                            thresholds_sh[t] = clamp_int(thr, 0, full_thresholds - 1);
                         }
                     }
-                    int thr = clamp_int(selected - 1, 0, num_thresholds_full - 1);
-                    thresholds_local[cand_count++] = thr;
-                }
-                // sort and deduplicate
-                for (int i = 1; i < cand_count; ++i) {
-                    int key = thresholds_local[i];
-                    int j = i - 1;
-                    while (j >= 0 && thresholds_local[j] > key) {
-                        thresholds_local[j + 1] = thresholds_local[j];
-                        --j;
+                } else {
+                    // CDF scan
+                    // We have count_total only here; compute K quantiles in bin space
+                    int cand = 0;
+                    num_eval = K;
+                    for (int i = 0; i < K; ++i) {
+                        double alpha  = (K == 1) ? 0.0 : double(i) / double(K - 1);
+                        double target = (double)total * (1.0 - 1e-12) * alpha;
+                        long long run = 0;
+                        int selected = 0;
+                        for (int b = 0; b < num_bins; ++b) { run += (long long)count_total[b]; if (run >= target) { selected = b; break; } }
+                        int thr = clamp_int(selected - 1, 0, full_thresholds - 1);
+                        thresholds_sh[cand++] = thr;
                     }
-                    thresholds_local[j + 1] = key;
-                }
-                int unique_count = 0;
-                for (int i = 0; i < cand_count; ++i) {
-                    if (i == 0 || thresholds_local[i] != thresholds_local[i - 1]) {
-                        thresholds_local[unique_count++] = thresholds_local[i];
+                    // sort & unique
+                    for (int i = 1; i < cand; ++i) {
+                        int key = thresholds_sh[i]; int j = i - 1;
+                        while (j >= 0 && thresholds_sh[j] > key) { thresholds_sh[j + 1] = thresholds_sh[j]; --j; }
+                        thresholds_sh[j + 1] = key;
                     }
+                    int uniq = 0;
+                    for (int i = 0; i < cand; ++i) if (i == 0 || thresholds_sh[i] != thresholds_sh[i - 1]) thresholds_sh[uniq++] = thresholds_sh[i];
+                    while (uniq < K) { thresholds_sh[uniq] = thresholds_sh[uniq - 1]; ++uniq; }
+                    num_eval = min_int(uniq, K);
                 }
-                while (unique_count < k_cuts) {
-                    thresholds_local[unique_count] = thresholds_local[unique_count - 1];
-                    ++unique_count;
-                }
-                num_eval = min_int(unique_count, k_cuts);
             }
         }
-        __syncwarp();
+        __syncthreads();
+        num_eval = __shfl_sync(0xffffffff, num_eval, 0);
+    } else {
+        // even / full sweep
+        if (threadIdx.x == 0) {
+            if (k_cuts <= 0 || k_cuts >= full_thresholds) {
+                num_eval = full_thresholds;
+                for (int t = 0; t < num_eval; ++t) thresholds_sh[t] = t;
+            } else {
+                num_eval = k_cuts;
+                if (k_cuts == 1) {
+                    thresholds_sh[0] = 0;
+                } else {
+                    double step = double(full_thresholds - 1) / double(k_cuts - 1);
+                    for (int t = 0; t < k_cuts; ++t) {
+                        int thr = int(std::round(step * t));
+                        thresholds_sh[t] = clamp_int(thr, 0, full_thresholds - 1);
+                    }
+                }
+            }
+        }
+        __syncthreads();
         num_eval = __shfl_sync(0xffffffff, num_eval, 0);
     }
 
-    if (lane == 0 && num_eval == 0) {
-        num_eval = min_int(num_thresholds_full, MAX_BINS);
-        for (int t = 0; t < num_eval; ++t) {
-            thresholds_local[t] = t;
+    num_eval = min_int(num_eval, MAX_BINS - 1);  // conservative cap
+    if (num_eval <= 0) {
+        if (threadIdx.x == 0) {
+            out_scores[out_index]     = NEG_INF;
+            out_thresholds[out_index] = -1;
+            out_left_grad[out_index]  = 0.f;
+            out_left_hess[out_index]  = 0.f;
+            out_left_count[out_index] = 0;
         }
+        return;
     }
-    __syncwarp();
-    num_eval = __shfl_sync(0xffffffff, num_eval, 0);
-    num_eval = min_int(num_eval, MAX_BINS);
 
-    for (int idx = threadIdx.x; idx < num_eval; idx += blockDim.x) {
-        mean_arr[idx] = 0.0f;
-        M2_arr[idx] = 0.0f;
-        weight_arr[idx] = 0.0f;
-        dir_arr[idx] = 0.0f;
-        left_grad_arr[idx] = 0.0f;
-        left_hess_arr[idx] = 0.0f;
-        left_count_arr[idx] = 0;
-    }
-    __syncwarp();
-
+    // ----------------------- Main per-era loop (DES) ---------------------------
     for (int era = 0; era < num_eras; ++era) {
-        int start = era_offsets[era];
-        int end = era_offsets[era + 1];
-        start = max_int(start, row_start);
-        end = min_int(end, row_end);
-        if (start >= end) {
-            continue;
-        }
+        int e_s = max_int(era_offsets[era], row_start);
+        int e_e = min_int(era_offsets[era + 1], row_end);
+        if (e_s >= e_e) continue;
 
-        for (int b = threadIdx.x; b < num_bins; b += blockDim.x) {
-            count_bins[b] = 0;
-            grad_bins[b] = 0.0f;
-            hess_bins[b] = 0.0f;
+        // zero per-warp private hists
+        for (int b = lane; b < num_bins; b += WARP_SIZE) {
+            cnt_w[warp_id * num_bins + b] = 0;
+            grd_w[warp_id * num_bins + b] = 0.f;
+            hss_w[warp_id * num_bins + b] = 0.f;
         }
-        __syncwarp();
+        __syncthreads();
 
-        for (int row = start + threadIdx.x; row < end; row += blockDim.x) {
-            if (row < row_start || row >= row_end) {
-                continue;
-            }
-            int data_row = row_indices[row];
-            int bin = static_cast<int>(static_cast<unsigned char>(bins[data_row * bins_stride + feature_id]));
-            float g = grad[row];
-            float h = hess[row];
+        // build per-warp histograms
+        for (int r = e_s + threadIdx.x; r < e_e; r += blockDim.x) {
+            const int32_t ridx = rows_index[r];
+            const long long off = (long long)feature_id * (long long)rows_dataset + (long long)ridx; // 64-bit safe
+            const int bin = int((unsigned char)bins_fmajor[off]);
             if (bin >= 0 && bin < num_bins) {
-                atomicAdd(&count_bins[bin], 1);
-                atomicAdd(&grad_bins[bin], g);
-                atomicAdd(&hess_bins[bin], h);
+                const float g = grad[r];
+                const float h = hess[r];
+                atomicAdd(&cnt_w[warp_id * num_bins + bin], 1);
+                atomicAdd(&grd_w[warp_id * num_bins + bin], g);
+                atomicAdd(&hss_w[warp_id * num_bins + bin], h);
             }
         }
-        __syncwarp();
+        __syncthreads();
 
-        float total_grad_e = 0.0f;
-        float total_hess_e = 0.0f;
-        int total_count_e = 0;
+        // reduce across warps into count_bins/grad_bins/hess_bins
         for (int b = threadIdx.x; b < num_bins; b += blockDim.x) {
-            total_grad_e += grad_bins[b];
-            total_hess_e += hess_bins[b];
+            int   c = 0; float g = 0.f, hh = 0.f;
+            #pragma unroll
+            for (int w = 0; w < WARPS; ++w) {
+                c  += cnt_w[w * num_bins + b];
+                g  += grd_w[w * num_bins + b];
+                hh += hss_w[w * num_bins + b];
+            }
+            count_bins[b] = c;
+            grad_bins[b]  = g;
+            hess_bins[b]  = hh;
+        }
+        __syncthreads();
+
+        // totals for this era
+        float total_grad_e = 0.f, total_hess_e = 0.f; int total_count_e = 0;
+        for (int b = threadIdx.x; b < num_bins; b += blockDim.x) {
+            total_grad_e  += grad_bins[b];
+            total_hess_e  += hess_bins[b];
             total_count_e += count_bins[b];
         }
-        total_grad_e = warp_reduce_sum(total_grad_e);
-        total_hess_e = warp_reduce_sum(total_hess_e);
+        total_grad_e  = warp_reduce_sum(total_grad_e);
+        total_hess_e  = warp_reduce_sum(total_hess_e);
         total_count_e = warp_reduce_sum_int(total_count_e);
 
-        float era_weight = 0.0f;
-        if (lane == 0) {
-            era_weight = era_weights[node_id * num_eras + era];
-        }
+        float era_weight = 0.f;
+        if (lane == 0) era_weight = era_weights[node_id * num_eras + era];
         era_weight = __shfl_sync(0xffffffff, era_weight, 0);
 
-        float parent_gain = 0.0f;
-        if (lane == 0) {
-            parent_gain = 0.5f * (total_grad_e * total_grad_e) / (total_hess_e + lambda_l2);
-        }
+        float parent_gain = 0.f;
+        if (lane == 0) parent_gain = 0.5f * (total_grad_e * total_grad_e) / (total_hess_e + lambda_l2);
         parent_gain = __shfl_sync(0xffffffff, parent_gain, 0);
 
-        if (lane == 0) {
-            int idx_thr = 0;
-            int left_count_running = 0;
-            float left_grad_running = 0.0f;
-            float left_hess_running = 0.0f;
+        // prefix scan over bins => left stats at every bin edge b
+        // after scan, *_bins[b] = sum_{k<=b} *_bins[k]
+        block_scan_prefix_int(grad_bins, hess_bins, count_bins, num_bins - 1); // we don't need last bin for thresholds
 
-            for (int b = 0; b < num_bins - 1 && idx_thr < num_eval; ++b) {
-                left_count_running += count_bins[b];
-                left_grad_running += grad_bins[b];
-                left_hess_running += hess_bins[b];
+        // one thread per threshold updates Welford accumulators
+        if (threadIdx.x < num_eval) {
+            const int thr = thresholds_sh[threadIdx.x];
+            if (thr >= 0 && thr < (num_bins - 1) && era_weight > 0.f) {
+                const int   left_count = count_bins[thr];
+                const float left_grad  = grad_bins[thr];
+                const float left_hess  = hess_bins[thr];
 
-                while (idx_thr < num_eval && thresholds_local[idx_thr] == b) {
-                    int left_count = left_count_running;
-                    int right_count = total_count_e - left_count;
-                    if (left_count > 0 && right_count > 0 && era_weight > 0.0f) {
-                        float left_grad = left_grad_running;
-                        float right_grad = total_grad_e - left_grad;
-                        float left_hess = left_hess_running;
-                        float right_hess = total_hess_e - left_hess;
-                        float denom_L = left_hess + lambda_l2;
-                        float denom_R = right_hess + lambda_l2;
-                        float gain = 0.5f * ((left_grad * left_grad) / denom_L + (right_grad * right_grad) / denom_R) - parent_gain;
+                const int   right_count = total_count_e - left_count;
+                if (left_count > 0 && right_count > 0) {
+                    const float right_grad = total_grad_e - left_grad;
+                    const float right_hess = total_hess_e - left_hess;
 
-                        float delta = gain - mean_arr[idx_thr];
-                        float new_weight = weight_arr[idx_thr] + era_weight;
-                        float mean_new = mean_arr[idx_thr] + (era_weight / new_weight) * delta;
-                        float delta2 = gain - mean_new;
-                        M2_arr[idx_thr] += era_weight * delta * delta2;
-                        mean_arr[idx_thr] = mean_new;
-                        weight_arr[idx_thr] = new_weight;
-                        left_grad_arr[idx_thr] += left_grad;
-                        left_hess_arr[idx_thr] += left_hess;
-                        left_count_arr[idx_thr] += static_cast<int64_t>(left_count);
-                        if (direction_weight != 0.0f) {
-                            float left_val = -left_grad / denom_L;
-                            float right_val = -right_grad / denom_R;
-                            dir_arr[idx_thr] += era_weight * ((left_val > right_val) ? 1.0f : -1.0f);
-                        }
+                    const float denomL = left_hess  + lambda_l2;
+                    const float denomR = right_hess + lambda_l2;
+                    const float gain   = 0.5f * ((left_grad*left_grad)/denomL + (right_grad*right_grad)/denomR) - parent_gain;
+
+                    // Welford
+                    const float delta = gain - mean_arr[threadIdx.x];
+                    const float new_w = weight_arr[threadIdx.x] + era_weight;
+                    const float mean2 = mean_arr[threadIdx.x] + (era_weight / new_w) * delta;
+                    const float delta2= gain - mean2;
+
+                    M2_arr       [threadIdx.x] += era_weight * delta * delta2;
+                    mean_arr     [threadIdx.x]  = mean2;
+                    weight_arr   [threadIdx.x]  = new_w;
+
+                    left_grad_arr[threadIdx.x] += left_grad;
+                    left_hess_arr[threadIdx.x] += left_hess;
+                    left_count_arr[threadIdx.x] += (int64_t)left_count;
+
+                    if (direction_weight != 0.f) {
+                        const float left_val  = -left_grad  / denomL;
+                        const float right_val = -right_grad / denomR;
+                        dir_arr[threadIdx.x] += era_weight * ((left_val > right_val) ? 1.f : -1.f);
                     }
-                    ++idx_thr;
                 }
             }
         }
-        __syncwarp();
-    }
+        __syncthreads();
+    } // eras
 
-    if (lane == 0) {
-        float best_score = NEG_INF;
-            int best_threshold = -1;
-            float best_left_grad = 0.0f;
-            float best_left_hess = 0.0f;
-            int64_t best_left_count = 0;
+    // -------------------------- Select best within feature ---------------------
+    if (threadIdx.x == 0) {
+        float best_score      = NEG_INF;
+        int   best_threshold  = -1;
+        float best_left_grad  = 0.f;
+        float best_left_hess  = 0.f;
+        int64_t best_left_cnt = 0;
 
-            float total_grad_node = total_grad_nodes[node_id];
-            float total_hess_node = total_hess_nodes[node_id];
-            int64_t total_count_node = total_count_nodes[node_id];
+        const float   total_grad_node  = total_grad_nodes[node_id];
+        const float   total_hess_node  = total_hess_nodes[node_id];
+        const int64_t total_count_node = total_count_nodes[node_id];
 
-            for (int idx = 0; idx < num_eval; ++idx) {
-                int thr = thresholds_local[idx];
-                if (thr < 0 || thr >= num_bins - 1) {
-                    continue;
-                }
-                int64_t left_count = left_count_arr[idx];
-                int64_t right_count = total_count_node - left_count;
-            if (left_count < min_samples_leaf || right_count < min_samples_leaf) {
-                continue;
-            }
-            float weight_sum = weight_arr[idx];
-            float std = (weight_sum > 0.0f) ? sqrtf(fmaxf(0.0f, M2_arr[idx] / weight_sum)) : 0.0f;
-            float score = mean_arr[idx] - lambda_dro * std;
-            if (direction_weight != 0.0f && weight_sum > 0.0f) {
-                score += direction_weight * (dir_arr[idx] / weight_sum);
-            }
+        for (int i = 0; i < num_eval; ++i) {
+            const int thr = thresholds_sh[i];
+            if (thr < 0 || thr >= num_bins - 1) continue;
 
-            bool better = score > best_score;
+            const int64_t lcnt = left_count_arr[i];
+            const int64_t rcnt = total_count_node - lcnt;
+            if (lcnt < (int64_t)min_samples_leaf || rcnt < (int64_t)min_samples_leaf) continue;
+
+            const float wsum = weight_arr[i];
+            const float std  = (wsum > 0.f) ? sqrtf(fmaxf(0.f, M2_arr[i] / wsum)) : 0.f;
+            float score      = mean_arr[i] - lambda_dro * std;
+            if (direction_weight != 0.f && wsum > 0.f) score += direction_weight * (dir_arr[i] / wsum);
+
+            bool better = (score > best_score);
             if (!better && fabsf(score - best_score) <= 1e-12f) {
-                if (left_count > best_left_count) {
-                    better = true;
-                } else if (left_count == best_left_count) {
-                    if (thr > best_threshold) {
-                        better = true;
-                    }
-                }
+                if (lcnt > best_left_cnt) better = true;
+                else if (lcnt == best_left_cnt && thr > best_threshold) better = true;
             }
-
             if (better) {
-                best_score = score;
-                best_threshold = thr;
-                best_left_grad = left_grad_arr[idx];
-                best_left_hess = left_hess_arr[idx];
-                best_left_count = left_count;
+                best_score      = score;
+                best_threshold  = thr;
+                best_left_grad  = left_grad_arr[i];
+                best_left_hess  = left_hess_arr[i];
+                best_left_cnt   = lcnt;
             }
         }
 
-        if (!std::isfinite(best_score)) {
+        if (!isfinite(best_score)) {
             best_threshold = -1;
-            best_left_grad = 0.0f;
-            best_left_hess = 0.0f;
-            best_left_count = 0;
+            best_left_grad = 0.f;
+            best_left_hess = 0.f;
+            best_left_cnt  = 0;
         }
 
-        out_scores[out_index] = best_score;
-        out_thresholds[out_index] = best_threshold;
-        out_left_grad[out_index] = best_left_grad;
-        out_left_hess[out_index] = best_left_hess;
-        out_left_count[out_index] = best_left_count;
+        out_scores     [out_index] = best_score;
+        out_thresholds [out_index] = best_threshold;
+        out_left_grad  [out_index] = best_left_grad;
+        out_left_hess  [out_index] = best_left_hess;
+        out_left_count [out_index] = best_left_cnt;
     }
 }
 
+// ------------------------------- Host wrapper --------------------------------
+
 py::dict find_best_splits_batched_cuda(
-    py::object bins,
-    py::object grad,
-    py::object hess,
-    py::object row_indices,
-    py::object node_row_splits,
-    py::object node_era_splits,
-    py::object era_weights,
-    py::object total_grad,
-    py::object total_hess,
-    py::object total_count,
-    py::object feature_ids,
+    py::object bins,               // torch.uint8 [N, F] (row-major)
+    py::object grad,               // torch.float32 [Rcat]
+    py::object hess,               // torch.float32 [Rcat]
+    py::object rows_index,         // torch.int32   [Rcat]  (concatenated row ids)
+    py::object node_row_splits,    // torch.int32   [num_nodes+1]
+    py::object node_era_splits,    // torch.int32   [num_nodes, num_eras+1]
+    py::object era_weights,        // torch.float32 [num_nodes, num_eras]
+    py::object total_grad,         // torch.float32 [num_nodes]
+    py::object total_hess,         // torch.float32 [num_nodes]
+    py::object total_count,        // torch.int64   [num_nodes]
+    py::object feature_ids,        // torch.int32   [num_features]
     int max_bins,
     int k_cuts,
     const std::string& cut_selection,
@@ -474,161 +508,157 @@ py::dict find_best_splits_batched_cuda(
     float lambda_dro,
     float direction_weight,
     int min_samples_leaf,
-    int rows_total
+    int rows_total_compact        // == rows_index.shape[0]
 ) {
     if (max_bins > MAX_BINS) {
         throw std::invalid_argument("CUDA backend supports up to 128 bins per feature.");
     }
 
-    py::tuple bins_shape = py::tuple(bins.attr("shape"));
-    int64_t bins_stride = py::int_(bins_shape[1]);
+    py::module torch = py::module::import("torch");
+
+    // shapes
+    py::tuple bins_shape = py::tuple(bins.attr("shape"));   // [N_dataset, F]
+    const long long rows_dataset = (long long)py::int_(bins_shape[0]);
+    const long long features     = (long long)py::int_(bins_shape[1]);
 
     py::tuple node_row_shape = py::tuple(node_row_splits.attr("shape"));
-    int64_t num_nodes = py::int_(node_row_shape[0]) - 1;
+    const int num_nodes = (int)py::int_(node_row_shape[0]) - 1;
     if (num_nodes <= 0) {
-        return py::dict(
-            "scores"_a=py::none(),
-            "thresholds"_a=py::none(),
-            "left_grad"_a=py::none(),
-            "left_hess"_a=py::none(),
-            "left_count"_a=py::none(),
-            "kernel_ms"_a=0.0
-        );
+        return py::dict("scores"_a=py::none(), "thresholds"_a=py::none(),
+                        "left_grad"_a=py::none(), "left_hess"_a=py::none(),
+                        "left_count"_a=py::none(), "kernel_ms"_a=0.0);
     }
 
     py::tuple feature_shape = py::tuple(feature_ids.attr("shape"));
-    int64_t num_features = py::int_(feature_shape[0]);
+    const int num_features = (int)py::int_(feature_shape[0]);
 
-    int cut_mode = (cut_selection == "mass") ? 1 : 0;
+    // Cut mode
+    const int cut_mode = (cut_selection == "mass") ? 1 : 0;
 
-    uintptr_t bins_ptr_val = py::int_(bins.attr("data_ptr")());
-    uintptr_t grad_ptr_val = py::int_(grad.attr("data_ptr")());
-    uintptr_t hess_ptr_val = py::int_(hess.attr("data_ptr")());
-    uintptr_t row_indices_ptr_val = py::int_(row_indices.attr("data_ptr")());
-    uintptr_t node_row_ptr_val = py::int_(node_row_splits.attr("data_ptr")());
-    uintptr_t node_era_ptr_val = py::int_(node_era_splits.attr("data_ptr")());
-    uintptr_t era_weights_ptr_val = py::int_(era_weights.attr("data_ptr")());
-    uintptr_t total_grad_ptr_val = py::int_(total_grad.attr("data_ptr")());
-    uintptr_t total_hess_ptr_val = py::int_(total_hess.attr("data_ptr")());
-    uintptr_t total_count_ptr_val = py::int_(total_count.attr("data_ptr")());
-    uintptr_t feature_ids_ptr_val = py::int_(feature_ids.attr("data_ptr")());
+    // Pointers
+    const uintptr_t grad_ptr       = py::int_(grad.attr("data_ptr")());
+    const uintptr_t hess_ptr       = py::int_(hess.attr("data_ptr")());
+    const uintptr_t rows_idx_ptr   = py::int_(rows_index.attr("data_ptr")());
+    const uintptr_t node_row_ptr   = py::int_(node_row_splits.attr("data_ptr")());
+    const uintptr_t node_era_ptr   = py::int_(node_era_splits.attr("data_ptr")());
+    const uintptr_t era_w_ptr      = py::int_(era_weights.attr("data_ptr")());
+    const uintptr_t total_grad_ptr = py::int_(total_grad.attr("data_ptr")());
+    const uintptr_t total_hess_ptr = py::int_(total_hess.attr("data_ptr")());
+    const uintptr_t total_cnt_ptr  = py::int_(total_count.attr("data_ptr")());
+    const uintptr_t feat_ids_ptr   = py::int_(feature_ids.attr("data_ptr")());
 
-    py::tuple era_shape = py::tuple(era_weights.attr("shape"));
-    int64_t num_eras = py::int_(era_shape[1]);
+    // Build feature-major view once (GPU-side, keeps API unchanged)
+    // bins_fmajor = bins.t().contiguous()   # [F, N_dataset]
+    py::object bins_fmajor = bins.attr("t")().attr("contiguous")();
+    const uintptr_t bins_fmajor_ptr = py::int_(bins_fmajor.attr("data_ptr")());
 
-    py::module torch = py::module::import("torch");
+    // Output tensors
     py::object device = bins.attr("device");
-
-    auto scores_tensor = torch.attr("empty")(
-        py::make_tuple(num_nodes, num_features),
-        "device"_a=device,
-        "dtype"_a=torch.attr("float32")
-    );
-    auto thresholds_tensor = torch.attr("empty")(
-        py::make_tuple(num_nodes, num_features),
-        "device"_a=device,
-        "dtype"_a=torch.attr("int32")
-    );
-    auto left_grad_tensor = torch.attr("zeros")(
-        py::make_tuple(num_nodes, num_features),
-        "device"_a=device,
-        "dtype"_a=torch.attr("float32")
-    );
-    auto left_hess_tensor = torch.attr("zeros")(
-        py::make_tuple(num_nodes, num_features),
-        "device"_a=device,
-        "dtype"_a=torch.attr("float32")
-    );
-    auto left_count_tensor = torch.attr("zeros")(
-        py::make_tuple(num_nodes, num_features),
-        "device"_a=device,
-        "dtype"_a=torch.attr("int64")
-    );
+    auto scores_tensor = torch.attr("empty")(py::make_tuple(num_nodes, num_features),
+                                             "device"_a=device, "dtype"_a=torch.attr("float32"));
+    auto thresholds_tensor = torch.attr("empty")(py::make_tuple(num_nodes, num_features),
+                                                 "device"_a=device, "dtype"_a=torch.attr("int32"));
+    auto left_grad_tensor = torch.attr("zeros")(py::make_tuple(num_nodes, num_features),
+                                                "device"_a=device, "dtype"_a=torch.attr("float32"));
+    auto left_hess_tensor = torch.attr("zeros")(py::make_tuple(num_nodes, num_features),
+                                                "device"_a=device, "dtype"_a=torch.attr("float32"));
+    auto left_count_tensor = torch.attr("zeros")(py::make_tuple(num_nodes, num_features),
+                                                 "device"_a=device, "dtype"_a=torch.attr("int64"));
 
     scores_tensor.attr("fill_")(-std::numeric_limits<float>::infinity());
     thresholds_tensor.attr("fill_")(-1);
 
-    uintptr_t scores_ptr_val = py::int_(scores_tensor.attr("data_ptr")());
-    uintptr_t thresholds_ptr_val = py::int_(thresholds_tensor.attr("data_ptr")());
-    uintptr_t left_grad_ptr_val = py::int_(left_grad_tensor.attr("data_ptr")());
-    uintptr_t left_hess_ptr_val = py::int_(left_hess_tensor.attr("data_ptr")());
-    uintptr_t left_count_ptr_val = py::int_(left_count_tensor.attr("data_ptr")());
+    const uintptr_t scores_ptr  = py::int_(scores_tensor.attr("data_ptr")());
+    const uintptr_t thr_ptr     = py::int_(thresholds_tensor.attr("data_ptr")());
+    const uintptr_t lgrad_ptr   = py::int_(left_grad_tensor.attr("data_ptr")());
+    const uintptr_t lhess_ptr   = py::int_(left_hess_tensor.attr("data_ptr")());
+    const uintptr_t lcnt_ptr    = py::int_(left_count_tensor.attr("data_ptr")());
 
-    dim3 block_dim(WARP_SIZE, 1, 1);
-    dim3 grid_dim(static_cast<unsigned int>(num_features), static_cast<unsigned int>(num_nodes), 1);
-    size_t per_bin_bytes = sizeof(int32_t) + 8 * sizeof(float) + sizeof(int64_t);
-    size_t shared_mem = static_cast<size_t>(max_bins) * per_bin_bytes + (alignof(int64_t) - 1);
+    // Launch config
+    dim3 block_dim(THREADS, 1, 1);
+    dim3 grid_dim((unsigned)num_features, (unsigned)num_nodes, 1);
 
-    cudaEvent_t start_evt;
-    cudaEvent_t stop_evt;
+    // Shared memory sizing:
+    // per-warp hists: WARPS * num_bins * (4 + 4 + 4)
+    // reduced per-era: num_bins * (4 + 4 + 4)
+    // count_total:     num_bins * 4
+    // thresholds:      num_bins * 4
+    // per-threshold acc: num_bins * (6*4 + 8)
+    size_t shmem =
+        (size_t)WARPS * num_bins * (sizeof(int32_t) + 2*sizeof(float)) +
+        (size_t)num_bins * (3*sizeof(float) + sizeof(int32_t)) +
+        (size_t)num_bins * sizeof(int32_t) +                     // count_total
+        (size_t)num_bins * sizeof(int32_t) +                     // thresholds
+        (size_t)num_bins * (6*sizeof(float) + sizeof(int64_t)) +
+        (alignof(int64_t) - 1);
+
+    // Time the kernel only
+    cudaEvent_t start_evt, stop_evt;
     CUDA_CHECK(cudaEventCreate(&start_evt));
     CUDA_CHECK(cudaEventCreate(&stop_evt));
     CUDA_CHECK(cudaEventRecord(start_evt));
 
-    cuda_find_best_splits_kernel<<<grid_dim, block_dim, shared_mem>>>(
-        reinterpret_cast<const int8_t*>(bins_ptr_val),
-        static_cast<int>(bins_stride),
-        reinterpret_cast<const float*>(grad_ptr_val),
-        reinterpret_cast<const float*>(hess_ptr_val),
-        reinterpret_cast<const int32_t*>(row_indices_ptr_val),
-        reinterpret_cast<const int32_t*>(node_row_ptr_val),
-        reinterpret_cast<const int32_t*>(node_era_ptr_val),
-        reinterpret_cast<const float*>(era_weights_ptr_val),
-        reinterpret_cast<const float*>(total_grad_ptr_val),
-        reinterpret_cast<const float*>(total_hess_ptr_val),
-        reinterpret_cast<const int64_t*>(total_count_ptr_val),
-        reinterpret_cast<const int32_t*>(feature_ids_ptr_val),
-        static_cast<int>(num_nodes),
-        static_cast<int>(num_features),
-        max_bins,
-        static_cast<int>(num_eras),
-        k_cuts,
-        cut_mode,
-        min_samples_leaf,
-        lambda_l2,
-        lambda_dro,
-        direction_weight,
-        rows_total,
-        reinterpret_cast<float*>(scores_ptr_val),
-        reinterpret_cast<int32_t*>(thresholds_ptr_val),
-        reinterpret_cast<float*>(left_grad_ptr_val),
-        reinterpret_cast<float*>(left_hess_ptr_val),
-        reinterpret_cast<int64_t*>(left_count_ptr_val)
+    cuda_find_best_splits_kernel<<<grid_dim, block_dim, shmem>>>(
+        reinterpret_cast<const int8_t*>(bins_fmajor_ptr),
+        (int)rows_dataset,                                       // rows per feature in feature-major
+        reinterpret_cast<const float*>(grad_ptr),
+        reinterpret_cast<const float*>(hess_ptr),
+        reinterpret_cast<const int32_t*>(rows_idx_ptr),
+        reinterpret_cast<const int32_t*>(node_row_ptr),
+        reinterpret_cast<const int32_t*>(node_era_ptr),
+        reinterpret_cast<const float*>(era_w_ptr),
+        reinterpret_cast<const float*>(total_grad_ptr),
+        reinterpret_cast<const float*>(total_hess_ptr),
+        reinterpret_cast<const int64_t*>(total_cnt_ptr),
+        reinterpret_cast<const int32_t*>(feat_ids_ptr),
+        (int)num_nodes,
+        (int)num_features,
+        (int)max_bins,
+        (int)py::int_(py::tuple(era_weights.attr("shape"))[1]),  // num_eras
+        (int)k_cuts,
+        (int)cut_mode,
+        (int)min_samples_leaf,
+        (float)lambda_l2,
+        (float)lambda_dro,
+        (float)direction_weight,
+        (int)rows_total_compact,
+        reinterpret_cast<float*>(scores_ptr),
+        reinterpret_cast<int32_t*>(thr_ptr),
+        reinterpret_cast<float*>(lgrad_ptr),
+        reinterpret_cast<float*>(lhess_ptr),
+        reinterpret_cast<int64_t*>(lcnt_ptr)
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(stop_evt));
     CUDA_CHECK(cudaEventSynchronize(stop_evt));
-
     float kernel_ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, start_evt, stop_evt));
     CUDA_CHECK(cudaEventDestroy(start_evt));
     CUDA_CHECK(cudaEventDestroy(stop_evt));
 
     py::dict result;
-    result["scores"] = scores_tensor;
+    result["scores"]     = scores_tensor;
     result["thresholds"] = thresholds_tensor;
-    result["left_grad"] = left_grad_tensor;
-    result["left_hess"] = left_hess_tensor;
+    result["left_grad"]  = left_grad_tensor;
+    result["left_hess"]  = left_hess_tensor;
     result["left_count"] = left_count_tensor;
-    result["kernel_ms"] = kernel_ms;
+    result["kernel_ms"]  = kernel_ms;
     return result;
 }
 
-}  // namespace
+} // namespace
 
 void register_cuda_frontier(py::module_& m) {
-    m.def(
-        "_cuda_available",
-        []() { return true; },
-        "Native CUDA backend is available."
-    );
+    m.def("_cuda_available", []() { return true; }, "Native CUDA backend is available.");
+
+    // IMPORTANT: API matches booster.py (rows_index + rows_total_compact present)
     m.def(
         "find_best_splits_batched_cuda",
         &find_best_splits_batched_cuda,
-        py::arg("bins"),
-        py::arg("grad"),
-        py::arg("hess"),
-        py::arg("row_indices"),
+        py::arg("bins"),               // [N,F] uint8, row-major
+        py::arg("grad"),               // [Rcat]
+        py::arg("hess"),               // [Rcat]
+        py::arg("rows_index"),         // [Rcat] int32
         py::arg("node_row_splits"),
         py::arg("node_era_splits"),
         py::arg("era_weights"),
@@ -643,7 +673,7 @@ void register_cuda_frontier(py::module_& m) {
         py::arg("lambda_dro"),
         py::arg("direction_weight"),
         py::arg("min_samples_leaf"),
-        py::arg("rows_total"),
+        py::arg("rows_total_compact"),
         "Find best splits for a batch of nodes using the CUDA backend."
     );
 }
