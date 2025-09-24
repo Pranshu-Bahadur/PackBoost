@@ -671,7 +671,7 @@ void register_cuda_frontier(py::module_& m){
     py::arg("right"),
     py::arg("value"),
     py::arg("is_leaf"),
-    "Fast CUDA router for a single tree over binned features."
+    "Fast CUDA  for a single tree over binned features."
   );
 
 }
