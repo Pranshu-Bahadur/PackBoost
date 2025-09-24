@@ -109,7 +109,7 @@ std::vector<int32_t> mass_cut_indices(
 }
 
 py::tuple find_best_splits_batched_cpu(
-    py::array_t<uint16_t, py::array::c_style | py::array::forcecast> bins,
+    py::array_t<int8_t, py::array::c_style | py::array::forcecast> bins,
     py::array_t<float, py::array::c_style | py::array::forcecast> grad,
     const py::list &nodes_era_rows,
     py::array_t<int32_t, py::array::c_style | py::array::forcecast> feature_subset,
@@ -275,7 +275,7 @@ py::tuple find_best_splits_batched_cpu(
                 std::size_t base = n * era_stride + e * bins_stride;
                 for (std::size_t ridx = 0; ridx < rows.size(); ++ridx) {
                     int32_t row = rows[ridx];
-                    uint16_t bin = bins_view(row, feature);
+                    int32_t bin = static_cast<int32_t>(static_cast<unsigned char>(bins_view(row, feature)));
                     if (bin >= num_bins) {
                         continue;
                     }
@@ -462,8 +462,8 @@ py::tuple find_best_splits_batched_cpu(
             left_side.reserve(rows.size());
             right_side.reserve(rows.size());
             for (int32_t row : rows) {
-                uint16_t bin = bins_view(row, best_feature[ctx_idx]);
-                if (bin <= static_cast<uint16_t>(best_threshold[ctx_idx])) {
+                int32_t bin = static_cast<int32_t>(static_cast<unsigned char>(bins_view(row, best_feature[ctx_idx])));
+                if (bin <= best_threshold[ctx_idx]) {
                     left_side.push_back(static_cast<int64_t>(row));
                 } else {
                     right_side.push_back(static_cast<int64_t>(row));

@@ -117,7 +117,8 @@ def build_era_index(
 ) -> list[torch.Tensor]:
     """Create per-era row index tensors."""
 
-    era_array = torch.as_tensor(np.asarray(era_ids, dtype=np.int64))
+    era_np = np.asarray(era_ids, dtype=np.int16)
+    era_array = torch.as_tensor(era_np, dtype=torch.int16)
     if era_array.ndim != 1:
         raise ValueError("era_ids must be 1D")
     if num_eras is None:

@@ -440,8 +440,8 @@ def main():
     ap.add_argument("--lambda-dro", type=float, default=0.0)
     ap.add_argument("--min-samples-leaf", type=int, default=1)
     ap.add_argument("--max-bins", type=int, default=8)
-    ap.add_argument("--k-cuts", type=int, default=7)
-    ap.add_argument("--layer-feature-fraction", type=float, default=0.1)
+    ap.add_argument("--k-cuts", type=int, default=0)
+    ap.add_argument("--layer-feature-fraction", type=float, default=1.0)
     ap.add_argument("--direction-weight", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--prebinned", action="store_true",

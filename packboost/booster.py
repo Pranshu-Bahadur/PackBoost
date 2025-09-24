@@ -341,16 +341,16 @@ class PackBoost:
             raise ValueError("max_bins must be ≤ 128 when using int8 bin storage")
         if era is None:
             # DES-off path: collapse all rows into a single synthetic era
-            era_np = np.zeros(N, dtype=np.int64)
-            era_encoded = np.zeros(N, dtype=np.int64)
-            uniq_era = np.array([0], dtype=np.int64)
+            era_np = np.zeros(N, dtype=np.int16)
+            era_encoded = np.zeros(N, dtype=np.int16)
+            uniq_era = np.array([0], dtype=np.int16)
         else:
-            era_np = np.asarray(era, dtype=np.int64)
+            era_np = np.asarray(era, dtype=np.int16)
             if era_np.shape[0] != N:
                 raise ValueError("era must align with X rows")
             uniq_era, era_inv = np.unique(era_np, return_inverse=True)
-            era_encoded = era_inv.astype(np.int64)
-        self._era_unique = uniq_era.astype(np.int16)
+            era_encoded = era_inv.astype(np.int16)
+        self._era_unique = uniq_era
         E = int(self._era_unique.shape[0])
 
         self._feature_names = list(feature_names) if feature_names is not None else [f"f{i}" for i in range(F)]
@@ -361,11 +361,10 @@ class PackBoost:
             self.config.max_bins,
             assume_prebinned=bool(self.config.prebinned),
         )
-        bins = torch.tensor(
-            self._binner.bins,
-            dtype=torch.int32,
-            device=self._device,
-        )  # [N,F] integral bins for histogramming
+        bins_np = np.asarray(self._binner.bins, dtype=np.int8)
+        bins = torch.from_numpy(bins_np).to(device=self._device)
+        if bins.dtype != torch.int8:
+            bins = bins.to(dtype=torch.int8)
         y_t = torch.from_numpy(y_np).to(device=self._device)
 
         # Init gradient state
@@ -396,9 +395,9 @@ class PackBoost:
                     y_eval_np = np.asarray(y_eval, dtype=np.float32)
                     y_eval_tensor = torch.from_numpy(y_eval_np).to(self._device)
                     if era_eval is None:
-                        era_eval_np = np.zeros(X_eval_bins.shape[0], dtype=np.int64)
+                        era_eval_np = np.zeros(X_eval_bins.shape[0], dtype=np.int16)
                     else:
-                        era_eval_np = np.asarray(era_eval, dtype=np.int64)
+                        era_eval_np = np.asarray(era_eval, dtype=np.int16)
                         if era_eval_np.shape[0] != X_eval_bins.shape[0]:
                             raise ValueError(f"eval set '{name}' era ids must align with X rows")
                     eval_states.append(
@@ -882,7 +881,7 @@ class PackBoost:
         grad_cpu = grad.detach().to(device="cpu")
         feat_cpu = feature_subset.detach().to(device="cpu", dtype=torch.int32)
 
-        bins_np = bins_cpu.contiguous().cpu().numpy().astype(np.uint16, copy=False)
+        bins_np = bins_cpu.contiguous().cpu().numpy().astype(np.int8, copy=False)
         grad_np = grad_cpu.contiguous().cpu().numpy().astype(np.float32, copy=False)
         feats_np = feat_cpu.contiguous().cpu().numpy().astype(np.int32, copy=False)
 
@@ -1844,11 +1843,12 @@ class PackBoost:
                 continue
             rchunks.append(rows)
             echunks.append(
-                torch.full((rows.numel(),), e_idx, dtype=torch.int32, device=rows.device)
+                torch.full((rows.numel(),), e_idx, dtype=torch.int16, device=rows.device)
             )
         if not rchunks:
-            empty = torch.empty(0, dtype=torch.int64, device=self._device)
-            return empty, empty.clone()
+            empty_rows = torch.empty(0, dtype=torch.int64, device=self._device)
+            empty_eras = torch.empty(0, dtype=torch.int16, device=self._device)
+            return empty_rows, empty_eras
         return torch.cat(rchunks, 0), torch.cat(echunks, 0)
 
     def _partition_rows(
