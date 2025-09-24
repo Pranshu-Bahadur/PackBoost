@@ -48,7 +48,7 @@ __device__ inline int warp_reduce_sum_int(int value) {
 }
 
 __global__ void cuda_find_best_splits_kernel(
-    const int32_t* __restrict__ bins,          // [rows_total, bins_stride]
+    const int8_t* __restrict__ bins,           // [rows_total, bins_stride]
     int bins_stride,
     const float* __restrict__ grad,            // [rows_total]
     const float* __restrict__ hess,            // [rows_total]
@@ -160,7 +160,7 @@ __global__ void cuda_find_best_splits_kernel(
         __syncwarp();
 
         for (int row = row_start + threadIdx.x; row < row_end; row += blockDim.x) {
-            int bin = bins[row * bins_stride + feature_id];
+            int bin = static_cast<int>(static_cast<unsigned char>(bins[row * bins_stride + feature_id]));
             if (bin >= 0 && bin < num_bins) {
                 atomicAdd(&count_bins[bin], 1);
             }
@@ -265,7 +265,7 @@ __global__ void cuda_find_best_splits_kernel(
         __syncwarp();
 
         for (int row = start + threadIdx.x; row < end; row += blockDim.x) {
-            int bin = bins[row * bins_stride + feature_id];
+            int bin = static_cast<int>(static_cast<unsigned char>(bins[row * bins_stride + feature_id]));
             float g = grad[row];
             float h = hess[row];
             if (bin >= 0 && bin < num_bins) {
@@ -429,7 +429,7 @@ py::dict find_best_splits_batched_cuda(
     int min_samples_leaf
 ) {
     if (max_bins > MAX_BINS) {
-        throw std::invalid_argument("CUDA backend supports up to 512 bins per feature.");
+        throw std::invalid_argument("CUDA backend supports up to 128 bins per feature.");
     }
 
     py::tuple bins_shape = py::tuple(bins.attr("shape"));
@@ -517,7 +517,7 @@ py::dict find_best_splits_batched_cuda(
     CUDA_CHECK(cudaEventRecord(start_evt));
 
     cuda_find_best_splits_kernel<<<grid_dim, block_dim, shared_mem>>>(
-        reinterpret_cast<const int32_t*>(bins_ptr_val),
+        reinterpret_cast<const int8_t*>(bins_ptr_val),
         static_cast<int>(bins_stride),
         reinterpret_cast<const float*>(grad_ptr_val),
         reinterpret_cast<const float*>(hess_ptr_val),

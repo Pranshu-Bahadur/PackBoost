@@ -1208,7 +1208,7 @@ class PackBoost:
         stats.block_size = max(stats.block_size, block_size)
 
         rows_cat = torch.cat(row_chunks, 0)
-        bins_cat = bins.index_select(0, rows_cat)
+        bins_cat_i8 = bins.index_select(0, rows_cat).to(torch.int8).contiguous()
         grad_cat = torch.cat(grad_chunks, 0)
         hess_cat = torch.cat(hess_chunks, 0)
 
@@ -1240,7 +1240,7 @@ class PackBoost:
         )
 
         result = self._cuda_backend.find_best_splits_batched_cuda(
-            bins_cat,
+            bins_cat_i8,
             grad_cat,
             hess_cat,
             node_row_splits,
