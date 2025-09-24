@@ -100,6 +100,27 @@ __global__ void cuda_find_best_splits_kernel(
     const int32_t* era_offsets = node_era_splits + node_id * (num_eras + 1);
     int row_start = node_row_splits[node_id];
     int row_end = node_row_splits[node_id + 1];
+    if (row_start < 0) {
+        row_start = 0;
+    }
+    if (row_end > rows_total) {
+        row_end = rows_total;
+    }
+    if (row_start > row_end) {
+        row_start = row_end;
+    }
+
+    if (feature_id < 0 || feature_id >= bins_stride) {
+        if (lane == 0) {
+            out_scores[out_index] = NEG_INF;
+            out_thresholds[out_index] = -1;
+            out_left_grad[out_index] = 0.0f;
+            out_left_hess[out_index] = 0.0f;
+            out_left_count[out_index] = 0;
+        }
+        return;
+    }
+
     int node_total_rows = row_end - row_start;
 
     if (node_total_rows < 2 * min_samples_leaf) {
@@ -269,6 +290,8 @@ __global__ void cuda_find_best_splits_kernel(
     for (int era = 0; era < num_eras; ++era) {
         int start = era_offsets[era];
         int end = era_offsets[era + 1];
+        start = max_int(start, row_start);
+        end = min_int(end, row_end);
         if (start >= end) {
             continue;
         }
@@ -281,6 +304,9 @@ __global__ void cuda_find_best_splits_kernel(
         __syncwarp();
 
         for (int row = start + threadIdx.x; row < end; row += blockDim.x) {
+            if (row < row_start || row >= row_end) {
+                continue;
+            }
             int bin = static_cast<int>(static_cast<unsigned char>(bins[row * bins_stride + feature_id]));
             float g = grad[row];
             float h = hess[row];
