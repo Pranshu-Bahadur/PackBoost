@@ -53,13 +53,38 @@ def quantile_bin(X: np.ndarray, max_bins: int) -> tuple[np.ndarray, np.ndarray]:
     return bins, edges
 
 
-def preprocess_features(X: np.ndarray, max_bins: int) -> BinningResult:
-    """Return (possibly) quantile-binned features stored as ``uint8``."""
+def preprocess_features(
+    X: np.ndarray,
+    max_bins: int,
+    *,
+    assume_prebinned: bool = False,
+) -> BinningResult:
+    """Return (possibly) quantile-binned features stored as ``uint8``.
+
+    Parameters
+    ----------
+    X:
+        Feature matrix. When ``assume_prebinned`` is ``True`` this must already
+        contain integer bin identifiers in ``[0, max_bins)``.
+    max_bins:
+        Number of histogram bins per feature.
+    assume_prebinned:
+        Skip quantile binning altogether and treat ``X`` as already binned.
+    """
 
     X_np = ensure_numpy(X)
+    if assume_prebinned:
+        if not detect_prebinned(X_np, max_bins):
+            raise ValueError(
+                "prebinned=True requires X to contain integer bins within [0, max_bins)."
+            )
+        bins = X_np.astype(np.uint8, copy=False)
+        return BinningResult(bins=bins, bin_edges=None, prebinned=True)
+
     if detect_prebinned(X_np, max_bins):
         bins = X_np.astype(np.uint8, copy=False)
         return BinningResult(bins=bins, bin_edges=None, prebinned=True)
+
     bins, edges = quantile_bin(X_np.astype(np.float32, copy=False), max_bins=max_bins)
     return BinningResult(bins=bins, bin_edges=edges, prebinned=False)
 
@@ -81,10 +106,21 @@ def apply_bins(X: np.ndarray, bin_edges: np.ndarray | None, max_bins: int) -> np
     return bins
 
 
-def build_era_index(era_ids: Iterable[int] | np.ndarray, num_eras: int) -> list[torch.Tensor]:
+def build_era_index(
+    era_ids: Iterable[int] | np.ndarray,
+    num_eras: int | None,
+) -> list[torch.Tensor]:
     """Create per-era row index tensors."""
 
     era_array = torch.as_tensor(np.asarray(era_ids, dtype=np.int64))
+    if era_array.ndim != 1:
+        raise ValueError("era_ids must be 1D")
+    if num_eras is None:
+        if era_array.numel() == 0:
+            num_eras = 1
+        else:
+            num_eras = int(era_array.max().item()) + 1
+    num_eras = int(num_eras)
     indices: list[torch.Tensor] = []
     for era in range(num_eras):
         rows = torch.nonzero(era_array == era, as_tuple=False).flatten().to(dtype=torch.int64)

@@ -74,10 +74,6 @@ def test_des_metrics_match_numpy(era_alpha: float) -> None:
     left_value = -left_grad / (left_hess + config.lambda_l2)
     right_value = -right_grad / (right_hess + config.lambda_l2)
 
-    total_grad = grad_all.sum()
-    total_hess = hess_all.sum()
-    parent_dir = torch.sign(-total_grad / (total_hess + config.lambda_l2))
-
     era_counts = torch.tensor(
         [float(rows.numel()) for rows in era_rows],
         dtype=torch.float32,
@@ -92,7 +88,6 @@ def test_des_metrics_match_numpy(era_alpha: float) -> None:
         right_value,
         valid,
         era_weights,
-        parent_dir,
         weight_sum,
     )
 
@@ -149,8 +144,6 @@ def test_des_metrics_match_numpy(era_alpha: float) -> None:
     else:
         weights_np = np.where(era_counts_np > 0, 1.0, 0.0)
 
-    parent_dir_np = np.sign(float((-total_grad.cpu().item()) / (total_hess.cpu().item() + config.lambda_l2)))
-
     mean_np = np.zeros(num_thresholds, dtype=np.float32)
     std_np = np.zeros(num_thresholds, dtype=np.float32)
     dir_np = np.zeros(num_thresholds, dtype=np.float32)
@@ -165,14 +158,8 @@ def test_des_metrics_match_numpy(era_alpha: float) -> None:
         mean_np[thr] = mean_val
         var_val = float(np.dot(w, (gains - mean_val) ** 2) / weight_sum_np)
         std_np[thr] = np.sqrt(max(var_val, 0.0))
-        if parent_dir_np == 0.0:
-            dir_np[thr] = 0.0
-        else:
-            agreement = 0.5 * (
-                (np.sign(left_val_np[:, thr]) == parent_dir_np).astype(np.float32)
-                + (np.sign(right_val_np[:, thr]) == parent_dir_np).astype(np.float32)
-            )
-            dir_np[thr] = float(np.dot(agreement, w) / weight_sum_np)
+        direction = np.where(left_val_np[:, thr] > right_val_np[:, thr], 1.0, -1.0)
+        dir_np[thr] = float(np.dot(direction, w) / weight_sum_np)
 
     agg_count_np = counts_np.sum(axis=0)
     prefix_count_total_np = np.cumsum(agg_count_np)[:-1]

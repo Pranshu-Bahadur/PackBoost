@@ -309,7 +309,7 @@ class PackBoost:
         self,
         X: np.ndarray,
         y: np.ndarray,
-        era: Iterable[int],
+        era: Iterable[int] | None,
         *,
         num_rounds: int,
         feature_names: Sequence[str] | None = None,
@@ -322,19 +322,28 @@ class PackBoost:
         N, F = X_np.shape
         if N != y_np.shape[0]:
             raise ValueError("X and y row mismatch")
-        era_np = np.asarray(list(era))
-        if era_np.shape[0] != N:
-            raise ValueError("era must align with X rows")
-
-        uniq_era, era_inv = np.unique(era_np, return_inverse=True)
+        if era is None:
+            # DES-off path: collapse all rows into a single synthetic era
+            era_np = np.zeros(N, dtype=np.int64)
+            era_encoded = np.zeros(N, dtype=np.int64)
+            uniq_era = np.array([0], dtype=np.int64)
+        else:
+            era_np = np.asarray(era, dtype=np.int64)
+            if era_np.shape[0] != N:
+                raise ValueError("era must align with X rows")
+            uniq_era, era_inv = np.unique(era_np, return_inverse=True)
+            era_encoded = era_inv.astype(np.int64)
         self._era_unique = uniq_era.astype(np.int16)
-        era_encoded = era_inv.astype(np.int64)
-        E = int(uniq_era.shape[0])
+        E = int(self._era_unique.shape[0])
 
         self._feature_names = list(feature_names) if feature_names is not None else [f"f{i}" for i in range(F)]
 
         # Bin once
-        self._binner = preprocess_features(X_np, self.config.max_bins)
+        self._binner = preprocess_features(
+            X_np,
+            self.config.max_bins,
+            assume_prebinned=bool(self.config.prebinned),
+        )
         bins = torch.tensor(
             self._binner.bins,
             dtype=torch.int32,
@@ -592,17 +601,21 @@ class PackBoost:
         right_values: torch.Tensor,
         valid: torch.Tensor,
         weights: torch.Tensor,
-        parent_dir: torch.Tensor,
         weight_sum: torch.Tensor,
     ) -> torch.Tensor:
-        parent = torch.as_tensor(parent_dir, dtype=torch.float32, device=left_values.device)
-        parent_sign = torch.sign(parent)
+        """Weighted directional coherence following the DES CUDA blueprint.
+
+        ``direction`` per era/threshold is ``+1`` if the left leaf value exceeds the
+        right leaf value, otherwise ``-1``. The result is a weighted average of
+        these per-era directions over valid eras.
+        """
+
         left = left_values.to(torch.float32)
         right = right_values.to(torch.float32)
         weights = weights.to(torch.float32)
         valid = valid.to(torch.bool)
         eras, thresholds = left.shape
-        agreement = torch.zeros(thresholds, dtype=torch.float32, device=left.device)
+        accum = torch.zeros(thresholds, dtype=torch.float32, device=left.device)
 
         for e in range(eras):
             w_e = float(weights[e].item())
@@ -613,18 +626,13 @@ class PackBoost:
                 continue
             lv = left[e]
             rv = right[e]
-            agree = 0.5 * (
-                (torch.sign(lv) == parent_sign).to(torch.float32)
-                + (torch.sign(rv) == parent_sign).to(torch.float32)
-            )
-            weighted = torch.zeros(thresholds, dtype=torch.float32, device=left.device)
-            weighted[mask] = w_e
-            agreement += weighted * agree
+            direction = torch.where(lv > rv, 1.0, -1.0)
+            accum[mask] += w_e * direction[mask]
 
         denom = torch.clamp_min(weight_sum.to(torch.float32), 1e-12)
-        out = torch.zeros_like(agreement)
+        out = torch.zeros_like(accum)
         mask = denom > 0
-        out[mask] = agreement[mask] / denom[mask]
+        out[mask] = accum[mask] / denom[mask]
         return out
 
     # --- Histogram builders (Torch) ---
@@ -729,6 +737,7 @@ class PackBoost:
         min_child = int(self.config.min_samples_leaf)
         node_payload: list[list[np.ndarray]] = []
         index_map: list[int] = []
+        duplicate_map: dict[int, int] = {}
         for idx, node in enumerate(nodes):
             era_arrays: list[np.ndarray] = []
             total = 0
@@ -743,11 +752,29 @@ class PackBoost:
             if total < 2 * min_child:
                 stats.nodes_skipped += 1
                 continue
+            duplicate_idx: int | None = None
+            for ctx_idx, existing in enumerate(node_payload):
+                if len(existing) != len(era_arrays):
+                    continue
+                same = True
+                for arr_a, arr_b in zip(existing, era_arrays):
+                    if arr_a.shape != arr_b.shape or not np.array_equal(arr_a, arr_b):
+                        same = False
+                        break
+                if same:
+                    duplicate_idx = ctx_idx
+                    break
+            if duplicate_idx is not None:
+                duplicate_map[idx] = duplicate_idx
+                continue
             node_payload.append(era_arrays)
             index_map.append(idx)
 
         if not node_payload:
             return decisions, stats
+
+        if duplicate_map:
+            stats.nodes_collapsed += len(duplicate_map)
 
         bins_cpu = bins.detach().to(device="cpu")
         grad_cpu = grad.detach().to(device="cpu")
@@ -869,17 +896,11 @@ class PackBoost:
                                         valid_mask.unsqueeze(1),
                                         era_weights_tensor,
                                     )
-                                    parent_grad_total = grad_rows.sum()
-                                    parent_hess_total = hess_rows.sum()
-                                    parent_dir = torch.sign(
-                                        -parent_grad_total / (parent_hess_total + self.config.lambda_l2)
-                                    )
                                     agreement_vec = self._directional_agreement(
                                         left_val_e.unsqueeze(1),
                                         right_val_e.unsqueeze(1),
                                         valid_mask.unsqueeze(1),
                                         era_weights_tensor,
-                                        parent_dir,
                                         weight_vec,
                                     )
                                     score_py = mean_vec[0] - self.config.lambda_dro * std_vec[0]
@@ -943,17 +964,11 @@ class PackBoost:
                         valid_mask.view(-1, 1),
                         era_weights_tensor,
                     )
-                    parent_grad_total = total_grad_e.sum()
-                    parent_hess_total = total_hess_e.sum()
-                    parent_dir = torch.sign(
-                        -parent_grad_total / (parent_hess_total + self.config.lambda_l2)
-                    )
                     agreement_vec = self._directional_agreement(
                         left_val_e.view(-1, 1),
                         right_val_e.view(-1, 1),
                         valid_mask.view(-1, 1),
                         era_weights_tensor,
-                        parent_dir,
                         weight_vec,
                     )
                     score_py = mean_vec[0] - self.config.lambda_dro * std_vec[0]
@@ -976,6 +991,11 @@ class PackBoost:
                 left_rows=left_rows,
                 right_rows=right_rows,
             )
+
+        if duplicate_map:
+            for dup_idx, ctx_idx in duplicate_map.items():
+                ref_node_idx = index_map[ctx_idx]
+                decisions[dup_idx] = decisions[ref_node_idx]
 
         return decisions, stats
 
@@ -1524,4 +1544,3 @@ class PackBoost:
             K = max(1, int(round(K * (decay ** depth))))
 
         return int(max(1, min(K, full_T)))
-

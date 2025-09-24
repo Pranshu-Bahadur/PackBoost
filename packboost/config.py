@@ -58,6 +58,11 @@ class PackBoostConfig:
         Optional seed controlling RNG for feature subsampling.
     device:
         Torch device identifier (``"cpu"`` or ``"cuda"``) for tensor ops.
+    prebinned:
+        When ``True`` the training data passed to :meth:`PackBoost.fit` is
+        treated as already quantised into integer bins and the preprocessing
+        stage will be skipped. The caller is responsible for ensuring
+        ``X`` only contains integers in ``[0, max_bins)`` in this mode.
     """
 
     pack_size: int = 8
@@ -82,3 +87,4 @@ class PackBoostConfig:
     enable_node_batching: bool = True
     random_state: int | None = None
     device: str = "cpu"
+    prebinned: bool = False

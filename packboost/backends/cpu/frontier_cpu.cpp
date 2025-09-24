@@ -30,7 +30,6 @@ struct NodeContext {
     float total_grad{0.0f};
     float total_hess{0.0f};
     int64_t total_count{0};
-    int parent_dir{0};
 };
 
 std::vector<int32_t> even_cut_indices(int max_bins, int k) {
@@ -107,16 +106,6 @@ std::vector<int32_t> mass_cut_indices(
         v = std::max<int32_t>(0, std::min<int32_t>(v, max_thr - 1));
     }
     return out;
-}
-
-int signf(float x) {
-    if (x > 0.0f) {
-        return 1;
-    }
-    if (x < 0.0f) {
-        return -1;
-    }
-    return 0;
 }
 
 py::tuple find_best_splits_batched_cpu(
@@ -215,8 +204,6 @@ py::tuple find_best_splits_batched_cpu(
             }
         }
         ctx.total_hess = static_cast<float>(ctx.total_count);
-        float parent_value = -ctx.total_grad / (ctx.total_hess + lambda_l2);
-        ctx.parent_dir = signf(parent_value);
         contexts.push_back(std::move(ctx));
         index_map.push_back(static_cast<int>(idx));
     }
@@ -356,7 +343,7 @@ py::tuple find_best_splits_batched_cpu(
 #pragma omp parallel for schedule(static)
         for (std::int64_t n = 0; n < static_cast<std::int64_t>(num_nodes); ++n) {
             const NodeContext &ctx = contexts[n];
-            const bool use_dir = (direction_weight != 0.0f) && (ctx.parent_dir != 0);
+            const bool use_dir = (direction_weight != 0.0f);
             float local_best_score = best_score[n];
             int32_t local_best_feat = best_feature[n];
             int32_t local_best_thr = best_threshold[n];
@@ -406,18 +393,10 @@ py::tuple find_best_splits_batched_cpu(
                         wsum = wsum_new;
                     }
                     if (use_dir) {
-                        float lg_dir = -left_grad_e / denom_L;
-                        float rg_dir = -right_grad_e / denom_R;
-                        int sign_l = signf(lg_dir);
-                        int sign_r = signf(rg_dir);
-                        float agree = 0.0f;
-                        if (sign_l == ctx.parent_dir) {
-                            agree += 0.5f;
-                        }
-                        if (sign_r == ctx.parent_dir) {
-                            agree += 0.5f;
-                        }
-                        agr_num += weight * agree;
+                        float left_val = -left_grad_e / denom_L;
+                        float right_val = -right_grad_e / denom_R;
+                        float direction = (left_val > right_val) ? 1.0f : -1.0f;
+                        agr_num += weight * direction;
                         agr_den += weight;
                     }
                 }

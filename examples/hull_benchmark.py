@@ -385,6 +385,7 @@ def make_packboost(args, seed: int):
         random_state=seed,
         layer_feature_fraction=args.layer_feature_fraction,
         direction_weight=args.direction_weight,
+        prebinned=bool(args.prebinned),
     )
     if (args.n_trees % cfg.pack_size) != 0:
         raise ValueError("n_trees must be divisible by pack_size.")
@@ -439,10 +440,12 @@ def main():
     ap.add_argument("--lambda-dro", type=float, default=0.0)
     ap.add_argument("--min-samples-leaf", type=int, default=1)
     ap.add_argument("--max-bins", type=int, default=8)
-    ap.add_argument("--k-cuts", type=int, default=0)
+    ap.add_argument("--k-cuts", type=int, default=7)
     ap.add_argument("--layer-feature-fraction", type=float, default=0.1)
     ap.add_argument("--direction-weight", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--prebinned", action="store_true",
+                    help="Treat features as already integer-binned when fitting PackBoost.")
 
     # Evaluation mode (on bucketed eras)
     ap.add_argument("--cv-splits", type=int, default=0, help="If >0, use TimeSeriesSplit CV over bucketed eras.")
@@ -622,7 +625,8 @@ def main():
     # -------- PackBoost bench (with EFB features) --------
     pack, rounds = make_packboost(args, args.seed)
     t0 = time.perf_counter()
-    pack.fit(X_tr_pb, y_tr, (era_tr if not args.des_off else np.zeros_like(era_tr)), num_rounds=rounds)
+    era_train = None if args.des_off else era_tr
+    pack.fit(X_tr_pb, y_tr, era_train, num_rounds=rounds)
     fit_t = time.perf_counter() - t0
     t0 = time.perf_counter(); pb_preds_te = pack.predict(X_te_pb); pred_t = time.perf_counter() - t0
     r2_pb = float(r2_score(y_te, pb_preds_te))

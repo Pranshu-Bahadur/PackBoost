@@ -90,11 +90,14 @@ $v\_{L/R}=-,\frac{G\_{L/R}}{H\_{L/R}+\lambda}$
 3. **Fused per (node,feature).** Histogram → prefix-scan (all thresholds) → per-era gains → online Welford for $$(\mu\_G,\sigma\_G)$$ + $$\mathcal{D}\_s$$ → pick best $$(k,\tau)$$.
 4. **Partition.** Stable segmented scatters produce child shards per (node, era). No host sync on GPU within a depth.
 
+> **DES-off shorthand.** Passing `era_ids=None` to `PackBoost.fit` now collapses the round to a single synthetic era while keeping the frontier batching and instrumentation intact—handy for ablation runs or Hull's DES-off mode.
+
 ---
 
 ## 4) Memory Layout & Workspaces
 
 * **Bins** $$X\_b$$: `uint8` if `max_bins ≤ 255`, else `uint16`, row-major.
+* **Prebinned fast-path:** set `PackBoostConfig.prebinned=True` when the caller supplies integer bins in `[0, max_bins)` to skip quantile preprocessing.
 * **Row pools:** `int32` contiguous pools per (node, era); SoA offsets per shard.
 * **Histogram scratch:** per-(node,feature) `[bins,2]` for $$(\sum g,\sum h)$$ in shared memory (GPU) or thread-local arrays (CPU).
 * **Accumulators:** weighted Welford `(count, mean, M2)` for $$(\mu\_G,\sigma\_G)$$; register accumulator for $$\mathcal{D}\_s$$.
@@ -105,6 +108,9 @@ $v\_{L/R}=-,\frac{G\_{L/R}}{H\_{L/R}+\lambda}$
 ## 5) Backends
 
 **CPU.** OpenMP over (node\_tile, feature\_tile); AVX2/AVX-512 gathers for histogram fills; thread-local histograms → reduce; stable per-era partitions via prefix offsets.
+
+* **Root histogram reuse.** Identical node shards (e.g., the pack roots at depth 0 or synchronized children) are detected via row signatures so histograms and DES scans are built once and decisions broadcast to duplicates. The native backend mirrors the Python frontier to keep instrumentation aligned.
+* **Directional parity with CUDA blueprint.** Per-era leaf values now drive a hard direction signal (`+1` if left > right else `-1`), matching the `directional_split_kernel` contract for future GPU integration.
 
 **CUDA.** Grid `(nodes_tile, features_tile)`, block `WARPS_PER_BLOCK × 32`, map **one warp → one (node,feature)**. Each warp:
 
@@ -156,27 +162,31 @@ $v\_{L/R}=-,\frac{G\_{L/R}}{H\_{L/R}+\lambda}$
 ## 7) Minimal Configuration
 
 ```python
-@dataclass(frozen=True)
+from dataclasses import dataclass
+from typing import Literal
+
+
+@dataclass(frozen=True, slots=True)
 class PackBoostConfig:
-    n_estimators: int = 400
     pack_size: int = 8
     max_depth: int = 6
-    learning_rate: float = 0.05
-    reg_lambda: float = 1.0
+    learning_rate: float = 0.1
+    lambda_l2: float = 1e-6
+    lambda_dro: float = 0.0
+    direction_weight: float = 0.0
     min_samples_leaf: int = 20
-    max_bins: int = 64
+    max_bins: int = 63
+    k_cuts: int = 0  # 0 => use all (bins-1) thresholds
+    cut_selection: Literal["even", "mass"] = "even"
     layer_feature_fraction: float = 1.0
-    # DES
-    lambda_dro: float = 0.25
-    lambda_dir: float = 0.10
     era_alpha: float = 0.0
-    dir_tanh_scale: float = 1.0
-    # Execution
-    device: str = "cpu"      # "cpu" | "cuda"
-    nodes_tile: int = 64
-    features_tile: int = 64
-    era_tile: int = 64
-    seed: int = 42
+    era_tile_size: int = 32
+    histogram_mode: Literal["rebuild", "subtract", "auto"] = "subtract"
+    feature_block_size: int = 32
+    enable_node_batching: bool = True
+    random_state: int | None = None
+    device: str = "cpu"  # "cpu" | "cuda"
+    prebinned: bool = False
 ```
 
 ---
@@ -557,6 +567,12 @@ find_best_splits_batched_cpu(
 ---
 
 ## 10) Changelog
+
+- 2025-09-23 — M1.2 / M2.1 alignment: prebinned path, DES parity, hull benchmark polish
+  - Added `PackBoostConfig.prebinned` for workflows that supply integer bins; `fit(..., era=None)` now defaults to a single era (useful for DES-off benchmarking).
+  - Torch and native CPU frontiers collapse duplicate node shards (root histogram reuse) so packs share histogram/scan work; instrumentation reports `nodes_collapsed` for visibility.
+  - DES directional term now matches the CUDA `directional_split_kernel`: per-era direction = `sign(left_value - right_value)` with weighted averaging, eliminating the old parent-direction heuristic.
+  - `examples/hull_benchmark.py` tightened preprocessing (explicit DES-off path, optional prebinned flag, no-leak era masks) to document the M1/M2 training flow.
 
 - 2025-09-21 — M1.1: Subtract-First Frontier + Packed Prediction
   - Refactored `_find_best_splits_batched`:
