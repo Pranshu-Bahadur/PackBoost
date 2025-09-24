@@ -1,4 +1,4 @@
-// frontier_cuda.cu  (row-major bins; no per-call transpose; 64-bit safe; fast hist/scan/score)
+// frontier_cuda.cu  (row-major bins; 64-bit safe; barrier-safe scan; block-wide totals)
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <cuda_runtime.h>
@@ -19,7 +19,7 @@ namespace {
 
 constexpr int WARP_SIZE = 32;
 constexpr int MAX_BINS  = 128;
-constexpr int THREADS   = 64;                  // 4 warps/block
+constexpr int THREADS   = 128;                  // 4 warps/block (change to 32/64/256 if you like)
 constexpr int WARPS     = THREADS / WARP_SIZE;
 __device__ constexpr float NEG_INF = -1.0e30f;
 
@@ -36,16 +36,15 @@ __device__ inline int warp_reduce_sum_int(int v){
   return v;
 }
 
-// Inclusive block scan over first n bins (n<=MAX_BINS)
-__device__ inline void block_scan_prefix(float* g,float* h,int* c,int n){
-  for(int off=1; off<n; off<<=1){
+// Safe Hillis–Steele inclusive scan on first n entries of g/h/c
+__device__ inline void block_scan_prefix(float* g, float* h, int* c, int n) {
+  for (int off = 1; off < n; off <<= 1) {
     __syncthreads();
-    int b=threadIdx.x;
-    float gprev=(b>=off && b<n)?g[b-off]:0.f;
-    float hprev=(b>=off && b<n)?h[b-off]:0.f;
-    int   cprev=(b>=off && b<n)?c[b-off]:0;
+    int b = threadIdx.x;
+    float gp = 0.f, hp = 0.f; int cp = 0;
+    if (b < n && b >= off) { gp = g[b - off]; hp = h[b - off]; cp = c[b - off]; }
     __syncthreads();
-    if(b<n){ g[b]+=gprev; h[b]+=hprev; c[b]+=cprev; }
+    if (b < n) { g[b] += gp; h[b] += hp; c[b] += cp; }
   }
   __syncthreads();
 }
@@ -86,6 +85,7 @@ __global__ void cuda_find_best_splits_kernel(
   const int foff       = blockIdx.x;
   const int lane       = threadIdx.x & (WARP_SIZE-1);
   const int warp_id    = threadIdx.x / WARP_SIZE;
+  __shared__ int s_Keval;
 
   if(node_id>=num_nodes || foff>=num_features) return;
 
@@ -150,6 +150,14 @@ __global__ void cuda_find_best_splits_kernel(
   int64_t* leftc_arr   = reinterpret_cast<int64_t*>(ap);
   cur = reinterpret_cast<unsigned char*>(leftc_arr + num_bins);
 
+  // per-warp partial totals → block-wide reduce
+  float* s_tg = reinterpret_cast<float*>(cur); cur += WARPS * sizeof(float);
+  float* s_th = reinterpret_cast<float*>(cur); cur += WARPS * sizeof(float);
+  int*   s_tc = reinterpret_cast<int*>(cur);   cur += WARPS * sizeof(int);
+  // shared broadcast slots
+  float* s_era_weight  = reinterpret_cast<float*>(cur); cur += sizeof(float);
+  float* s_parent_gain = reinterpret_cast<float*>(cur); cur += sizeof(float);
+
   const int Tfull = max_int(num_bins-1,1);
   int Keval = 0;
 
@@ -212,7 +220,9 @@ __global__ void cuda_find_best_splits_kernel(
       }
     }
     __syncthreads();
-    Keval = __shfl_sync(0xffffffff, Keval, 0);
+    if (threadIdx.x == 0) s_Keval = Keval;
+    __syncthreads();
+    Keval = s_Keval;
   } else {
     if(threadIdx.x==0){
       if(k_cuts<=0 || k_cuts>=Tfull){ Keval=Tfull; for(int t=0;t<Keval;++t) thr_sh[t]=t; }
@@ -226,7 +236,9 @@ __global__ void cuda_find_best_splits_kernel(
       }
     }
     __syncthreads();
-    Keval = __shfl_sync(0xffffffff, Keval, 0);
+    if (threadIdx.x == 0) s_Keval = Keval;
+    __syncthreads();
+    Keval = s_Keval;
   }
 
   Keval = min_int(Keval, MAX_BINS-1);
@@ -272,52 +284,67 @@ __global__ void cuda_find_best_splits_kernel(
     }
     __syncthreads();
 
-    // totals for era
-    float tg=0.f, th=0.f; int tc=0;
-    for(int b=threadIdx.x; b<num_bins; b+=blockDim.x){ tg+=grad_bins[b]; th+=hess_bins[b]; tc+=count_bins[b]; }
-    tg=warp_reduce_sum(tg); th=warp_reduce_sum(th); tc=warp_reduce_sum_int(tc);
+    // ---- totals for this era (block-wide) ----
+    float tg_part = 0.f, th_part = 0.f; int tc_part = 0;
+    for (int b = threadIdx.x; b < num_bins; b += blockDim.x) {
+      tg_part += grad_bins[b]; th_part += hess_bins[b]; tc_part += count_bins[b];
+    }
+    tg_part = warp_reduce_sum(tg_part);
+    th_part = warp_reduce_sum(th_part);
+    tc_part = warp_reduce_sum_int(tc_part);
+    if ((threadIdx.x & (WARP_SIZE - 1)) == 0) {
+      const int w = threadIdx.x / WARP_SIZE;
+      s_tg[w] = tg_part; s_th[w] = th_part; s_tc[w] = tc_part;
+    }
+    __syncthreads();
+    float total_grad_e = 0.f, total_hess_e = 0.f; int total_count_e = 0;
+    if (threadIdx.x == 0) {
+      for (int w = 0; w < WARPS; ++w) { total_grad_e += s_tg[w]; total_hess_e += s_th[w]; total_count_e += s_tc[w]; }
+      *s_era_weight  = era_weights[node_id * num_eras + era];
+      *s_parent_gain = 0.5f * (total_grad_e * total_grad_e) / (total_hess_e + lambda_l2);
+      // stash block totals in the first warp slots for broadcast if needed
+      s_tg[0] = total_grad_e; s_th[0] = total_hess_e; s_tc[0] = total_count_e;
+    }
+    __syncthreads();
+    total_grad_e  = s_tg[0];
+    total_hess_e  = s_th[0];
+    total_count_e = s_tc[0];
+    const float era_weight  = *s_era_weight;
+    const float parent_gain = *s_parent_gain;
 
-    float w_e=0.f; if(lane==0) w_e = era_weights[node_id* num_eras + era];
-    w_e = __shfl_sync(0xffffffff, w_e, 0);
-
-    float parent_gain=0.f; if(lane==0) parent_gain = 0.5f*(tg*tg)/(th+lambda_l2);
-    parent_gain = __shfl_sync(0xffffffff, parent_gain, 0);
-
-    // left prefix on first Tfull bins
+    // prefix on first Tfull bins (we never split at the last bin)
     block_scan_prefix(grad_bins, hess_bins, count_bins, num_bins-1);
 
-    // one thread per threshold
-    if(threadIdx.x < Keval){
-      const int thr = thr_sh[threadIdx.x];
-      if(thr>=0 && thr<num_bins-1 && w_e>0.f){
+    // one (or more) thresholds per thread
+    for (int t = threadIdx.x; t < Keval; t += blockDim.x) {
+      const int thr = thr_sh[t];
+      if (thr >= 0 && thr < (num_bins - 1) && era_weight > 0.f) {
         const int   lc = count_bins[thr];
         const float lg = grad_bins[thr];
         const float lh = hess_bins[thr];
-        const int   rc = tc - lc;
-        if(lc>0 && rc>0){
-          const float rg = tg - lg;
-          const float rh = th - lh;
-          const float dL = lh + lambda_l2;
-          const float dR = rh + lambda_l2;
-          const float gain = 0.5f*((lg*lg)/dL + (rg*rg)/dR) - parent_gain;
+        const int   rc = total_count_e - lc;
+        if (lc > 0 && rc > 0) {
+          const float rg = total_grad_e - lg;
+          const float rh = total_hess_e - lh;
+          const float dL = lh + lambda_l2, dR = rh + lambda_l2;
+          const float gain = 0.5f * ((lg*lg)/dL + (rg*rg)/dR) - parent_gain;
 
-          // Welford
-          const float delta = gain - mean_arr[threadIdx.x];
-          const float neww  = wsum_arr[threadIdx.x] + w_e;
-          const float mean2 = mean_arr[threadIdx.x] + (w_e/neww)*delta;
+          const float delta = gain - mean_arr[t];
+          const float neww  = wsum_arr[t] + era_weight;
+          const float mean2 = mean_arr[t] + (era_weight/neww) * delta;
           const float delta2= gain - mean2;
 
-          M2_arr   [threadIdx.x] += w_e * delta * delta2;
-          mean_arr [threadIdx.x]  = mean2;
-          wsum_arr [threadIdx.x]  = neww;
+          M2_arr [t] += era_weight * delta * delta2;
+          mean_arr[t]  = mean2;
+          wsum_arr[t]  = neww;
 
-          leftg_arr[threadIdx.x] += lg;
-          lefth_arr[threadIdx.x] += lh;
-          leftc_arr[threadIdx.x] += (int64_t)lc;
+          leftg_arr[t] += lg;
+          lefth_arr[t] += lh;
+          leftc_arr[t] += (int64_t)lc;
 
-          if(direction_weight!=0.f){
+          if (direction_weight != 0.f) {
             const float Lv = -lg/dL, Rv = -rg/dR;
-            dir_arr[threadIdx.x] += w_e * ((Lv>Rv)?1.f:-1.f);
+            dir_arr[t] += era_weight * ((Lv > Rv) ? 1.f : -1.f);
           }
         }
       }
@@ -331,6 +358,7 @@ __global__ void cuda_find_best_splits_kernel(
     const float   TG = total_grad_nodes[node_id];
     const float   TH = total_hess_nodes[node_id];
     const int64_t TC = total_count_nodes[node_id];
+    (void)TG; (void)TH; // kept for parity/debug; not used here directly
 
     for(int i=0;i<Keval;++i){
       const int    th = thr_sh[i];
@@ -392,6 +420,7 @@ py::dict find_best_splits_batched_cuda(
   py::tuple bshape = py::tuple(bins.attr("shape"));   // [N,F]
   const int rows_dataset = (int)py::int_(bshape[0]);
   const int bins_stride  = (int)py::int_(bshape[1]);
+  (void)rows_dataset;
 
   py::tuple nshape = py::tuple(node_row_splits.attr("shape"));
   const int num_nodes = (int)py::int_(nshape[0]) - 1;
@@ -450,15 +479,17 @@ py::dict find_best_splits_batched_cuda(
       (size_t)NB*sizeof(int32_t) +                           // count_total
       (size_t)NB*sizeof(int32_t) +                           // thr_sh
       (size_t)NB*(6*sizeof(float)+sizeof(int64_t)) +         // per-threshold accums
+      (size_t)WARPS*(2*sizeof(float)+sizeof(int)) +          // per-warp totals
+      (size_t)(2*sizeof(float)) +                            // broadcast slots
       (alignof(int64_t)-1);
+
+  py::tuple era_shape = py::tuple(era_weights.attr("shape"));
+  const int num_eras = (int)py::int_(era_shape[1]);
 
   cudaEvent_t start_evt, stop_evt;
   CUDA_CHECK(cudaEventCreate(&start_evt));
   CUDA_CHECK(cudaEventCreate(&stop_evt));
   CUDA_CHECK(cudaEventRecord(start_evt));
-
-  const int num_eras =
-      (int)py::int_(py::tuple(era_weights.attr("shape"))[1]);
 
   cuda_find_best_splits_kernel<<<grid, block, shmem>>>(
     reinterpret_cast<const int8_t*>(bins_ptr),
@@ -478,7 +509,7 @@ py::dict find_best_splits_batched_cuda(
     (int)max_bins,
     (int)num_eras,
     (int)k_cuts,
-    (int)cut_mode,
+    (int)((cut_selection=="mass")?1:0),
     (int)min_samples_leaf,
     (float)lambda_l2,
     (float)lambda_dro,
