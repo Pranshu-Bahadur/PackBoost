@@ -86,5 +86,5 @@ class PackBoostConfig:
     feature_block_size: int = 32
     enable_node_batching: bool = True
     random_state: int | None = None
-    device: str = "cpu"
+    device: str = "cuda"
     prebinned: bool = False
