@@ -25,6 +25,7 @@ namespace {
 
 constexpr int WARP_SIZE = 32;
 constexpr int MAX_BINS = 512;
+__device__ constexpr float NEG_INF = -1.0e30f;
 
 __host__ __device__ inline int max_int(int a, int b) { return a > b ? a : b; }
 __host__ __device__ inline int min_int(int a, int b) { return a < b ? a : b; }
@@ -87,7 +88,7 @@ __global__ void cuda_find_best_splits_kernel(
 
     if (num_bins <= 1) {
         if (lane == 0) {
-            out_scores[out_index] = -std::numeric_limits<float>::infinity();
+            out_scores[out_index] = NEG_INF;
             out_thresholds[out_index] = -1;
             out_left_grad[out_index] = 0.0f;
             out_left_hess[out_index] = 0.0f;
@@ -103,7 +104,7 @@ __global__ void cuda_find_best_splits_kernel(
 
     if (node_total_rows < 2 * min_samples_leaf) {
         if (lane == 0) {
-            out_scores[out_index] = -std::numeric_limits<float>::infinity();
+            out_scores[out_index] = NEG_INF;
             out_thresholds[out_index] = -1;
             out_left_grad[out_index] = 0.0f;
             out_left_hess[out_index] = 0.0f;
@@ -346,7 +347,7 @@ __global__ void cuda_find_best_splits_kernel(
     }
 
     if (lane == 0) {
-        float best_score = -std::numeric_limits<float>::infinity();
+        float best_score = NEG_INF;
             int best_threshold = -1;
             float best_left_grad = 0.0f;
             float best_left_hess = 0.0f;
