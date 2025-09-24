@@ -1205,6 +1205,8 @@ class PackBoost:
             stats.nodes_collapsed += len(duplicate_map)
 
         stats.nodes_processed += len(contexts)
+        Nnodes = len(contexts)
+        expected_eras = max(1, max(len(ctx.shard.era_rows) for ctx in contexts))
         block_size = int(feat_ids.numel())
         stats.block_size = max(stats.block_size, block_size)
 
@@ -1223,25 +1225,32 @@ class PackBoost:
 
         era_offset_rows: list[list[int]] = []
         for ctx in contexts:
-            counts = [int(r.numel()) for r in ctx.shard.era_rows]
             prefix: list[int] = [0]
             running = 0
-            for cnt in counts:
+            for rows_tensor in ctx.shard.era_rows:
+                cnt = int(rows_tensor.numel())
                 running += cnt
+                prefix.append(running)
+            while len(prefix) < expected_eras + 1:
                 prefix.append(running)
             prefix = [p + ctx.row_start for p in prefix]
             era_offset_rows.append(prefix)
         node_era_splits = torch.tensor(
             era_offset_rows, dtype=torch.int32, device=self._device
         ).contiguous()
-        if node_era_splits.shape[1] != (Eras + 1):
+        if node_era_splits.shape[1] != (expected_eras + 1):
             raise RuntimeError("node_era_splits has unexpected width")
 
-        era_weights_tensor = (
-            torch.stack([c.era_weights.to(dtype=torch.float32) for c in contexts], 0)
-            .to(self._device, dtype=torch.float32)
-            .contiguous()
-        )
+        weight_rows: list[torch.Tensor] = []
+        for c in contexts:
+            w = c.era_weights.to(dtype=torch.float32)
+            if w.numel() == 0:
+                w = torch.ones((1,), dtype=torch.float32, device=self._device)
+            if w.numel() < expected_eras:
+                pad = torch.zeros((expected_eras - w.numel(),), dtype=torch.float32, device=self._device)
+                w = torch.cat([w, pad])
+            weight_rows.append(w)
+        era_weights_tensor = torch.stack(weight_rows, 0).contiguous()
         total_grad_nodes = torch.tensor(
             [c.total_grad for c in contexts], dtype=torch.float32, device=self._device
         )
