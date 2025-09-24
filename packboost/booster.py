@@ -1244,7 +1244,7 @@ class PackBoost:
             raise RuntimeError("node_era_splits start offsets mismatch node_row_splits")
         if not torch.equal(node_era_splits[:, -1], node_row_splits[1:]):
             raise RuntimeError("node_era_splits end offsets mismatch node_row_splits")
-        if (node_era_splits.diff(dim=1) < 0).any():
+        if (node_era_splits[:, 1:] - node_era_splits[:, :-1] < 0).any():
             raise RuntimeError("node_era_splits offsets must be non-decreasing")
 
         weight_rows: list[torch.Tensor] = []

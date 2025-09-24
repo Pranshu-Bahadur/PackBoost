@@ -164,6 +164,7 @@ __global__ void cuda_find_best_splits_kernel(
         }
     }
     __syncwarp();
+    num_eval = __shfl_sync(0xffffffff, num_eval, 0);
 
     if (k_cuts > 0 && k_cuts < num_thresholds_full && cut_mode == 1) {
         for (int idx = threadIdx.x; idx < num_bins; idx += blockDim.x) {
@@ -241,6 +242,7 @@ __global__ void cuda_find_best_splits_kernel(
             }
         }
         __syncwarp();
+        num_eval = __shfl_sync(0xffffffff, num_eval, 0);
     }
 
     if (lane == 0 && num_eval == 0) {
@@ -250,6 +252,8 @@ __global__ void cuda_find_best_splits_kernel(
         }
     }
     __syncwarp();
+    num_eval = __shfl_sync(0xffffffff, num_eval, 0);
+    num_eval = min_int(num_eval, MAX_BINS);
 
     for (int idx = threadIdx.x; idx < num_eval; idx += blockDim.x) {
         mean_arr[idx] = 0.0f;
