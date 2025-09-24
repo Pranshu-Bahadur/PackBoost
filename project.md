@@ -112,13 +112,12 @@ $v\_{L/R}=-,\frac{G\_{L/R}}{H\_{L/R}+\lambda}$
 * **Root histogram reuse.** Identical node shards (e.g., the pack roots at depth 0 or synchronized children) are detected via row signatures so histograms and DES scans are built once and decisions broadcast to duplicates. The native backend mirrors the Python frontier to keep instrumentation aligned.
 * **Directional parity with CUDA blueprint.** Per-era leaf values now drive a hard direction signal (`+1` if left > right else `-1`), matching the `directional_split_kernel` contract for future GPU integration.
 
-**CUDA.** Grid `(nodes_tile, features_tile)`, block `WARPS_PER_BLOCK × 32`, map **one warp → one (node,feature)**. Each warp:
+**CUDA.** Grid `(nodes_tile, features_tile)`, block `32`, map **one warp → one (node,feature)** with shared-memory histograms.
 
-* accumulates `[bins,2]` into shared memory via warp reductions (avoid atomics),
-* runs warp-exclusive scans (shuffles) to produce left aggregates; right by subtraction,
-* computes per-era gains and updates online $$(\mu\_G,\sigma\_G)$$ and $$\mathcal{D}\_s$$ in registers,
-* performs segmented scatters (warp scans) into persistent workspaces for child partitions.
-  Pack dimension $$B$$ is explicit (tile more (node,feature) or include $$B$$ in the tiling domain).
+* Shared `[bins] × (count, grad, hess)` buffers per warp tile rows by era without global atomics.
+* Streaming prefix builds threshold cuts (full sweep or on-the-fly `K` with mass/even policies) and updates Welford/dir stats in shared accumulators.
+* Kernel emits per-(node,feature) best score/threshold/left stats; host reduction applies deterministic tie-break and uses the Python partitioner (keeps API parity with CPU path).
+* Timing is surfaced (`kernel_ms`) so depth instrumentation can log fused frontier cost alongside CPU metrics.
 
 ---
 
@@ -568,10 +567,11 @@ find_best_splits_batched_cpu(
 
 ## 10) Changelog
 
-- 2025-09-23 — M1.2 / M2.1 alignment: prebinned path, DES parity, hull benchmark polish
+- 2025-09-23 — M1.2 / M2.1 alignment + M4 bootstrap: prebinned path, DES parity, CUDA frontier, hull benchmark polish
   - Added `PackBoostConfig.prebinned` for workflows that supply integer bins; `fit(..., era=None)` now defaults to a single era (useful for DES-off benchmarking).
   - Torch and native CPU frontiers collapse duplicate node shards (root histogram reuse) so packs share histogram/scan work; instrumentation reports `nodes_collapsed` for visibility.
   - DES directional term now matches the CUDA `directional_split_kernel`: per-era direction = `sign(left_value - right_value)` with weighted averaging, eliminating the old parent-direction heuristic.
+  - First CUDA fused frontier (warp-per-(node,feature)) implemented via `find_best_splits_batched_cuda`; shared-memory histograms with streaming K-cut selection feed a host-side tie-break so Torch and native paths stay isomorphic.
   - `examples/hull_benchmark.py` tightened preprocessing (explicit DES-off path, optional prebinned flag, no-leak era masks) to document the M1/M2 training flow.
 
 - 2025-09-21 — M1.1: Subtract-First Frontier + Packed Prediction

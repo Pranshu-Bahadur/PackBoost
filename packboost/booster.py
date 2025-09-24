@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from time import perf_counter
@@ -288,6 +289,8 @@ class PackBoost:
         self._trained_pack_size: int | None = None
         self._use_native_cpu = False
         self._cpu_backend = None
+        self._use_native_cuda = False
+        self._cuda_backend = None
         self._native_validate = os.getenv("PACKBOOST_NATIVE_VALIDATE") == "1"
 
         disable_native = os.getenv("PACKBOOST_DISABLE_NATIVE_CPU") == "1"
@@ -298,6 +301,15 @@ class PackBoost:
                     self._cpu_backend = native_backends
             except Exception:  # pragma: no cover - defensive guard
                 self._use_native_cpu = False
+
+        disable_native_cuda = os.getenv("PACKBOOST_DISABLE_NATIVE_CUDA") == "1"
+        if not disable_native_cuda and self._device.type == "cuda":
+            try:
+                if native_backends.cuda_available():
+                    self._use_native_cuda = True
+                    self._cuda_backend = native_backends
+            except Exception:  # pragma: no cover - defensive guard
+                self._use_native_cuda = False
 
     # Public -------------------------------------------------------------
 
@@ -361,7 +373,7 @@ class PackBoost:
             self._tree_weight = None
             self._trained_pack_size = None
             era_index = build_era_index(era_encoded, E)  # list[np.ndarray] of row ids per era
-            base_era_rows = [r for r in era_index]
+            base_era_rows = [r.to(device=self._device, dtype=torch.int64) for r in era_index]
             self._trees = []
 
             for round_idx in range(num_rounds):
@@ -999,6 +1011,272 @@ class PackBoost:
 
         return decisions, stats
 
+    def _find_best_splits_batched_cuda(
+        self,
+        nodes: Sequence[NodeShard],
+        grad: torch.Tensor,
+        hess: torch.Tensor,
+        bins: torch.Tensor,
+        feature_subset: torch.Tensor,
+    ) -> tuple[list[SplitDecision | None], DepthInstrumentation]:
+        stats = DepthInstrumentation()
+        M = len(nodes)
+        decisions: list[SplitDecision | None] = [None] * M
+        if M == 0:
+            return decisions, stats
+
+        num_bins = int(self.config.max_bins)
+        full_T = num_bins - 1
+        if full_T <= 0:
+            stats.nodes_skipped += M
+            return decisions, stats
+
+        feat_ids = feature_subset.to(self._device, dtype=torch.int32)
+        if feat_ids.numel() == 0:
+            stats.nodes_skipped += M
+            return decisions, stats
+        feat_ids_i64 = feat_ids.to(torch.int64)
+
+        lam_l2 = float(self.config.lambda_l2)
+
+        contexts: list[_NodeContext] = []
+        index_map: list[int] = []
+        row_chunks: list[torch.Tensor] = []
+        grad_chunks: list[torch.Tensor] = []
+        hess_chunks: list[torch.Tensor] = []
+        context_rows: list[torch.Tensor] = []
+        context_era_ids: list[torch.Tensor] = []
+        duplicate_map: dict[int, int] = {}
+        row_start = 0
+
+        for idx, node in enumerate(nodes):
+            all_rows, era_ids = self._stack_node_rows(node.era_rows)
+            if all_rows.device != self._device:
+                all_rows = all_rows.to(self._device)
+            if era_ids.device != self._device:
+                era_ids = era_ids.to(self._device)
+            total_count = int(all_rows.numel())
+            if total_count < 2 * self.config.min_samples_leaf:
+                stats.nodes_skipped += 1
+                continue
+
+            duplicate_idx: int | None = None
+            for ctx_idx, rows_ref in enumerate(context_rows):
+                if rows_ref.shape[0] != all_rows.shape[0]:
+                    continue
+                if not torch.equal(rows_ref, all_rows):
+                    continue
+                if not torch.equal(context_era_ids[ctx_idx], era_ids):
+                    continue
+                duplicate_idx = ctx_idx
+                break
+            if duplicate_idx is not None:
+                duplicate_map[idx] = duplicate_idx
+                continue
+
+            g_rows = grad.index_select(0, all_rows)
+            h_rows = hess.index_select(0, all_rows)
+            g_tot = float(g_rows.sum().item())
+            h_tot = float(h_rows.sum().item())
+
+            era_counts = torch.tensor(
+                [float(r.numel()) for r in node.era_rows],
+                dtype=torch.float32,
+                device=self._device,
+            )
+            era_w = self._compute_era_weights(era_counts)
+
+            ctx = _NodeContext(
+                shard=node,
+                era_weights=era_w,
+                parent_dir=torch.tensor(0.0, device=self._device),
+                total_grad=g_tot,
+                total_hess=h_tot,
+                total_count=total_count,
+                row_start=row_start,
+                row_count=total_count,
+            )
+            contexts.append(ctx)
+            index_map.append(idx)
+
+            row_chunks.append(all_rows)
+            grad_chunks.append(g_rows)
+            hess_chunks.append(h_rows)
+            context_rows.append(all_rows)
+            context_era_ids.append(era_ids)
+            row_start += total_count
+            stats.rows_total += total_count
+
+        if not contexts:
+            return decisions, stats
+
+        if duplicate_map:
+            stats.nodes_collapsed += len(duplicate_map)
+
+        stats.nodes_processed += len(contexts)
+        block_size = int(feat_ids.numel())
+        stats.block_size = max(stats.block_size, block_size)
+
+        rows_cat = torch.cat(row_chunks, 0)
+        bins_cat = bins.index_select(0, rows_cat)
+        grad_cat = torch.cat(grad_chunks, 0)
+        hess_cat = torch.cat(hess_chunks, 0)
+
+        node_row_offsets: list[int] = [ctx.row_start for ctx in contexts]
+        node_row_offsets.append(row_start)
+        node_row_splits = torch.tensor(node_row_offsets, dtype=torch.int32, device=self._device)
+
+        era_offset_rows: list[list[int]] = []
+        for ctx in contexts:
+            counts = [int(r.numel()) for r in ctx.shard.era_rows]
+            prefix: list[int] = [0]
+            running = 0
+            for cnt in counts:
+                running += cnt
+                prefix.append(running)
+            prefix = [p + ctx.row_start for p in prefix]
+            era_offset_rows.append(prefix)
+        node_era_splits = torch.tensor(era_offset_rows, dtype=torch.int32, device=self._device)
+
+        era_weights_tensor = torch.stack([c.era_weights for c in contexts], 0).contiguous()
+        total_grad_nodes = torch.tensor(
+            [c.total_grad for c in contexts], dtype=torch.float32, device=self._device
+        )
+        total_hess_nodes = torch.tensor(
+            [c.total_hess for c in contexts], dtype=torch.float32, device=self._device
+        )
+        total_count_nodes = torch.tensor(
+            [c.total_count for c in contexts], dtype=torch.int64, device=self._device
+        )
+
+        result = self._cuda_backend.find_best_splits_batched_cuda(
+            bins_cat,
+            grad_cat,
+            hess_cat,
+            node_row_splits,
+            node_era_splits,
+            era_weights_tensor,
+            total_grad_nodes,
+            total_hess_nodes,
+            total_count_nodes,
+            feat_ids,
+            int(self.config.max_bins),
+            int(self.config.k_cuts),
+            str(self.config.cut_selection),
+            lam_l2,
+            float(self.config.lambda_dro),
+            float(self.config.direction_weight),
+            int(self.config.min_samples_leaf),
+        )
+
+        kernel_ms = float(result.get("kernel_ms", 0.0))
+
+        scores_cpu = result["scores"].to("cpu").contiguous()
+        thresholds_cpu = result["thresholds"].to("cpu").contiguous()
+        left_grad_cpu = result["left_grad"].to("cpu").contiguous()
+        left_hess_cpu = result["left_hess"].to("cpu").contiguous()
+        left_count_cpu = result["left_count"].to("cpu").contiguous()
+
+        feat_ids_list = feat_ids_i64.to(torch.device("cpu")).tolist()
+        total_grad_list = total_grad_nodes.to(torch.device("cpu")).tolist()
+        total_hess_list = total_hess_nodes.to(torch.device("cpu")).tolist()
+        total_count_list = total_count_nodes.to(torch.device("cpu")).tolist()
+
+        scores_np = scores_cpu.numpy()
+        thresholds_np = thresholds_cpu.numpy()
+        left_grad_np = left_grad_cpu.numpy()
+        left_hess_np = left_hess_cpu.numpy()
+        left_count_np = left_count_cpu.numpy()
+
+        for cid, ctx in enumerate(contexts):
+            node_idx = index_map[cid]
+            node_scores = scores_np[cid]
+            node_thresholds = thresholds_np[cid]
+            node_left_grad = left_grad_np[cid]
+            node_left_hess = left_hess_np[cid]
+            node_left_count = left_count_np[cid]
+
+            best_score = float("-inf")
+            best_feature = -1
+            best_threshold = -1
+            best_left_grad = 0.0
+            best_left_hess = 0.0
+            best_left_count = 0
+
+            total_grad_node = float(total_grad_list[cid])
+            total_hess_node = float(total_hess_list[cid])
+            total_count_node = int(total_count_list[cid])
+
+            for f_index, feature_global in enumerate(feat_ids_list):
+                score_val = float(node_scores[f_index])
+                threshold_val = int(node_thresholds[f_index])
+                if threshold_val < 0 or not math.isfinite(score_val):
+                    continue
+                left_count_val = int(node_left_count[f_index])
+                right_count_val = total_count_node - left_count_val
+                if (
+                    left_count_val < self.config.min_samples_leaf
+                    or right_count_val < self.config.min_samples_leaf
+                ):
+                    continue
+
+                better = score_val > best_score
+                if not better and abs(score_val - best_score) <= 1e-12:
+                    if left_count_val > best_left_count:
+                        better = True
+                    elif left_count_val == best_left_count:
+                        if feature_global > best_feature:
+                            better = True
+                        elif feature_global == best_feature and threshold_val > best_threshold:
+                            better = True
+
+                if better:
+                    best_score = score_val
+                    best_feature = int(feature_global)
+                    best_threshold = threshold_val
+                    best_left_grad = float(node_left_grad[f_index])
+                    best_left_hess = float(node_left_hess[f_index])
+                    best_left_count = left_count_val
+
+            if best_feature < 0:
+                decisions[node_idx] = None
+                continue
+
+            right_grad = total_grad_node - best_left_grad
+            right_hess = total_hess_node - best_left_hess
+            right_count = total_count_node - best_left_count
+
+            left_rows, right_rows = self._partition_rows(
+                bins,
+                ctx.shard.era_rows,
+                best_feature,
+                best_threshold,
+            )
+
+            decisions[node_idx] = SplitDecision(
+                feature=best_feature,
+                threshold=best_threshold,
+                score=best_score,
+                left_grad=best_left_grad,
+                left_hess=best_left_hess,
+                right_grad=right_grad,
+                right_hess=right_hess,
+                left_count=best_left_count,
+                right_count=right_count,
+                left_rows=left_rows,
+                right_rows=right_rows,
+            )
+
+        if duplicate_map:
+            for dup_idx, ctx_idx in duplicate_map.items():
+                rep_node = index_map[ctx_idx]
+                decisions[dup_idx] = decisions[rep_node]
+
+        stats.feature_blocks += 1
+        stats.score_ms += kernel_ms
+        stats.nodes_subtract_ok += len(contexts)
+        return decisions, stats
+
     def _mass_cut_indices(self, counts_block: torch.Tensor, k: int) -> torch.Tensor:
         """Per-feature cut selection by mass quantiles over (nodes, eras)."""
         B, N, E, BINS = counts_block.shape
@@ -1040,6 +1318,8 @@ class PackBoost:
         ) -> tuple[list[SplitDecision | None], DepthInstrumentation]:
         if self._use_native_cpu:
             return self._find_best_splits_batched_native(nodes, grad, hess, bins, feature_subset)
+        if self._use_native_cuda:
+            return self._find_best_splits_batched_cuda(nodes, grad, hess, bins, feature_subset)
 
         stats = DepthInstrumentation()
         M = len(nodes)
