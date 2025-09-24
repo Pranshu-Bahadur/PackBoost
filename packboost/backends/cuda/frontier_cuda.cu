@@ -19,7 +19,7 @@ namespace {
 
 constexpr int WARP_SIZE = 32;
 constexpr int MAX_BINS  = 128;
-constexpr int THREADS   = 32;                  // 4 warps/block
+constexpr int THREADS   = 64;                  // 4 warps/block
 constexpr int WARPS     = THREADS / WARP_SIZE;
 __device__ constexpr float NEG_INF = -1.0e30f;
 
