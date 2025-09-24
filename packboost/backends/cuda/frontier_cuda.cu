@@ -175,7 +175,8 @@ __global__ void cuda_find_best_splits_kernel(
     __syncthreads();
 
     for(int b=threadIdx.x;b<num_bins;b+=blockDim.x){
-      int s=0; #pragma unroll
+      int s=0; 
+      #pragma unroll
       for(int w=0;w<WARPS;++w) s += cnt_w[w*num_bins+b];
       count_total[b]=s;
     }
