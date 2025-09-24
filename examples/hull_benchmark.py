@@ -441,7 +441,7 @@ def main():
     ap.add_argument("--min-samples-leaf", type=int, default=1)
     ap.add_argument("--max-bins", type=int, default=8)
     ap.add_argument("--k-cuts", type=int, default=0)
-    ap.add_argument("--layer-feature-fraction", type=float, default=1.0)
+    ap.add_argument("--layer-feature-fraction", type=float, default=0.1)
     ap.add_argument("--direction-weight", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--prebinned", action="store_true",
@@ -450,7 +450,7 @@ def main():
     # Evaluation mode (on bucketed eras)
     ap.add_argument("--cv-splits", type=int, default=0, help="If >0, use TimeSeriesSplit CV over bucketed eras.")
     ap.add_argument("--embargo-eras", type=int, default=0, help="Gap eras removed from end of each train fold (bucketed).")
-    ap.add_argument("--holdout-frac", type=float, default=0.05, help="If cv-splits=0 and holdout-eras not set.")
+    ap.add_argument("--holdout-frac", type=float, default=0.02, help="If cv-splits=0 and holdout-eras not set.")
     ap.add_argument("--holdout-eras", type=int, default=1,
                     help="If set (>0), hold out the last N bucketed eras (default 1 bucket).")
 

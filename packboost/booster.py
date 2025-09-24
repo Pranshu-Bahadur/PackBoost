@@ -1141,9 +1141,15 @@ class PackBoost:
         for idx, node in enumerate(nodes):
             all_rows, era_ids = self._stack_node_rows(node.era_rows)
             if all_rows.device != self._device:
-                all_rows = all_rows.to(self._device)
+                all_rows = all_rows.to(self._device, dtype=torch.int64)
+            else:
+                all_rows = all_rows.to(dtype=torch.int64)
             if era_ids.device != self._device:
-                era_ids = era_ids.to(self._device)
+                era_ids = era_ids.to(self._device, dtype=torch.int16)
+            else:
+                era_ids = era_ids.to(dtype=torch.int16)
+            all_rows = all_rows.contiguous()
+            era_ids = era_ids.contiguous()
             total_count = int(all_rows.numel())
             if total_count < 2 * self.config.min_samples_leaf:
                 stats.nodes_skipped += 1
@@ -1189,8 +1195,8 @@ class PackBoost:
             index_map.append(idx)
 
             row_chunks.append(all_rows)
-            grad_chunks.append(g_rows)
-            hess_chunks.append(h_rows)
+            grad_chunks.append(g_rows.contiguous())
+            hess_chunks.append(h_rows.contiguous())
             context_rows.append(all_rows)
             context_era_ids.append(era_ids)
             row_start += total_count
@@ -1206,14 +1212,19 @@ class PackBoost:
         block_size = int(feat_ids.numel())
         stats.block_size = max(stats.block_size, block_size)
 
-        rows_cat = torch.cat(row_chunks, 0)
-        bins_cat_i8 = bins.index_select(0, rows_cat).to(torch.int8).contiguous()
-        grad_cat = torch.cat(grad_chunks, 0)
-        hess_cat = torch.cat(hess_chunks, 0)
+        rows_cat = torch.cat(row_chunks, 0).contiguous()
+        bins_cat_i8 = bins.index_select(0, rows_cat).to(dtype=torch.int8).contiguous()
+        grad_cat = torch.cat(grad_chunks, 0).contiguous()
+        hess_cat = torch.cat(hess_chunks, 0).contiguous()
 
         node_row_offsets: list[int] = [ctx.row_start for ctx in contexts]
         node_row_offsets.append(row_start)
-        node_row_splits = torch.tensor(node_row_offsets, dtype=torch.int32, device=self._device)
+        node_row_splits_np = np.asarray(node_row_offsets, dtype=np.int32)
+        node_row_splits = (
+            torch.from_numpy(node_row_splits_np)
+            .to(self._device, dtype=torch.int32)
+            .contiguous()
+        )
 
         era_offset_rows: list[list[int]] = []
         for ctx in contexts:
@@ -1225,9 +1236,18 @@ class PackBoost:
                 prefix.append(running)
             prefix = [p + ctx.row_start for p in prefix]
             era_offset_rows.append(prefix)
-        node_era_splits = torch.tensor(era_offset_rows, dtype=torch.int32, device=self._device)
+        node_era_splits_np = np.asarray(era_offset_rows, dtype=np.int32)
+        node_era_splits = (
+            torch.from_numpy(node_era_splits_np)
+            .to(self._device, dtype=torch.int32)
+            .contiguous()
+        )
 
-        era_weights_tensor = torch.stack([c.era_weights for c in contexts], 0).contiguous()
+        era_weights_tensor = (
+            torch.stack([c.era_weights.to(dtype=torch.float32) for c in contexts], 0)
+            .to(self._device, dtype=torch.float32)
+            .contiguous()
+        )
         total_grad_nodes = torch.tensor(
             [c.total_grad for c in contexts], dtype=torch.float32, device=self._device
         )
