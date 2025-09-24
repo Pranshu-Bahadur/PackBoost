@@ -49,6 +49,49 @@ __device__ inline void block_scan_prefix(float* g, float* h, int* c, int n) {
   __syncthreads();
 }
 
+__global__ void cuda_predict_bins_kernel(
+    const uint8_t* __restrict__ bins_rowmajor,  // [N, F] (row-major)
+    int bins_stride,                             // = F
+    int num_rows,
+
+    const int32_t* __restrict__ feature,        // [num_nodes]
+    const int32_t* __restrict__ threshold,      // [num_nodes]
+    const int32_t* __restrict__ left,           // [num_nodes]
+    const int32_t* __restrict__ right,          // [num_nodes]
+    const uint8_t* __restrict__ is_leaf,        // [num_nodes] (0/1)
+    const float*   __restrict__ value,          // [num_nodes]
+    int num_nodes,
+
+    float* __restrict__ out                     // [N]
+){
+    // grid-stride: one thread routes many rows independently
+    for (int row = blockIdx.x * blockDim.x + threadIdx.x;
+         row < num_rows;
+         row += blockDim.x * gridDim.x)
+    {
+        int node = 0;
+        // Safety cap to avoid rare malformed trees causing infinite loops
+        // (depth <= num_nodes for well-formed binary trees)
+        for (int it = 0; it < num_nodes; ++it) {
+            if (is_leaf[node]) {
+                out[row] = value[node];
+                break;
+            }
+            const int f   = feature[node];
+            const int thr = threshold[node];
+            const int v   = int(bins_rowmajor[(size_t)row * (size_t)bins_stride + (size_t)f]);
+            const bool go_left = (v <= thr);
+            node = go_left ? left[node] : right[node];
+
+            // Defensive guard: if nodes are corrupted, emit 0 and stop
+            if (node < 0 || node >= num_nodes) {
+                out[row] = 0.0f;
+                break;
+            }
+        }
+    }
+}
+
 __global__ void cuda_find_best_splits_kernel(
   // bins is ROW-MAJOR: [rows_dataset, num_features]
   const int8_t* __restrict__ bins_rowmajor,
@@ -534,7 +577,78 @@ py::dict find_best_splits_batched_cuda(
   return r;
 }
 
+
+py::object predict_bins_cuda(
+    py::object bins,        // torch.uint8 or int8 [N,F] on CUDA
+    py::object feature,     // torch.int32 [num_nodes] on same device
+    py::object threshold,   // torch.int32 [num_nodes]
+    py::object left,        // torch.int32 [num_nodes]
+    py::object right,       // torch.int32 [num_nodes]
+    py::object value,       // torch.float32 [num_nodes]
+    py::object is_leaf      // torch.bool [num_nodes]  (or uint8)
+){
+    py::module torch = py::module::import("torch");
+    py::tuple bshape = py::tuple(bins.attr("shape"));
+    const int N = (int)py::int_(bshape[0]);
+    const int F = (int)py::int_(bshape[1]);
+
+    py::tuple nshape = py::tuple(feature.attr("shape"));
+    const int num_nodes = (int)py::int_(nshape[0]);
+
+    if (N == 0 || num_nodes == 0) {
+        return torch.attr("empty")(py::make_tuple(0), "device"_a=bins.attr("device"),
+                                   "dtype"_a=torch.attr("float32"));
+    }
+
+    // device
+    py::object device = bins.attr("device");
+
+    // Make sure dtypes are as expected (cheap, no copies if already correct)
+    auto bins_u8 = bins;
+    if (!py::bool_(bins.attr("dtype").attr("is_floating_point")()).cast<bool>()) {
+        // cast to uint8 view if needed (int8 is fine; pointer is reinterpreted as uint8_t)
+        // We’ll pass its data_ptr as uint8_t*
+    }
+
+    // output
+    auto out = torch.attr("empty")(py::make_tuple(N), "device"_a=device,
+                                   "dtype"_a=torch.attr("float32"));
+
+    // raw ptrs
+    const uintptr_t bins_ptr  = py::int_(bins.attr("data_ptr")());
+    const uintptr_t feat_ptr  = py::int_(feature.attr("data_ptr")());
+    const uintptr_t thr_ptr   = py::int_(threshold.attr("data_ptr")());
+    const uintptr_t left_ptr  = py::int_(left.attr("data_ptr")());
+    const uintptr_t right_ptr = py::int_(right.attr("data_ptr")());
+    const uintptr_t val_ptr   = py::int_(value.attr("data_ptr")());
+    // is_leaf: accept bool or uint8; we read bytes (0/1)
+    const uintptr_t leaf_ptr  = py::int_(is_leaf.attr("to")(torch.attr("uint8")).attr("contiguous")().attr("data_ptr")());
+    const uintptr_t out_ptr   = py::int_(out.attr("data_ptr")());
+
+    // launch
+    const int threads = 256;
+    int blocks = (N + threads - 1) / threads;
+    blocks = std::min(blocks, 65535);  // 1D grid cap
+
+    cuda_predict_bins_kernel<<<blocks, threads>>>(
+        reinterpret_cast<const uint8_t*>(bins_ptr), F, N,
+        reinterpret_cast<const int32_t*>(feat_ptr),
+        reinterpret_cast<const int32_t*>(thr_ptr),
+        reinterpret_cast<const int32_t*>(left_ptr),
+        reinterpret_cast<const int32_t*>(right_ptr),
+        reinterpret_cast<const uint8_t*>(leaf_ptr),
+        reinterpret_cast<const float*>(val_ptr),
+        (int)num_nodes,
+        reinterpret_cast<float*>(out_ptr)
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    return out;
+}
+
 } // namespace
+
+
 
 void register_cuda_frontier(py::module_& m){
   m.def("_cuda_available", [](){return true;}, "Native CUDA backend is available.");
@@ -546,4 +660,18 @@ void register_cuda_frontier(py::module_& m){
     py::arg("lambda_l2"), py::arg("lambda_dro"), py::arg("direction_weight"),
     py::arg("min_samples_leaf"), py::arg("rows_total_compact"),
     "Find best splits for a batch of nodes using the CUDA backend.");
+  // ====== in register_cuda_frontier(...) add:
+  m.def(
+    "predict_bins_cuda",
+    &predict_bins_cuda,
+    py::arg("bins"),
+    py::arg("feature"),
+    py::arg("threshold"),
+    py::arg("left"),
+    py::arg("right"),
+    py::arg("value"),
+    py::arg("is_leaf"),
+    "Fast CUDA router for a single tree over binned features."
+  );
+
 }

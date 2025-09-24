@@ -69,41 +69,63 @@ class Tree:
         device = bins.device
         if N == 0:
             return torch.empty(0, dtype=torch.float32, device=device)
+
+        # Fast native CUDA path (per-tree) — drop-in
+        if device.type == "cuda":
+            try:
+                from . import backends as native_backends
+                if native_backends.cuda_available():
+                    c = self._ensure_compiled(device)
+                    # Ensure compact dtypes; no copies if already correct
+                    feat = c["feature"].to(torch.int32)
+                    thr  = c["threshold"].to(torch.int32)
+                    left = c["left"].to(torch.int32)
+                    right= c["right"].to(torch.int32)
+                    val  = c["value"].to(torch.float32)
+                    leaf = c["is_leaf"].to(torch.bool)
+
+                    # bins can be int8 or uint8; backend reads bytes
+                    bins_b = bins.contiguous()
+                    return native_backends.predict_bins_cuda(
+                        bins_b, feat, thr, left, right, val, leaf
+                    )
+            except Exception:
+                # fall back if anything goes wrong
+                pass
+
+        # CPU fallback (NumPy) remains as-is
         if device.type == "cpu":
             return self._predict_bins_cpu_numpy(bins)
 
+        # Generic Torch fallback (kept for completeness)
         c = self._ensure_compiled(device)
         node_idx = torch.zeros(N, dtype=torch.int32, device=device)
         out = torch.zeros(N, dtype=torch.float32, device=device)
         active = torch.arange(N, dtype=torch.int64, device=device)
-
         while active.numel() > 0:
             nodes = node_idx.index_select(0, active).to(torch.int64)
             is_leaf = c["is_leaf"].index_select(0, nodes)
             if is_leaf.all():
-                out[active] = c["value"].index_select(0, nodes)
-                break
+                out[active] = c["value"].index_select(0, nodes); break
             if is_leaf.any():
                 leaf_rows = active[is_leaf]
                 leaf_nodes = nodes[is_leaf]
                 out[leaf_rows] = c["value"].index_select(0, leaf_nodes)
                 active = active[~is_leaf]
                 nodes = nodes[~is_leaf]
-                if active.numel() == 0:
-                    break
-
+                if active.numel() == 0: break
             feat = c["feature"].index_select(0, nodes).to(torch.int64)
-            thr = c["threshold"].index_select(0, nodes).to(torch.int64)
+            thr  = c["threshold"].index_select(0, nodes).to(torch.int64)
             row_feat = bins.index_select(0, active)
             val = row_feat.gather(1, feat.view(-1, 1)).squeeze(1).to(torch.int64)
             go_left = val <= thr
             next_idx = torch.where(go_left, c["left"].index_select(0, nodes), c["right"].index_select(0, nodes))
             node_idx.index_copy_(0, active, next_idx.to(torch.int32))
-
         if active.numel() > 0:
             nodes = node_idx.index_select(0, active).to(torch.int64)
             out[active] = c["value"].index_select(0, nodes)
         return out
+
 
     def _predict_bins_cpu_numpy(self, bins: torch.Tensor) -> torch.Tensor:
         bins_np = bins.detach().cpu().numpy()
