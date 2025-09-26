@@ -131,9 +131,9 @@ __global__ void frontier_scatter_kernel(
     const int32_t* lsplit   = left_splits     + n * (E + 1);
     const int32_t* rsplit   = right_splits    + n * (E + 1);
 
-    extern __shared__ int32_t smem[];
-    int32_t* curL = smem;          // [E]
-    int32_t* curR = smem + E;      // [E]
+    extern __shared__ unsigned char smem[];
+    int32_t* curL = reinterpret_cast<int32_t*>(smem);          // [E]
+    int32_t* curR = reinterpret_cast<int32_t*>(smem) + E;      // [E]
 
     // init cursors
     for (int e = threadIdx.x; e < E; e += TPB) {
