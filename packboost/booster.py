@@ -316,6 +316,12 @@ class PackBoost:
         self._native_validate = os.getenv("PACKBOOST_NATIVE_VALIDATE") == "1"
         self._round_metrics: list[dict[str, float]] = []
 
+        # Packed-forest cache for fast inference/eval (flattened per-pack)
+        self._packed_forest: list[dict[str, torch.Tensor]] = []
+
+        # Optional: allow disabling pack predictor with an env var
+        self._disable_pack_predict = os.getenv("PACKBOOST_DISABLE_PACK_PREDICT") == "1"
+
         disable_native = os.getenv("PACKBOOST_DISABLE_NATIVE_CPU") == "1"
         if not disable_native and self._device.type == "cpu":
             try:
@@ -399,6 +405,7 @@ class PackBoost:
             self._tree_weight = None
             self._trained_pack_size = None
             self._round_metrics = []
+            self._packed_forest = []  # drop any cached packs from previous fits
             era_index = build_era_index(era_encoded, E)  # list[np.ndarray] of row ids per era
             base_era_rows = [r.to(device=self._device, dtype=torch.int64) for r in era_index]
             self._trees = []
@@ -552,30 +559,63 @@ class PackBoost:
                 # Pack prediction and averaging (lr / B)
                 pack_sum = torch.zeros_like(preds)
                 per_tree_w = float(self.config.learning_rate) / float(self.config.pack_size)
+
+                # Build trees and collect the list for this pack
+                pack_trees: list[Tree] = []
                 for t_id, tb in enumerate(pack_builders):
                     tr = tb.build()
+                    pack_trees.append(tr)
                     self._trees.append(tr)
+
+                    # training-time contribution on the training rows (unchanged)
                     leaves = leaf_assignments[t_id]
-                    if not leaves:
-                        continue
-                    for leaf_id, rows_all in leaves.items():
-                        if rows_all.numel() == 0:
-                            continue
-                        value = float(tr.nodes[leaf_id].value)
-                        contrib = torch.full(
-                            (rows_all.numel(),),
-                            value,
-                            dtype=torch.float32,
-                            device=self._device,
-                        )
-                        pack_sum.index_add_(0, rows_all, contrib)
-                    for state in eval_states:
-                        bins_eval: torch.Tensor = state["bins"]  # type: ignore[assignment]
-                        preds_eval: torch.Tensor = state["preds"]  # type: ignore[assignment]
-                        preds_eval.add_(per_tree_w * tr.predict_bins(bins_eval))
+                    if leaves:
+                        for leaf_id, rows_all in leaves.items():
+                            if rows_all.numel() == 0:
+                                continue
+                            value = float(tr.nodes[leaf_id].value)
+                            contrib = torch.full(
+                                (rows_all.numel(),),
+                                value,
+                                dtype=torch.float32,
+                                device=self._device,
+                            )
+                            pack_sum.index_add_(0, rows_all, contrib)
+
                 preds += per_tree_w * pack_sum
                 self._tree_weight = per_tree_w
                 self._trained_pack_size = int(self.config.pack_size)
+
+                # -------- Fast eval prediction for this pack (single CUDA call) --------
+                if eval_states:
+                    use_pack_predict = (
+                        (self._device.type == "cuda")
+                        and (self._cuda_backend is not None)
+                        and (not self._disable_pack_predict)
+                    )
+                    if use_pack_predict:
+                        pack = self._pack_trees_cuda(pack_trees, self._device)
+                        # cache for final predict
+                        self._packed_forest.append(pack)
+                        for state in eval_states:
+                            bins_eval: torch.Tensor = state["bins"]  # type: ignore[assignment]
+                            preds_eval: torch.Tensor = state["preds"]  # type: ignore[assignment]
+                            out_add = self._cuda_backend.predict_pack_cuda(
+                                bins_eval.contiguous(),
+                                pack["feature"], pack["threshold"],
+                                pack["left_abs"], pack["right_abs"],
+                                pack["value"], pack["is_leaf"], pack["offsets"],
+                                float(per_tree_w),
+                            )
+                            preds_eval.add_(out_add)
+                    else:
+                        # Fallback: per-tree eval
+                        for tr in pack_trees:
+                            for state in eval_states:
+                                bins_eval: torch.Tensor = state["bins"]  # type: ignore[assignment]
+                                preds_eval: torch.Tensor = state["preds"]  # type: ignore[assignment]
+                                preds_eval.add_(per_tree_w * tr.predict_bins(bins_eval))
+                # -----------------------------------------------------------------------
 
                 round_elapsed = perf_counter() - round_start
                 log_metrics(round_idx, round_elapsed)
@@ -587,17 +627,38 @@ class PackBoost:
             raise RuntimeError("Model must be fitted before predict()")
         bins_np = apply_bins(X, self._binner.bin_edges, self.config.max_bins)
         with torch.no_grad():
-            bins = torch.from_numpy(bins_np).to(device=self._device)
+            bins = torch.from_numpy(bins_np).to(device=self._device, dtype=torch.int8)
             if not self._trees:
                 return np.zeros(bins.shape[0], dtype=np.float32)
             if self._tree_weight is None:
                 raise RuntimeError("Missing _tree_weight; call fit() first.")
             if self._trained_pack_size is not None and int(self.config.pack_size) != self._trained_pack_size:
                 raise RuntimeError("pack_size differs from training; keep it constant.")
+
+            # Fast path: cached pack-forest + CUDA backend
+            if (
+                self._packed_forest
+                and self._device.type == "cuda"
+                and self._cuda_backend is not None
+                and not self._disable_pack_predict
+            ):
+                pred = torch.zeros(bins.shape[0], dtype=torch.float32, device=self._device)
+                for pack in self._packed_forest:
+                    out_add = self._cuda_backend.predict_pack_cuda(
+                        bins.contiguous(),
+                        pack["feature"], pack["threshold"],
+                        pack["left_abs"], pack["right_abs"],
+                        pack["value"], pack["is_leaf"], pack["offsets"],
+                        float(self._tree_weight),
+                    )
+                    pred.add_(out_add)
+                return pred.cpu().numpy()
+
+            # Fallback: per-tree (CPU or CUDA)
             pred = torch.zeros(bins.shape[0], dtype=torch.float32, device=self._device)
             for tr in self._trees:
                 pred += self._tree_weight * tr.predict_bins(bins)
-        return pred.cpu().numpy()
+            return pred.cpu().numpy()
 
     @property
     def round_metrics(self) -> Sequence[dict[str, float]]:
@@ -610,7 +671,65 @@ class PackBoost:
             raise ValueError("block_size_trees must be positive")
         if self._binner is None:
             raise RuntimeError("Model must be fitted before predict_packwise()")
+        # Delegate to predict(): we already cached per-pack flattenings during fit
         return self.predict(X)
+
+    # Internals ----------------------------------------------------------
+
+    def _pack_trees_cuda(self, trees: Sequence[Tree], device: torch.device) -> dict[str, torch.Tensor]:
+        """
+        Flatten a list of trees into concatenated arrays that a CUDA kernel can
+        traverse in parallel. Child indices are converted to absolute indices
+        within the pack. Leaves keep is_leaf=1 and their children are set to -1.
+        Returns tensors on `device` with compact dtypes.
+        """
+        # Count total nodes and prepare offsets
+        num_trees = len(trees)
+        node_counts = [len(t.nodes) for t in trees]
+        offsets = [0]
+        for c in node_counts:
+            offsets.append(offsets[-1] + c)
+        total_nodes = offsets[-1]
+
+        # Build host arrays
+        feat = torch.empty(total_nodes, dtype=torch.int32)
+        thr = torch.empty_like(feat)
+        left_a = torch.empty_like(feat)
+        right_a = torch.empty_like(feat)
+        vals = torch.empty(total_nodes, dtype=torch.float32)
+        leaf_u8 = torch.empty(total_nodes, dtype=torch.uint8)
+
+        # Fill
+        for ti, t in enumerate(trees):
+            base = offsets[ti]
+            for i, n in enumerate(t.nodes):
+                j = base + i
+                feat[j] = int(n.feature)
+                thr[j] = int(n.threshold)
+                vals[j] = float(n.value)
+                if n.is_leaf:
+                    leaf_u8[j] = 1
+                    left_a[j] = -1
+                    right_a[j] = -1
+                else:
+                    leaf_u8[j] = 0
+                    left_a[j] = (base + n.left) if n.left >= 0 else -1
+                    right_a[j] = (base + n.right) if n.right >= 0 else -1
+
+        # Offsets tensor (prefix sum per tree; last item = total_nodes)
+        off_t = torch.tensor(offsets, dtype=torch.int32)
+
+        # Move to device once, make contiguous
+        pack = {
+            "feature": feat.to(device=device, non_blocking=True).contiguous(),
+            "threshold": thr.to(device=device, non_blocking=True).contiguous(),
+            "left_abs": left_a.to(device=device, non_blocking=True).contiguous(),
+            "right_abs": right_a.to(device=device, non_blocking=True).contiguous(),
+            "value": vals.to(device=device, non_blocking=True).contiguous(),
+            "is_leaf": leaf_u8.to(device=device, non_blocking=True).contiguous(),
+            "offsets": off_t.to(device=device, non_blocking=True).contiguous(),
+        }
+        return pack
 
     # Internals ----------------------------------------------------------
 
