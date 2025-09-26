@@ -598,10 +598,10 @@ py::dict find_best_splits_batched_cuda(
 
   py::module torch = py::module::import("torch");
 
-  // Shapes
-  py::tuple bshape = py::tuple(bins.attr("shape"));   // [N,F]
-  const int rows_dataset = (int)py::int_(bshape[0]);
-  const int num_features_all  = (int)py::int_(bshape[1]);
+  // Shapes (feature-major [F,N])
+  py::tuple bshape = py::tuple(bins.attr("shape"));   // [F,N]
+  const int num_features_all = (int)py::int_(bshape[0]);
+  const int rows_dataset     = (int)py::int_(bshape[1]);
 
   py::tuple nshape = py::tuple(node_row_splits.attr("shape"));
   const int num_nodes = (int)py::int_(nshape[0]) - 1;
@@ -726,9 +726,9 @@ py::dict partition_frontier_cuda(
 ){
   py::module torch = py::module::import("torch");
 
-  // Shapes & meta
-  py::tuple bshape = py::tuple(bins.attr("shape"));    // [N,F]
-  const int N = (int)py::int_(bshape[0]);
+  // Shapes & meta (feature-major [F,N])
+  py::tuple bshape = py::tuple(bins.attr("shape"));    // [F,N]
+  const int N = (int)py::int_(bshape[1]);
 
   py::tuple nshape = py::tuple(node_row_splits.attr("shape")); // [Nsel+1]
   const int Nsel = (int)py::int_(nshape[0]) - 1;
@@ -862,9 +862,10 @@ py::object predict_bins_cuda(
     py::object is_leaf      // torch.bool [num_nodes]  (or uint8)
 ){
     py::module torch = py::module::import("torch");
+    // bins is feature-major [F, N]
     py::tuple bshape = py::tuple(bins.attr("shape"));
-    const int N = (int)py::int_(bshape[0]);
-    const int F = (int)py::int_(bshape[1]);
+    const int F = (int)py::int_(bshape[0]);
+    const int N = (int)py::int_(bshape[1]);
 
     py::tuple nshape = py::tuple(feature.attr("shape"));
     const int num_nodes = (int)py::int_(nshape[0]);
@@ -985,9 +986,10 @@ py::object predict_pack_cuda(
   float tree_weight        // per-tree scale (e.g., lr / pack_size)
 ){
   py::module torch = py::module::import("torch");
+  // bins is feature-major [F, N]
   py::tuple bshape = py::tuple(bins.attr("shape"));
-  const int N = (int)py::int_(bshape[0]);
-  const int F = (int)py::int_(bshape[1]);
+  const int F = (int)py::int_(bshape[0]);
+  const int N = (int)py::int_(bshape[1]);
   if (N == 0) {
       return torch.attr("empty")(py::make_tuple(0), "device"_a=bins.attr("device"),
                                  "dtype"_a=torch.attr("float32"));
