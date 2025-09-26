@@ -586,36 +586,47 @@ class PackBoost:
                 self._tree_weight = per_tree_w
                 self._trained_pack_size = int(self.config.pack_size)
 
-                # -------- Fast eval prediction for this pack (single CUDA call) --------
-                if eval_states:
-                    use_pack_predict = (
-                        (self._device.type == "cuda")
-                        and (self._cuda_backend is not None)
-                        and (not self._disable_pack_predict)
-                    )
-                    if use_pack_predict:
-                        pack = self._pack_trees_cuda(pack_trees, self._device)
-                        # cache for final predict
-                        self._packed_forest.append(pack)
-                        for state in eval_states:
-                            bins_eval: torch.Tensor = state["bins"]  # type: ignore[assignment]
-                            preds_eval: torch.Tensor = state["preds"]  # type: ignore[assignment]
-                            out_add = self._cuda_backend.predict_pack_cuda(
-                                bins_eval.contiguous(),
-                                pack["feature"], pack["threshold"],
-                                pack["left_abs"], pack["right_abs"],
-                                pack["value"], pack["is_leaf"], pack["offsets"],
-                                float(per_tree_w),
-                            )
-                            preds_eval.add_(out_add)
-                    else:
-                        # Fallback: per-tree eval
-                        for tr in pack_trees:
-                            for state in eval_states:
-                                bins_eval: torch.Tensor = state["bins"]  # type: ignore[assignment]
-                                preds_eval: torch.Tensor = state["preds"]  # type: ignore[assignment]
-                                preds_eval.add_(per_tree_w * tr.predict_bins(bins_eval))
-                # -----------------------------------------------------------------------
+                # Cache this pack's flattened trees for fast eval/predict on CUDA
+                if (
+                    (self._device.type == "cuda")
+                    and (self._cuda_backend is not None)
+                    and (not self._disable_pack_predict)
+                ):
+                    pack = self._pack_trees_cuda(pack_trees, self._device)
+                    self._packed_forest.append(pack)
+
+                # Optionally delay eval to reduce overhead; compute only on certain rounds
+                eval_every = int(os.getenv("PACKBOOST_EVAL_EVERY", "1"))
+                evaluate_now = (
+                    bool(eval_states)
+                    and (((round_idx + 1) % max(1, eval_every)) == 0 or (round_idx + 1) == num_rounds)
+                )
+                if evaluate_now:
+                    for state in eval_states:
+                        bins_eval: torch.Tensor = state["bins"]  # type: ignore[assignment]
+                        y_eval_tensor: torch.Tensor = state["y_tensor"]  # type: ignore[assignment]
+                        preds_eval = torch.zeros_like(y_eval_tensor)
+                        # Fast path: use cached packs on CUDA
+                        if (
+                            self._packed_forest
+                            and self._device.type == "cuda"
+                            and self._cuda_backend is not None
+                            and not self._disable_pack_predict
+                        ):
+                            for p in self._packed_forest:
+                                out_add = self._cuda_backend.predict_pack_cuda(
+                                    bins_eval.contiguous(),
+                                    p["feature"], p["threshold"],
+                                    p["left_abs"], p["right_abs"],
+                                    p["value"], p["is_leaf"], p["offsets"],
+                                    float(self._tree_weight),
+                                )
+                                preds_eval.add_(out_add)
+                        else:
+                            # Fallback: sum across all trees
+                            for tr in self._trees:
+                                preds_eval.add_(self._tree_weight * tr.predict_bins(bins_eval))
+                        state["preds"] = preds_eval  # type: ignore[index]
 
                 round_elapsed = perf_counter() - round_start
                 log_metrics(round_idx, round_elapsed)
