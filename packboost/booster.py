@@ -82,10 +82,11 @@ class Tree:
                     left = c["left"].to(torch.int32)
                     right= c["right"].to(torch.int32)
                     val  = c["value"].to(torch.float32)
-                    leaf = c["is_leaf"].to(torch.bool)
+                    leaf = c["is_leaf"].to(torch.uint8)
 
                     # bins can be int8 or uint8; backend expects feature-major [F,N]
                     bins_fm = bins.to(torch.uint8).t().contiguous()
+                    from . import backends as native_backends
                     return native_backends.predict_bins_cuda(
                         bins_fm, feat, thr, left, right, val, leaf
                     )
@@ -342,6 +343,7 @@ class PackBoost:
                     self._cuda_backend = native_backends
             except Exception:  # pragma: no cover - defensive guard
                 self._use_native_cuda = False
+                print('here?')
 
     
     def _assert_feature_major_i8(self, fm: torch.Tensor, rows_dataset: int, feat_max: int, row_max: int) -> None:
@@ -623,7 +625,7 @@ class PackBoost:
                                     else state["bins"].to(torch.uint8).t().contiguous(),  # type: ignore[index]
                                     p["feature"], p["threshold"],
                                     p["left_abs"], p["right_abs"],
-                                    p["value"], p["is_leaf"], p["offsets"],
+                                    p["value"], p["is_leaf"].to(torch.uint8), p["offsets"],
                                     float(self._tree_weight),
                                 )
                                 preds_eval.add_(out_add)
@@ -634,14 +636,15 @@ class PackBoost:
                                 bins_fm_u8 = bins_eval.to(torch.uint8).t().contiguous()
                                 for tr in self._trees:
                                     c = tr._ensure_compiled(self._device)
-                                    out = self._cuda_backend.predict_bins_cuda(
+                                    from . import backends as native_backends
+                                    out = native_backends.predict_bins_cuda(
                                         bins_fm_u8,
                                         c["feature"].to(torch.int32),
                                         c["threshold"].to(torch.int32),
                                         c["left"].to(torch.int32),
                                         c["right"].to(torch.int32),
                                         c["value"].to(torch.float32),
-                                        c["is_leaf"],
+                                        c["is_leaf"].to(torch.uint8),
                                     )
                                     preds_eval.add_(self._tree_weight * out)
                             else:
@@ -679,7 +682,7 @@ class PackBoost:
                         bins_fm_pred,
                         pack["feature"], pack["threshold"],
                         pack["left_abs"], pack["right_abs"],
-                        pack["value"], pack["is_leaf"], pack["offsets"],
+                        pack["value"], pack["is_leaf"].to(torch.uint8), pack["offsets"],
                         float(self._tree_weight),
                     )
                     pred.add_(out_add)
@@ -691,14 +694,15 @@ class PackBoost:
                 bins_fm_pred = bins.to(torch.uint8).t().contiguous()
                 for tr in self._trees:
                     c = tr._ensure_compiled(self._device)
-                    out = self._cuda_backend.predict_bins_cuda(
+                    from . import backends as native_backends
+                    out = native_backends.predict_bins_cuda(
                         bins_fm_pred,
                         c["feature"].to(torch.int32),
                         c["threshold"].to(torch.int32),
                         c["left"].to(torch.int32),
                         c["right"].to(torch.int32),
                         c["value"].to(torch.float32),
-                        c["is_leaf"],
+                        c["is_leaf"].to(torch.uint8),
                     )
                     pred.add_(self._tree_weight * out)
                 return pred.cpu().numpy()

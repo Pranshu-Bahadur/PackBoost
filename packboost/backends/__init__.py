@@ -149,7 +149,7 @@ def predict_bins_cuda(*args: Any, **kwargs: Any):
     fn = _get_attr_callable(_BACKEND, "predict_bins_cuda")
     if fn is None:
         raise RuntimeError("CUDA predict_bins is unavailable in this build.")
-    return fn(*args, **kwargs)
+    return _BACKEND.predict_bins_cuda(*args, **kwargs)
 
 
 def predict_pack_cuda(*args: Any, **kwargs: Any):

@@ -850,8 +850,6 @@ py::dict partition_frontier_cuda(
   return r;
 }
 
-
-
 py::object predict_bins_cuda(
     py::object bins,        // torch.uint8 or int8 [N,F] on CUDA
     py::object feature,     // torch.int32 [num_nodes] on same device
@@ -923,59 +921,74 @@ py::object predict_bins_cuda(
 
 
 // ================== Pack predictor: warp-parallel over trees ==================
+// ================== Pack predictor: shared-mem reduction, no warp intrinsics ==================
 __global__ void predict_pack_kernel(
   const uint8_t* __restrict__ bins, int F, int N,
   const int32_t* __restrict__ feature,     // [nodes_total_pack]
   const int32_t* __restrict__ threshold,   // [nodes_total_pack]
-  const int32_t* __restrict__ left_abs,    // [nodes_total_pack] absolute indices
+  const int32_t* __restrict__ left_abs,    // [nodes_total_pack]
   const int32_t* __restrict__ right_abs,   // [nodes_total_pack]
   const uint8_t* __restrict__ is_leaf,     // [nodes_total_pack] (0/1)
   const float*   __restrict__ value,       // [nodes_total_pack]
-  const int32_t* __restrict__ offsets,     // [B+1] pack-local node offsets (absolute)
-  int B,                                    // trees in this pack
-  float tree_weight,                        // common weight per tree
-  float* __restrict__ out                   // [N] (+=)
+  const int32_t* __restrict__ offsets,     // [B+1]
+  int B,                                   // trees in this pack
+  float tree_weight,                       // common weight per tree
+  float* __restrict__ out                  // [N] (+=)
 ){
-  const int W = 32;
-  const int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
-  const int lane = threadIdx.x & (W - 1);
-  const int warp_id = global_tid / W;
-  const int warp_stride = (gridDim.x * blockDim.x) / W;
+  // One block cooperatively accumulates the sum over trees for a row,
+  // using shared-memory reduction. Blocks iterate rows grid-stride.
+  extern __shared__ float s_partials[]; // size: blockDim.x
 
-  for (int row = warp_id; row < N; row += warp_stride) {
-      float acc = 0.0f;
+  (void)F; // F not used here, but kept for parity
 
-      // Process the pack in chunks of 32 trees (one per lane)
-      for (int t0 = 0; t0 < B; t0 += W) {
-          const int t = t0 + lane;
-          float leaf_val = 0.0f;
+  for (int row = blockIdx.x; row < N; row += gridDim.x) {
+    float partial = 0.0f;
 
-          if (t < B) {
-              int node = offsets[t];           // absolute root of this tree in the pack
-              const int node_end = offsets[t + 1];
+    // Each thread processes a striped subset of trees
+    for (int t = threadIdx.x; t < B; t += blockDim.x) {
+      float leaf_val = 0.0f;
 
-              // Walk until leaf; cap steps defensively by tree size
-              for (int it = 0; it < (node_end - node); ++it) {
-                  if (is_leaf[node]) { leaf_val = value[node]; break; }
-                  const int f   = feature[node];
-                  const int thr = threshold[node];
-                  const int v   = load_bin_colmajor(bins, N, row, f);
-                  node = (v <= thr) ? left_abs[node] : right_abs[node];
-                  if (node < offsets[t] || node >= node_end) { leaf_val = 0.0f; break; } // guard
-              }
-          }
-          // Warp-reduce the 32 leaf values → lane 0 holds the sum for this chunk
-          for (int off = W / 2; off > 0; off >>= 1)
-              leaf_val += __shfl_down_sync(0xffffffff, leaf_val, off);
-          if (lane == 0) acc += leaf_val;
+      // Traverse tree t (absolute indices within the packed arrays)
+      int node      = offsets[t];
+      const int end = offsets[t + 1];
+      const int max_steps = end - node;  // defensive cap
+
+      for (int it = 0; it < max_steps; ++it) {
+        if (is_leaf[node]) { leaf_val = value[node]; break; }
+        const int f   = feature[node];
+        const int thr = threshold[node];
+        const int v   = load_bin_colmajor(bins, N, row, f);  // bins is [F,N]
+        const int nxt = (v <= thr) ? left_abs[node] : right_abs[node];
+        // guard against corrupted children
+        if (nxt < offsets[t] || nxt >= end) { leaf_val = 0.0f; break; }
+        node = nxt;
       }
 
-      if (lane == 0) out[row] += tree_weight * acc;
+      partial += leaf_val;
+    }
+
+    // Block-wide reduction in shared memory
+    s_partials[threadIdx.x] = partial;
+    __syncthreads();
+
+    for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+      if (threadIdx.x < offset) {
+        s_partials[threadIdx.x] += s_partials[threadIdx.x + offset];
+      }
+      __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+      out[row] += tree_weight * s_partials[0];
+    }
+    __syncthreads(); // reuse s_partials safely next row
   }
 }
 
+
+// ================== Host wrapper (API unchanged) ==================
 py::object predict_pack_cuda(
-  py::object bins,         // torch.uint8/int8 [N,F] on CUDA
+  py::object bins,         // torch.uint8/int8 [F,N] on CUDA (feature-major)
   py::object feature,      // torch.int32 [nodes_total_pack]
   py::object threshold,    // torch.int32 [nodes_total_pack]
   py::object left_abs,     // torch.int32 [nodes_total_pack]
@@ -986,14 +999,16 @@ py::object predict_pack_cuda(
   float tree_weight        // per-tree scale (e.g., lr / pack_size)
 ){
   py::module torch = py::module::import("torch");
+
   // bins is feature-major [F, N]
   py::tuple bshape = py::tuple(bins.attr("shape"));
   const int F = (int)py::int_(bshape[0]);
   const int N = (int)py::int_(bshape[1]);
   if (N == 0) {
-      return torch.attr("empty")(py::make_tuple(0), "device"_a=bins.attr("device"),
-                                 "dtype"_a=torch.attr("float32"));
+    return torch.attr("empty")(py::make_tuple(0), "device"_a=bins.attr("device"),
+                               "dtype"_a=torch.attr("float32"));
   }
+
   const int B = (int)py::int_(py::tuple(offsets.attr("shape"))[0]) - 1;
 
   auto out = torch.attr("zeros")(py::make_tuple(N),
@@ -1011,11 +1026,12 @@ py::object predict_pack_cuda(
   const uintptr_t off_ptr  = py::int_(offsets.attr("data_ptr")());
   const uintptr_t out_ptr  = py::int_(out.attr("data_ptr")());
 
-  int threads = 256;                  // 8 warps / block
-  int warps_total = (N + 1 - 1);      // aim: ≥ N warps; we’ll rely on grid-stride
-  int blocks = std::max(1, std::min(65535, (warps_total * 32 + threads - 1) / threads));
+  // Launch config: cooperative reduction width = threads
+  const int threads = 256;                               // tuneable: 128/256/512
+  const int blocks  = std::min(65535, std::max(1, (N + threads - 1) / threads));
+  const size_t shmem = sizeof(float) * (size_t)threads;  // one float per thread
 
-  predict_pack_kernel<<<blocks, threads>>>(
+  predict_pack_kernel<<<blocks, threads, shmem>>>(
       reinterpret_cast<const uint8_t*>(bins_ptr), F, N,
       reinterpret_cast<const int32_t*>(f_ptr),
       reinterpret_cast<const int32_t*>(t_ptr),
@@ -1028,8 +1044,11 @@ py::object predict_pack_cuda(
       reinterpret_cast<float*>(out_ptr)
   );
   CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());  // ensure completion before returning the tensor
+
   return out;
 }
+
 
 
 } // namespace
@@ -1064,7 +1083,7 @@ void register_cuda_frontier(py::module_& m){
     py::arg("left_abs"), py::arg("right_abs"), py::arg("value"),
     py::arg("is_leaf"), py::arg("offsets"), py::arg("tree_weight"),
     "Warp-parallel CUDA predictor over a pack of trees (sum and scale).");
-    m.def("partition_frontier_cuda", &partition_frontier_cuda,
+  m.def("partition_frontier_cuda", &partition_frontier_cuda,
       py::arg("bins"), py::arg("rows_index"),
       py::arg("node_row_splits"), py::arg("node_era_splits"),
       py::arg("feat_per_node"),   py::arg("thr_per_node"),
