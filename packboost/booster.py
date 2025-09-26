@@ -84,10 +84,10 @@ class Tree:
                     val  = c["value"].to(torch.float32)
                     leaf = c["is_leaf"].to(torch.bool)
 
-                    # bins can be int8 or uint8; backend reads bytes
-                    bins_b = bins.contiguous()
+                    # bins can be int8 or uint8; backend expects feature-major [F,N]
+                    bins_fm = bins.to(torch.uint8).t().contiguous()
                     return native_backends.predict_bins_cuda(
-                        bins_b, feat, thr, left, right, val, leaf
+                        bins_fm, feat, thr, left, right, val, leaf
                     )
             except Exception:
                 # fall back if anything goes wrong
@@ -395,6 +395,11 @@ class PackBoost:
             bins = bins.to(dtype=torch.int8)
         y_t = torch.from_numpy(y_np).to(device=self._device)
 
+        # Precompute feature-major bins for CUDA backend once
+        bins_fm: torch.Tensor | None = None
+        if self._use_native_cuda:
+            bins_fm = bins.to(torch.uint8).t().contiguous()
+
         # Init gradient state
         grad = torch.zeros(N, dtype=torch.float32, device=self._device)
         hess = torch.ones(N, dtype=torch.float32, device=self._device)  # squared loss
@@ -433,6 +438,7 @@ class PackBoost:
                         {
                             "name": name,
                             "bins": bins_eval,
+                            "bins_fm": (bins_eval.to(torch.uint8).t().contiguous() if self._use_native_cuda else None),
                             "y_tensor": y_eval_tensor,
                             "era_np": era_eval_np,
                             "preds": torch.zeros_like(y_eval_tensor),
@@ -615,7 +621,7 @@ class PackBoost:
                         ):
                             for p in self._packed_forest:
                                 out_add = self._cuda_backend.predict_pack_cuda(
-                                    bins_eval.contiguous(),
+                                    (state.get("bins_fm") if state.get("bins_fm") is not None else bins_eval.to(torch.uint8).t().contiguous()),
                                     p["feature"], p["threshold"],
                                     p["left_abs"], p["right_abs"],
                                     p["value"], p["is_leaf"], p["offsets"],
@@ -654,9 +660,10 @@ class PackBoost:
                 and not self._disable_pack_predict
             ):
                 pred = torch.zeros(bins.shape[0], dtype=torch.float32, device=self._device)
+                bins_fm_pred = bins.to(torch.uint8).t().contiguous()
                 for pack in self._packed_forest:
                     out_add = self._cuda_backend.predict_pack_cuda(
-                        bins.contiguous(),
+                        bins_fm_pred,
                         pack["feature"], pack["threshold"],
                         pack["left_abs"], pack["right_abs"],
                         pack["value"], pack["is_leaf"], pack["offsets"],
@@ -1420,7 +1427,7 @@ class PackBoost:
         )
 
         result = self._cuda_backend.find_best_splits_batched_cuda(
-            bins,
+            (bins_fm if 'bins_fm' in locals() and bins_fm is not None else bins),
             grad_cat,
             hess_cat,
             rows_cat_i32,
@@ -2006,7 +2013,7 @@ class PackBoost:
 
                 # Inputs for kernel
                 rows_cat_i32 = rows_cat.to(torch.int32).contiguous()
-                bins_i8 = bins.to(torch.int8).contiguous()
+                bins_i8 = (bins_fm if 'bins_fm' in locals() and bins_fm is not None else bins).contiguous()
 
                 part_start = perf_counter()
                 part = self._cuda_backend.partition_frontier_cuda(

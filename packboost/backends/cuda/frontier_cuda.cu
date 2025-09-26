@@ -1,4 +1,4 @@
-// frontier_cuda.cu  (row-major bins; 64-bit safe; barrier-safe scan; block-wide totals)
+// frontier_cuda.cu  (feature-major bins; 64-bit safe; barrier-safe scan; block-wide totals)
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <cuda_runtime.h>
@@ -19,7 +19,7 @@ namespace {
 
 constexpr int WARP_SIZE = 32;
 constexpr int MAX_BINS  = 128;
-constexpr int THREADS   = 128;                  // 4 warps/block (change to 32/64/256 if you like)
+constexpr int THREADS   = 256;                  // 8 warps/block is a good default
 constexpr int WARPS     = THREADS / WARP_SIZE;
 __device__ constexpr float NEG_INF = -1.0e30f;
 
@@ -233,9 +233,10 @@ __global__ void cuda_predict_bins_kernel(
 }
 
 __global__ void cuda_find_best_splits_kernel(
-  // bins is ROW-MAJOR: [rows_dataset, num_features]
-  const int8_t* __restrict__ bins_rowmajor,
-  int bins_stride,                                 // = num_features
+  // bins is FEATURE-MAJOR: [num_features_dataset, rows_dataset]
+  const int8_t* __restrict__ bins_fm,
+  int rows_dataset,                                 // = number of rows in dataset (N)
+  int cols_dataset,                                 // = number of features in dataset (F)
   const float* __restrict__ grad,                  // [rows_total_compact]
   const float* __restrict__ hess,                  // [rows_total_compact]
   const int32_t* __restrict__ rows_index,          // [rows_total_compact] -> original dataset row ids
@@ -275,7 +276,7 @@ __global__ void cuda_find_best_splits_kernel(
   const int feature_id = feature_ids[foff];
   const int out_index  = node_id * num_features + foff;
 
-  if(feature_id<0 || feature_id>=num_features || num_bins<=1){
+  if(feature_id<0 || feature_id>=cols_dataset || num_bins<=1){
     if(threadIdx.x==0){
       out_scores[out_index]=NEG_INF; out_thresholds[out_index]=-1;
       out_left_grad[out_index]=0.f; out_left_hess[out_index]=0.f; out_left_count[out_index]=0;
@@ -359,7 +360,7 @@ __global__ void cuda_find_best_splits_kernel(
 
     for(int r=row_start+threadIdx.x; r<row_end; r+=blockDim.x){
       const int32_t ridx = rows_index[r];
-      const int bin = load_bin_colmajor(reinterpret_cast<const uint8_t*>(bins_rowmajor), bins_stride, ridx, feature_id);
+      const int bin = load_bin_colmajor(reinterpret_cast<const uint8_t*>(bins_fm), rows_dataset, ridx, feature_id);
       if(bin>=0 && bin<num_bins) atomicAdd(&cnt_w[warp_id*num_bins+bin],1);
     }
     __syncthreads();
@@ -446,7 +447,7 @@ __global__ void cuda_find_best_splits_kernel(
     // build per-warp histograms
     for(int r=es+threadIdx.x; r<ee; r+=blockDim.x){
       const int32_t ridx = rows_index[r];
-      const int bin = load_bin_colmajor(reinterpret_cast<const uint8_t*>(bins_rowmajor), bins_stride, ridx, feature_id);
+      const int bin = load_bin_colmajor(reinterpret_cast<const uint8_t*>(bins_fm), rows_dataset, ridx, feature_id);
       if(bin>=0 && bin<num_bins){
         const float g=grad[r], h=hess[r];
         atomicAdd(&cnt_w[warp_id*num_bins+bin],1);
@@ -614,10 +615,8 @@ py::dict find_best_splits_batched_cuda(
   const int num_features = (int)py::int_(fshape[0]);
   const int cut_mode = (cut_selection=="mass") ? 1 : 0;
 
-  // Raw pointers
-  // Transpose bins to feature-major [F, N] for coalesced loads
-  py::object bins_col = bins.attr("t")().attr("contiguous")();
-  const uintptr_t bins_ptr      = py::int_(bins_col.attr("data_ptr")());
+  // Raw pointers — expect feature-major [F, N]
+  const uintptr_t bins_ptr      = py::int_(bins.attr("data_ptr")());
   const uintptr_t grad_ptr      = py::int_(grad.attr("data_ptr")());
   const uintptr_t hess_ptr      = py::int_(hess.attr("data_ptr")());
   const uintptr_t rows_idx_ptr  = py::int_(rows_index.attr("data_ptr")());
@@ -676,6 +675,7 @@ py::dict find_best_splits_batched_cuda(
   cuda_find_best_splits_kernel<<<grid, block, shmem>>>(
     reinterpret_cast<const int8_t*>(bins_ptr),
     (int)rows_dataset,
+    (int)num_features_all,
     reinterpret_cast<const float*>(grad_ptr),
     reinterpret_cast<const float*>(hess_ptr),
     reinterpret_cast<const int32_t*>(rows_idx_ptr),
@@ -750,9 +750,8 @@ py::dict partition_frontier_cuda(
   py::object device = bins.attr("device");
   auto opts_i32 = py::dict("device"_a=device, "dtype"_a=torch.attr("int32"));
 
-  // Pointers (transpose to feature-major [F,N])
-  py::object bins_col = bins.attr("t")().attr("contiguous")();
-  const uintptr_t bins_ptr  = py::int_(bins_col.attr("data_ptr")());
+  // Pointers — expect feature-major [F,N]
+  const uintptr_t bins_ptr  = py::int_(bins.attr("data_ptr")());
   const uintptr_t rows_ptr  = py::int_(rows_index.attr("data_ptr")());
   const uintptr_t nrow_ptr  = py::int_(node_row_splits.attr("data_ptr")());
   const uintptr_t nera_ptr  = py::int_(node_era_splits.attr("data_ptr")());
@@ -889,10 +888,8 @@ py::object predict_bins_cuda(
     auto out = torch.attr("empty")(py::make_tuple(N), "device"_a=device,
                                    "dtype"_a=torch.attr("float32"));
 
-    // raw ptrs
-    // Transpose to feature-major for coalesced reads
-    py::object bins_col = bins.attr("t")().attr("contiguous")();
-    const uintptr_t bins_ptr  = py::int_(bins_col.attr("data_ptr")());
+    // raw ptrs — expect feature-major [F,N]
+    const uintptr_t bins_ptr  = py::int_(bins.attr("data_ptr")());
     const uintptr_t feat_ptr  = py::int_(feature.attr("data_ptr")());
     const uintptr_t thr_ptr   = py::int_(threshold.attr("data_ptr")());
     const uintptr_t left_ptr  = py::int_(left.attr("data_ptr")());
@@ -1001,9 +998,8 @@ py::object predict_pack_cuda(
                                  "device"_a=bins.attr("device"),
                                  "dtype"_a=torch.attr("float32"));
 
-  // Ensure feature-major [F,N]
-  py::object bins_col = bins.attr("t")().attr("contiguous")();
-  const uintptr_t bins_ptr = py::int_(bins_col.attr("data_ptr")());
+  // Expect feature-major [F,N] from caller
+  const uintptr_t bins_ptr = py::int_(bins.attr("data_ptr")());
   const uintptr_t f_ptr    = py::int_(feature.attr("data_ptr")());
   const uintptr_t t_ptr    = py::int_(threshold.attr("data_ptr")());
   const uintptr_t l_ptr    = py::int_(left_abs.attr("data_ptr")());
