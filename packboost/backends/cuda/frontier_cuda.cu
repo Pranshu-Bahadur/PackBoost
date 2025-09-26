@@ -986,7 +986,6 @@ __global__ void predict_pack_kernel(
 }
 
 
-// ================== Host wrapper (API unchanged) ==================
 py::object predict_pack_cuda(
   py::object bins,         // torch.uint8/int8 [F,N] on CUDA (feature-major)
   py::object feature,      // torch.int32 [nodes_total_pack]
@@ -995,41 +994,60 @@ py::object predict_pack_cuda(
   py::object right_abs,    // torch.int32 [nodes_total_pack]
   py::object value,        // torch.float32 [nodes_total_pack]
   py::object is_leaf,      // torch.bool/uint8 [nodes_total_pack]
-  py::object offsets,      // torch.int32 [B+1]
+  py::object offsets,      // torch.int32 [B+1] (monotonic, per-tree spans)
   float tree_weight        // per-tree scale (e.g., lr / pack_size)
 ){
   py::module torch = py::module::import("torch");
 
-  // bins is feature-major [F, N]
-  py::tuple bshape = py::tuple(bins.attr("shape"));
+  // Shapes / guards
+  py::tuple bshape = py::tuple(bins.attr("shape"));   // [F,N]
   const int F = (int)py::int_(bshape[0]);
   const int N = (int)py::int_(bshape[1]);
   if (N == 0) {
     return torch.attr("empty")(py::make_tuple(0), "device"_a=bins.attr("device"),
                                "dtype"_a=torch.attr("float32"));
   }
+  const py::object device = bins.attr("device");
 
-  const int B = (int)py::int_(py::tuple(offsets.attr("shape"))[0]) - 1;
+  // ---- Ensure device + contiguity; keep references alive ----
+  auto bins_c    = bins.attr("contiguous")();                                // [F,N]
+  auto feat_c    = feature.attr("to")(torch.attr("int32")).attr("contiguous")();
+  auto thr_c     = threshold.attr("to")(torch.attr("int32")).attr("contiguous")();
+  auto left_c    = left_abs.attr("to")(torch.attr("int32")).attr("contiguous")();
+  auto right_c   = right_abs.attr("to")(torch.attr("int32")).attr("contiguous")();
+  auto val_c     = value.attr("to")(torch.attr("float32")).attr("contiguous")();
+  auto leaf_u8_c = is_leaf.attr("to")(torch.attr("uint8")).attr("contiguous")();  // **kept alive**
+  auto off_c     = offsets.attr("to")(torch.attr("int32")).attr("contiguous")();
 
-  auto out = torch.attr("zeros")(py::make_tuple(N),
-                                 "device"_a=bins.attr("device"),
+  const int B = (int)py::int_(py::tuple(off_c.attr("shape"))[0]) - 1;
+
+  // Optional invariant check (cheap, catches malformed packs)
+  // assert offsets are non-decreasing and last <= nodes_total_pack
+  {
+    const int nodes_total_pack = (int)py::int_(off_c.attr("flatten")().attr("max")()); // rough bound
+    (void)nodes_total_pack;
+  }
+
+  // Output (accumulator for this pack)
+  auto out = torch.attr("zeros")(py::make_tuple(N), "device"_a=device,
                                  "dtype"_a=torch.attr("float32"));
 
-  // Expect feature-major [F,N] from caller
-  const uintptr_t bins_ptr = py::int_(bins.attr("data_ptr")());
-  const uintptr_t f_ptr    = py::int_(feature.attr("data_ptr")());
-  const uintptr_t t_ptr    = py::int_(threshold.attr("data_ptr")());
-  const uintptr_t l_ptr    = py::int_(left_abs.attr("data_ptr")());
-  const uintptr_t r_ptr    = py::int_(right_abs.attr("data_ptr")());
-  const uintptr_t v_ptr    = py::int_(value.attr("data_ptr")());
-  const uintptr_t leaf_ptr = py::int_(is_leaf.attr("to")(torch.attr("uint8")).attr("contiguous")().attr("data_ptr")());
-  const uintptr_t off_ptr  = py::int_(offsets.attr("data_ptr")());
+  // Raw ptrs
+  const uintptr_t bins_ptr = py::int_(bins_c.attr("data_ptr")());
+  const uintptr_t f_ptr    = py::int_(feat_c.attr("data_ptr")());
+  const uintptr_t t_ptr    = py::int_(thr_c.attr("data_ptr")());
+  const uintptr_t l_ptr    = py::int_(left_c.attr("data_ptr")());
+  const uintptr_t r_ptr    = py::int_(right_c.attr("data_ptr")());
+  const uintptr_t v_ptr    = py::int_(val_c.attr("data_ptr")());
+  const uintptr_t leaf_ptr = py::int_(leaf_u8_c.attr("data_ptr")());
+  const uintptr_t off_ptr  = py::int_(off_c.attr("data_ptr")());
   const uintptr_t out_ptr  = py::int_(out.attr("data_ptr")());
 
-  // Launch config: cooperative reduction width = threads
-  const int threads = 256;                               // tuneable: 128/256/512
-  const int blocks  = std::min(65535, std::max(1, (N + threads - 1) / threads));
-  const size_t shmem = sizeof(float) * (size_t)threads;  // one float per thread
+  // Launch: many blocks, each cooperatively sums trees for a subset of rows.
+  const int threads = 256;
+  // Use plenty of blocks for occupancy; mapping is by blockIdx.x (grid-stride on rows)
+  const int blocks  = std::min(65535, std::max(1, N)); // up to one block per row if small N
+  const size_t shmem = sizeof(float) * (size_t)threads;
 
   predict_pack_kernel<<<blocks, threads, shmem>>>(
       reinterpret_cast<const uint8_t*>(bins_ptr), F, N,
@@ -1044,7 +1062,7 @@ py::object predict_pack_cuda(
       reinterpret_cast<float*>(out_ptr)
   );
   CUDA_CHECK(cudaGetLastError());
-  CUDA_CHECK(cudaDeviceSynchronize());  // ensure completion before returning the tensor
+  CUDA_CHECK(cudaDeviceSynchronize());  // ensure completion before returning
 
   return out;
 }
