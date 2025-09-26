@@ -11,6 +11,9 @@ __all__ = [
     "find_best_splits_batched",
     "cuda_available",
     "find_best_splits_batched_cuda",
+    "partition_frontier_cuda",
+    "predict_bins_cuda",
+    "predict_pack_cuda",
 ]
 
 
@@ -65,4 +68,37 @@ def find_best_splits_batched_cuda(*args: Any, **kwargs: Any):
     fn = getattr(_BACKEND, "find_best_splits_batched_cuda", None)
     if fn is None:
         raise RuntimeError("CUDA backend is unavailable in this build.")
+    return fn(*args, **kwargs)
+
+
+def partition_frontier_cuda(*args: Any, **kwargs: Any):
+    """Batched frontier partition (count + scatter) on CUDA."""
+
+    if _BACKEND is None:
+        raise RuntimeError("Native backend is not built; run setup_native.py first.")
+    fn = getattr(_BACKEND, "partition_frontier_cuda", None)
+    if fn is None:
+        raise RuntimeError("CUDA partition_frontier is unavailable in this build.")
+    return fn(*args, **kwargs)
+
+
+def predict_bins_cuda(*args: Any, **kwargs: Any):
+    """Fast CUDA route for a single tree over binned features."""
+
+    if _BACKEND is None:
+        raise RuntimeError("Native backend is not built; run setup_native.py first.")
+    fn = getattr(_BACKEND, "predict_bins_cuda", None)
+    if fn is None:
+        raise RuntimeError("CUDA predict_bins is unavailable in this build.")
+    return fn(*args, **kwargs)
+
+
+def predict_pack_cuda(*args: Any, **kwargs: Any):
+    """Warp-parallel CUDA predictor over a pack of trees (sum and scale)."""
+
+    if _BACKEND is None:
+        raise RuntimeError("Native backend is not built; run setup_native.py first.")
+    fn = getattr(_BACKEND, "predict_pack_cuda", None)
+    if fn is None:
+        raise RuntimeError("CUDA predict_pack is unavailable in this build.")
     return fn(*args, **kwargs)

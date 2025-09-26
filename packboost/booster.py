@@ -1963,38 +1963,141 @@ class PackBoost:
         stats.nodes_rebuild += rebuild_cnt
         stats.nodes_subtract_fallback += int(fallback_any.sum().item())
 
-        # Emit decisions and partition rows for each node
-        for cid, ctx in enumerate(contexts):
-            node_idx = index_map[cid]
-            feat = int(best_features[cid].item())
-            if feat < 0:
-                continue
-            thr = int(best_thresholds[cid].item())
-            score_val = float(best_scores[cid].item())
-            l_g = float(best_left_grad[cid].item())
-            l_h = float(best_left_hess[cid].item())
-            l_cnt = int(best_left_count[cid].item())
-            r_g = float(total_grad_nodes[cid].item() - l_g)
-            r_h = float(total_hess_nodes[cid].item() - l_h)
-            r_cnt = int(total_count_nodes[cid].item() - best_left_count[cid].item())
+        # ---- Batched partition via CUDA (count+scatter) ----
+        try:
+            sel_mask = best_features >= 0
+            if torch.any(sel_mask):
+                sel_idx = torch.nonzero(sel_mask, as_tuple=False).view(-1)
 
-            part_start = perf_counter()
-            left_rows, right_rows = self._partition_rows(bins, ctx.shard.era_rows, feat, thr)
-            stats.partition_ms += (perf_counter() - part_start) * 1000.0
+                # Build compact metadata for selected nodes (Nsel)
+                node_row_offsets: list[int] = [contexts[i.item()].row_start for i in sel_idx.tolist()]
+                # Sentinel can be the global end; kernel doesn't use it. Kept for shape.
+                node_row_offsets.append(row_start)
+                node_row_splits_sel = torch.tensor(node_row_offsets, dtype=torch.int32, device=self._device)
 
-            decisions[node_idx] = SplitDecision(
-                feature=feat,
-                threshold=thr,
-                score=score_val,
-                left_grad=l_g,
-                left_hess=l_h,
-                right_grad=r_g,
-                right_hess=r_h,
-                left_count=l_cnt,
-                right_count=r_cnt,
-                left_rows=left_rows,
-                right_rows=right_rows,
-            )
+                expected_eras = max(1, max(len(contexts[i.item()].shard.era_rows) for i in sel_idx.tolist()))
+                era_offset_rows_sel: list[list[int]] = []
+                for i in sel_idx.tolist():
+                    ctx = contexts[i]
+                    pref: list[int] = [0]
+                    run = 0
+                    for rows_t in ctx.shard.era_rows:
+                        run += int(rows_t.numel()); pref.append(run)
+                    while len(pref) < expected_eras + 1:
+                        pref.append(run)
+                    # add base offset into rows_cat
+                    pref = [p + ctx.row_start for p in pref]
+                    era_offset_rows_sel.append(pref)
+                node_era_splits_sel = torch.tensor(era_offset_rows_sel, dtype=torch.int32, device=self._device).contiguous()
+
+                feat_sel = best_features.index_select(0, sel_idx).to(torch.int32).contiguous()
+                thr_sel = best_thresholds.index_select(0, sel_idx).to(torch.int32).contiguous()
+
+                # Inputs for kernel
+                rows_cat_i32 = rows_cat.to(torch.int32).contiguous()
+                bins_i8 = bins.to(torch.int8).contiguous()
+
+                part_start = perf_counter()
+                part = self._cuda_backend.partition_frontier_cuda(
+                    bins_i8,
+                    rows_cat_i32,
+                    node_row_splits_sel,
+                    node_era_splits_sel,
+                    feat_sel,
+                    thr_sel,
+                )
+                stats.partition_ms += (perf_counter() - part_start) * 1000.0
+
+                left_idx: torch.Tensor = part["left_index"]  # int32 flat, dataset row ids
+                right_idx: torch.Tensor = part["right_index"]
+                left_spl: torch.Tensor = part["left_splits"].to(torch.int64).contiguous()   # [Nsel, E+1]
+                right_spl: torch.Tensor = part["right_splits"].to(torch.int64).contiguous()
+
+                # Sanity: lengths
+                assert left_spl.shape[0] == sel_idx.numel()
+                assert right_spl.shape[0] == sel_idx.numel()
+
+                # Build SplitDecision for selected nodes
+                for j, cid in enumerate(sel_idx.tolist()):
+                    node_idx = index_map[cid]
+                    feat = int(best_features[cid].item())
+                    thr = int(best_thresholds[cid].item())
+                    score_val = float(best_scores[cid].item())
+
+                    # reconstruct per-era slices (GPU tensors of dataset row ids, int64)
+                    Ls: list[torch.Tensor] = []
+                    Rs: list[torch.Tensor] = []
+                    for e in range(expected_eras):
+                        lb, le = int(left_spl[j, e].item()), int(left_spl[j, e + 1].item())
+                        rb, re = int(right_spl[j, e].item()), int(right_spl[j, e + 1].item())
+                        Ls.append(left_idx[lb:le].to(dtype=torch.int64, device=self._device))
+                        Rs.append(right_idx[rb:re].to(dtype=torch.int64, device=self._device))
+
+                    l_cnt = int((left_spl[j, -1] - left_spl[j, 0]).item())
+                    r_cnt = int((right_spl[j, -1] - right_spl[j, 0]).item())
+
+                    # Conservation: left + right equals node span
+                    node_span = int(contexts[cid].row_count)
+                    if (l_cnt + r_cnt) != node_span:
+                        raise RuntimeError("partition_frontier_cuda count mismatch for node")
+
+                    # sums from full grad/hess (length N): index by dataset row ids
+                    if l_cnt > 0:
+                        l_flat = left_idx[left_spl[j, 0]: left_spl[j, -1]].to(torch.int64)
+                        l_g = float(grad.index_select(0, l_flat).sum().item())
+                        l_h = float(hess.index_select(0, l_flat).sum().item())
+                    else:
+                        l_g = 0.0; l_h = 0.0
+
+                    r_g = float(total_grad_nodes[cid].item() - l_g)
+                    r_h = float(total_hess_nodes[cid].item() - l_h)
+
+                    decisions[node_idx] = SplitDecision(
+                        feature=feat, threshold=thr, score=score_val,
+                        left_grad=l_g, left_hess=l_h, right_grad=r_g, right_hess=r_h,
+                        left_count=l_cnt, right_count=r_cnt,
+                        left_rows=Ls, right_rows=Rs,
+                    )
+
+            # Fallback for nodes without valid selection
+            for cid, ctx in enumerate(contexts):
+                if int(best_features[cid].item()) < 0:
+                    node_idx = index_map[cid]
+                    decisions[node_idx] = None
+        except Exception:
+            # Fallback: per-node Python partition
+            for cid, ctx in enumerate(contexts):
+                node_idx = index_map[cid]
+                feat = int(best_features[cid].item())
+                if feat < 0:
+                    decisions[node_idx] = None
+                    continue
+                thr = int(best_thresholds[cid].item())
+                score_val = float(best_scores[cid].item())
+                l_g = float(best_left_grad[cid].item())
+                l_h = float(best_left_hess[cid].item())
+                l_cnt = int(best_left_count[cid].item())
+                r_g = float(total_grad_nodes[cid].item() - l_g)
+                r_h = float(total_hess_nodes[cid].item() - l_h)
+                r_cnt = int(total_count_nodes[cid].item() - best_left_count[cid].item())
+
+                part_start = perf_counter()
+                left_rows, right_rows = self._partition_rows(bins, ctx.shard.era_rows, feat, thr)
+                stats.partition_ms += (perf_counter() - part_start) * 1000.0
+
+                decisions[node_idx] = SplitDecision(
+                    feature=feat,
+                    threshold=thr,
+                    score=score_val,
+                    left_grad=l_g,
+                    left_hess=l_h,
+                    right_grad=r_g,
+                    right_hess=r_h,
+                    left_count=l_cnt,
+                    right_count=r_cnt,
+                    left_rows=left_rows,
+                    right_rows=right_rows,
+                )
 
         if duplicate_map:
             for dup_idx, ctx_idx in duplicate_map.items():

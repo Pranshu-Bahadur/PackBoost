@@ -49,6 +49,144 @@ __device__ inline void block_scan_prefix(float* g, float* h, int* c, int n) {
   __syncthreads();
 }
 
+// ===== Batched frontier partition: count + warp-aggregated scatter =====
+
+template<int TPB>
+__global__ void frontier_count_kernel(
+    const int8_t*  __restrict__ bins_rowmajor,   // [N,F] row-major int8
+    int            bins_stride,                  // F
+    const int32_t* __restrict__ rows_index,      // [Rcat] -> dataset row ids
+    const int32_t* __restrict__ node_row_splits, // [Nsel+1] offsets into rows_index
+    const int32_t* __restrict__ node_era_splits, // [Nsel*(E+1)] offsets within node span
+    const int32_t* __restrict__ feat_per_node,   // [Nsel]
+    const int32_t* __restrict__ thr_per_node,    // [Nsel]
+    int32_t*       __restrict__ left_counts,     // [Nsel*E] out
+    int            Nsel,
+    int            E
+){
+    const int n = blockIdx.x;                    // node
+    if (n >= Nsel) return;
+
+    const int feat = feat_per_node[n];
+    const int thr  = thr_per_node[n];
+
+    const int32_t node_base = node_row_splits[n];
+    const int32_t* era_off  = node_era_splits + n * (E + 1);
+
+    for (int e = 0; e < E; ++e) {
+        const int32_t beg = era_off[e];
+        const int32_t end = era_off[e + 1];
+        const int32_t len = end - beg;
+
+        // per-thread local counter
+        int local = 0;
+        for (int i = threadIdx.x; i < len; i += TPB) {
+            const int32_t pos  = node_base + beg + i;
+            const int32_t rid  = rows_index[pos];
+            const long long off= (long long)rid * (long long)bins_stride + (long long)feat;
+            const int bin      = int((unsigned char)bins_rowmajor[off]);
+            local += (bin <= thr);
+        }
+
+        // block reduction
+        __shared__ int ssum[TPB];
+        ssum[threadIdx.x] = local;
+        __syncthreads();
+        for (int stride = TPB >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) ssum[threadIdx.x] += ssum[threadIdx.x + stride];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) left_counts[n * E + e] = ssum[0];
+        __syncthreads();
+    }
+}
+
+__device__ __forceinline__ unsigned lane_id_u() { return threadIdx.x & (WARP_SIZE - 1); }
+
+// Each block handles one node; per era we stream rows and do warp-aggregated atomics.
+template<int TPB>
+__global__ void frontier_scatter_kernel(
+    const int8_t*  __restrict__ bins_rowmajor,   // [N,F]
+    int            bins_stride,                  // F
+    const int32_t* __restrict__ rows_index,      // [Rcat]
+    const int32_t* __restrict__ node_row_splits, // [Nsel+1]
+    const int32_t* __restrict__ node_era_splits, // [Nsel*(E+1)]
+    const int32_t* __restrict__ feat_per_node,   // [Nsel]
+    const int32_t* __restrict__ thr_per_node,    // [Nsel]
+    const int32_t* __restrict__ left_splits,     // [Nsel*(E+1)] exclusive
+    const int32_t* __restrict__ right_splits,    // [Nsel*(E+1)] exclusive
+    int32_t*       __restrict__ out_left,        // [sum_left]
+    int32_t*       __restrict__ out_right,       // [sum_right]
+    int            Nsel,
+    int            E
+){
+    const int n = blockIdx.x;                    // node
+    if (n >= Nsel) return;
+
+    const int feat = feat_per_node[n];
+    const int thr  = thr_per_node[n];
+
+    const int32_t node_base = node_row_splits[n];
+    const int32_t* era_off  = node_era_splits + n * (E + 1);
+    const int32_t* lsplit   = left_splits     + n * (E + 1);
+    const int32_t* rsplit   = right_splits    + n * (E + 1);
+
+    extern __shared__ int32_t smem[];
+    int32_t* curL = smem;          // [E]
+    int32_t* curR = smem + E;      // [E]
+
+    // init cursors
+    for (int e = threadIdx.x; e < E; e += TPB) {
+        curL[e] = 0;
+        curR[e] = 0;
+    }
+    __syncthreads();
+
+    for (int e = 0; e < E; ++e) {
+        const int32_t beg = era_off[e];
+        const int32_t end = era_off[e + 1];
+        const int32_t len = end - beg;
+
+        for (int i = threadIdx.x; i < len; i += TPB) {
+            const bool active = (i < len);
+            int32_t rid = -1, bin = 0;
+            if (active) {
+                const int32_t pos  = node_base + beg + i;
+                rid = rows_index[pos];
+                const long long off= (long long)rid * (long long)bins_stride + (long long)feat;
+                bin = int((unsigned char)bins_rowmajor[off]);
+            }
+            const int is_left  = active && (bin <= thr);
+            const int is_right = active && !is_left;
+
+            // LEFT: warp-aggregated
+            const unsigned warp_mask = __ballot_sync(0xffffffff, is_left);
+            const int n_left = __popc(warp_mask);
+            const unsigned lane = lane_id_u();
+            int warp_baseL = 0;
+            if (lane == 0 && n_left > 0) warp_baseL = atomicAdd(&curL[e], n_left);
+            warp_baseL = __shfl_sync(0xffffffff, warp_baseL, 0);
+            if (is_left) {
+                const int rank = __popc(warp_mask & ((1u << lane) - 1));
+                out_left[lsplit[e] + warp_baseL + rank] = rid;
+            }
+
+            // RIGHT: warp-aggregated
+            const unsigned warp_mask_r = __ballot_sync(0xffffffff, is_right);
+            const int n_right = __popc(warp_mask_r);
+            int warp_baseR = 0;
+            if (lane == 0 && n_right > 0) warp_baseR = atomicAdd(&curR[e], n_right);
+            warp_baseR = __shfl_sync(0xffffffff, warp_baseR, 0);
+            if (is_right) {
+                const int rank = __popc(warp_mask_r & ((1u << lane) - 1));
+                out_right[rsplit[e] + warp_baseR + rank] = rid;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+
 __global__ void cuda_predict_bins_kernel(
     const uint8_t* __restrict__ bins_rowmajor,  // [N, F] (row-major)
     int bins_stride,                             // = F
@@ -577,6 +715,141 @@ py::dict find_best_splits_batched_cuda(
   return r;
 }
 
+py::dict partition_frontier_cuda(
+  py::object bins,               // torch.int8/uint8 [N,F] (row-major)
+  py::object rows_index,         // torch.int32 [Rcat]
+  py::object node_row_splits,    // torch.int32 [Nsel+1]
+  py::object node_era_splits,    // torch.int32 [Nsel, E+1]
+  py::object feat_per_node,      // torch.int32 [Nsel]
+  py::object thr_per_node        // torch.int32 [Nsel]
+){
+  py::module torch = py::module::import("torch");
+
+  // Shapes & meta
+  py::tuple bshape = py::tuple(bins.attr("shape"));    // [N,F]
+  const int F = (int)py::int_(bshape[1]);
+
+  py::tuple nshape = py::tuple(node_row_splits.attr("shape")); // [Nsel+1]
+  const int Nsel = (int)py::int_(nshape[0]) - 1;
+  if (Nsel <= 0) {
+    return py::dict("left_index"_a=torch.attr("empty")(py::make_tuple(0), "device"_a=bins.attr("device"),
+                                                       "dtype"_a=torch.attr("int32")),
+                    "right_index"_a=torch.attr("empty")(py::make_tuple(0), "device"_a=bins.attr("device"),
+                                                        "dtype"_a=torch.attr("int32")),
+                    "left_splits"_a=torch.attr("empty")(py::make_tuple(0,0), "device"_a=bins.attr("device"),
+                                                        "dtype"_a=torch.attr("int32")),
+                    "right_splits"_a=torch.attr("empty")(py::make_tuple(0,0), "device"_a=bins.attr("device"),
+                                                         "dtype"_a=torch.attr("int32")));
+  }
+
+  py::tuple eshape = py::tuple(node_era_splits.attr("shape")); // [Nsel, E+1]
+  const int E = (int)py::int_(eshape[1]) - 1;
+
+  // Device & dtypes
+  py::object device = bins.attr("device");
+  auto opts_i32 = py::dict("device"_a=device, "dtype"_a=torch.attr("int32"));
+
+  // Pointers
+  const uintptr_t bins_ptr  = py::int_(bins.attr("contiguous")().attr("data_ptr")());
+  const uintptr_t rows_ptr  = py::int_(rows_index.attr("data_ptr")());
+  const uintptr_t nrow_ptr  = py::int_(node_row_splits.attr("data_ptr")());
+  const uintptr_t nera_ptr  = py::int_(node_era_splits.attr("data_ptr")());
+  const uintptr_t feat_ptr  = py::int_(feat_per_node.attr("data_ptr")());
+  const uintptr_t thr_ptr   = py::int_(thr_per_node.attr("data_ptr")());
+
+  // Phase A: counts
+  auto left_counts = torch.attr("zeros")(py::make_tuple(Nsel, E), **opts_i32);
+  const uintptr_t lcnt_ptr = py::int_(left_counts.attr("data_ptr")());
+
+  {
+    dim3 grid((unsigned)Nsel, 1, 1);
+    dim3 block(THREADS, 1, 1);
+    frontier_count_kernel<THREADS><<<grid, block>>>(
+      reinterpret_cast<const int8_t*>(bins_ptr),
+      (int)F,
+      reinterpret_cast<const int32_t*>(rows_ptr),
+      reinterpret_cast<const int32_t*>(nrow_ptr),
+      reinterpret_cast<const int32_t*>(nera_ptr),
+      reinterpret_cast<const int32_t*>(feat_ptr),
+      reinterpret_cast<const int32_t*>(thr_ptr),
+      reinterpret_cast<int32_t*>(lcnt_ptr),
+      (int)Nsel, (int)E
+    );
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  // Era lengths & splits (GPU, via torch ops)
+  auto era_next = node_era_splits.attr("slice")(1, 1, E + 1);  // [Nsel,E]
+  auto era_prev = node_era_splits.attr("slice")(1, 0, E);      // [Nsel,E]
+  auto era_lens = era_next - era_prev;                         // [Nsel,E]
+
+  auto right_counts = era_lens - left_counts;                  // [Nsel,E]
+  auto zero_col     = torch.attr("zeros")(py::make_tuple(Nsel, 1), **opts_i32);
+
+  // Per-node totals
+  auto left_node_tot  = left_counts.attr("sum")(1).attr("contiguous")();   // [Nsel]
+  auto right_node_tot = right_counts.attr("sum")(1).attr("contiguous")();  // [Nsel]
+
+  // Local (per-node) splits [Nsel,E+1]
+  auto left_cumsum  = left_counts.attr("cumsum")(1);
+  auto right_cumsum = right_counts.attr("cumsum")(1);
+  auto left_local   = torch.attr("cat")(py::make_tuple(zero_col, left_cumsum), 1).attr("contiguous")();
+  auto right_local  = torch.attr("cat")(py::make_tuple(zero_col, right_cumsum), 1).attr("contiguous")();
+
+  // Build per-node base offsets so that splits become ABSOLUTE into the flat outputs
+  auto left_node_base = torch.attr("cat")(py::make_tuple(
+      torch.attr("zeros")(py::make_tuple(1), **opts_i32),
+      left_node_tot.attr("to")(torch.attr("int32")).attr("cumsum")(0).attr("slice")(0, 0, Nsel)
+  ), 0).attr("contiguous")();  // [Nsel]
+  auto right_node_base = torch.attr("cat")(py::make_tuple(
+      torch.attr("zeros")(py::make_tuple(1), **opts_i32),
+      right_node_tot.attr("to")(torch.attr("int32")).attr("cumsum")(0).attr("slice")(0, 0, Nsel)
+  ), 0).attr("contiguous")();  // [Nsel]
+
+  auto left_splits  = (left_local  + left_node_base.attr("unsqueeze")(1)).attr("contiguous")();   // [Nsel,E+1]
+  auto right_splits = (right_local + right_node_base.attr("unsqueeze")(1)).attr("contiguous")();  // [Nsel,E+1]
+
+  const long long total_left  = (long long)py::int_(left_node_tot.attr("sum")());
+  const long long total_right = (long long)py::int_(right_node_tot.attr("sum")());
+
+  auto out_left  = torch.attr("empty")(py::make_tuple(total_left),  **opts_i32);
+  auto out_right = torch.attr("empty")(py::make_tuple(total_right), **opts_i32);
+
+  // Phase B: scatter
+  {
+    const uintptr_t outL_ptr = py::int_(out_left.attr("data_ptr")());
+    const uintptr_t outR_ptr = py::int_(out_right.attr("data_ptr")());
+    const uintptr_t ls_ptr   = py::int_(left_splits.attr("data_ptr")());
+    const uintptr_t rs_ptr   = py::int_(right_splits.attr("data_ptr")());
+
+    dim3 grid((unsigned)Nsel, 1, 1);
+    dim3 block(THREADS, 1, 1);
+    size_t shmem = sizeof(int32_t) * (size_t)E * 2;   // curL[E] + curR[E]
+    frontier_scatter_kernel<THREADS><<<grid, block, shmem>>>(
+      reinterpret_cast<const int8_t*>(bins_ptr), (int)F,
+      reinterpret_cast<const int32_t*>(rows_ptr),
+      reinterpret_cast<const int32_t*>(nrow_ptr),
+      reinterpret_cast<const int32_t*>(nera_ptr),
+      reinterpret_cast<const int32_t*>(feat_ptr),
+      reinterpret_cast<const int32_t*>(thr_ptr),
+      reinterpret_cast<const int32_t*>(ls_ptr),
+      reinterpret_cast<const int32_t*>(rs_ptr),
+      reinterpret_cast<int32_t*>(outL_ptr),
+      reinterpret_cast<int32_t*>(outR_ptr),
+      (int)Nsel, (int)E
+    );
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  py::dict r;
+  r["left_index"]  = out_left;
+  r["right_index"] = out_right;
+  r["left_splits"]  = left_splits;
+  r["right_splits"] = right_splits;
+  return r;
+}
+
+
 
 py::object predict_bins_cuda(
     py::object bins,        // torch.uint8 or int8 [N,F] on CUDA
@@ -787,6 +1060,12 @@ void register_cuda_frontier(py::module_& m){
     py::arg("left_abs"), py::arg("right_abs"), py::arg("value"),
     py::arg("is_leaf"), py::arg("offsets"), py::arg("tree_weight"),
     "Warp-parallel CUDA predictor over a pack of trees (sum and scale).");
+    m.def("partition_frontier_cuda", &partition_frontier_cuda,
+      py::arg("bins"), py::arg("rows_index"),
+      py::arg("node_row_splits"), py::arg("node_era_splits"),
+      py::arg("feat_per_node"),   py::arg("thr_per_node"),
+      "Batched frontier partition (count + warp-aggregated scatter).");
+
 
 
 }
