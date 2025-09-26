@@ -86,7 +86,7 @@ __global__ void frontier_count_kernel(
         // per-thread local counter
         int local = 0;
         for (int i = threadIdx.x; i < len; i += TPB) {
-            const int32_t pos  = node_base + beg + i;
+            const int32_t pos  =  beg + i;
             const int32_t rid  = rows_index[pos];
             const int bin      = load_bin_colmajor(reinterpret_cast<const uint8_t*>(bins_colmajor), rows_dataset, rid, feat);
             local += (bin <= thr);
@@ -155,7 +155,7 @@ __global__ void frontier_scatter_kernel(
             const bool active = (i < len);
             int32_t rid = -1, bin = 0;
             if (active) {
-                const int32_t pos  = node_base + beg + i;
+                const int32_t pos  = beg + i;
                 rid = rows_index[pos];
                 bin = load_bin_colmajor(reinterpret_cast<const uint8_t*>(bins_colmajor), rows_dataset, rid, feat);
             }

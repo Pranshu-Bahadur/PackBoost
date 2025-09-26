@@ -315,6 +315,9 @@ class PackBoost:
         self._cuda_backend = None
         self._native_validate = os.getenv("PACKBOOST_NATIVE_VALIDATE") == "1"
         self._round_metrics: list[dict[str, float]] = []
+        # __init__
+        self._bins_fm: torch.Tensor | None = None
+
 
         # Packed-forest cache for fast inference/eval (flattened per-pack)
         self._packed_forest: list[dict[str, torch.Tensor]] = []
@@ -339,6 +342,27 @@ class PackBoost:
                     self._cuda_backend = native_backends
             except Exception:  # pragma: no cover - defensive guard
                 self._use_native_cuda = False
+
+    
+    def _assert_feature_major_i8(self, fm: torch.Tensor, rows_dataset: int, feat_max: int, row_max: int) -> None:
+        if fm is None:
+            raise RuntimeError("_bins_fm_i8 is None")
+        if fm.dim() != 2:
+            raise RuntimeError("bins_fm_i8 must be 2D [F,N]")
+        F, N = fm.shape
+        if fm.dtype != torch.int8:
+            raise RuntimeError(f"bins_fm_i8 must be int8, got {fm.dtype}")
+        if not fm.is_contiguous():
+            raise RuntimeError("bins_fm_i8 must be contiguous")
+        s0, s1 = fm.stride()
+        if s0 != N or s1 != 1:
+            raise RuntimeError(f"bins_fm_i8 stride must be (N,1)=({N},1), got {fm.stride()}")
+        if rows_dataset != N:
+            raise RuntimeError(f"rows_dataset ({rows_dataset}) != bins_fm_i8.shape[1] ({N})")
+        if feat_max >= F:
+            raise RuntimeError(f"feature id {feat_max} out of range F={F}")
+        if row_max >= N:
+            raise RuntimeError(f"row id {row_max} out of range N={N}")
 
     # Public -------------------------------------------------------------
 
@@ -389,20 +413,22 @@ class PackBoost:
             self.config.max_bins,
             assume_prebinned=bool(self.config.prebinned),
         )
+        
         bins_np = np.asarray(self._binner.bins, dtype=np.int8)
-        bins = torch.from_numpy(bins_np).to(device=self._device)
-        if bins.dtype != torch.int8:
-            bins = bins.to(dtype=torch.int8)
+        bins = torch.from_numpy(bins_np).to(device=self._device, dtype=torch.int8)
         y_t = torch.from_numpy(y_np).to(device=self._device)
 
-        # Precompute feature-major bins for CUDA backend once
-        bins_fm: torch.Tensor | None = None
+        # Build FM caches (once)
         if self._use_native_cuda:
-            bins_fm = bins.to(torch.uint8).t().contiguous()
+            self._bins_fm_i8 = bins.to(torch.int8).t().contiguous()   # frontier kernels
+            self._bins_fm_u8 = self._bins_fm_i8.to(torch.uint8)       # predict kernels
+        else:
+            self._bins_fm_i8 = None
+            self._bins_fm_u8 = None
 
         # Init gradient state
         grad = torch.zeros(N, dtype=torch.float32, device=self._device)
-        hess = torch.ones(N, dtype=torch.float32, device=self._device)  # squared loss
+        hess = torch.ones(N, dtype=torch.float32, device=self._device)
         preds = torch.zeros(N, dtype=torch.float32, device=self._device)
 
         with torch.no_grad():
@@ -410,40 +436,38 @@ class PackBoost:
             self._tree_weight = None
             self._trained_pack_size = None
             self._round_metrics = []
-            self._packed_forest = []  # drop any cached packs from previous fits
-            era_index = build_era_index(era_encoded, E)  # list[np.ndarray] of row ids per era
+            self._packed_forest = []
+            era_index = build_era_index(era_encoded, E)
             base_era_rows = [r.to(device=self._device, dtype=torch.int64) for r in era_index]
             self._trees = []
 
+            # (Optional) eval state building unchanged, but we will *not* run eval if env disables it
             eval_states: list[dict[str, object]] = []
             if eval_sets:
                 for name, X_eval, y_eval, era_eval in eval_sets:
                     if y_eval is None:
                         raise ValueError(f"eval set '{name}' requires y values for correlation logging")
                     X_eval_np = np.asarray(X_eval)
-                    if not bool(self.config.prebinned):
-                        X_eval_bins = apply_bins(X_eval_np, self._binner.bin_edges, self.config.max_bins)
-                    else:
-                        X_eval_bins = X_eval_np.astype(np.int8, copy=False)
+                    X_eval_bins = (
+                        apply_bins(X_eval_np, self._binner.bin_edges, self.config.max_bins)
+                        if not bool(self.config.prebinned) else X_eval_np.astype(np.int8, copy=False)
+                    )
                     bins_eval = torch.from_numpy(X_eval_bins).to(self._device, dtype=torch.int8)
                     y_eval_np = np.asarray(y_eval, dtype=np.float32)
                     y_eval_tensor = torch.from_numpy(y_eval_np).to(self._device)
-                    if era_eval is None:
-                        era_eval_np = np.zeros(X_eval_bins.shape[0], dtype=np.int16)
-                    else:
-                        era_eval_np = np.asarray(era_eval, dtype=np.int16)
-                        if era_eval_np.shape[0] != X_eval_bins.shape[0]:
-                            raise ValueError(f"eval set '{name}' era ids must align with X rows")
-                    eval_states.append(
-                        {
-                            "name": name,
-                            "bins": bins_eval,
-                            "bins_fm": (bins_eval.to(torch.uint8).t().contiguous() if self._use_native_cuda else None),
-                            "y_tensor": y_eval_tensor,
-                            "era_np": era_eval_np,
-                            "preds": torch.zeros_like(y_eval_tensor),
-                        }
-                    )
+                    era_eval_np = (np.zeros(X_eval_bins.shape[0], dtype=np.int16)
+                                  if era_eval is None
+                                  else np.asarray(era_eval, dtype=np.int16))
+                    if era_eval_np.shape[0] != X_eval_bins.shape[0]:
+                        raise ValueError(f"eval set '{name}' era ids must align with X rows")
+                    eval_states.append({
+                        "name": name,
+                        "bins": bins_eval,
+                        "bins_fm_u8": (bins_eval.to(torch.uint8).t().contiguous() if self._use_native_cuda else None),
+                        "y_tensor": y_eval_tensor,
+                        "era_np": era_eval_np,
+                        "preds": torch.zeros_like(y_eval_tensor),
+                    })
 
             def log_metrics(round_idx: int, round_time: float) -> None:
                 preds_np = preds.cpu().numpy()
@@ -464,47 +488,40 @@ class PackBoost:
                 if round_callback is not None:
                     round_callback(round_idx + 1, metrics)
 
+            # ===== boosting rounds =====
             for round_idx in range(num_rounds):
                 round_start = perf_counter()
                 self._update_gradients(preds, y_t, grad)
                 self._update_hessians(hess)
 
-                # New pack (B trees) with root initialisation
                 pack_builders = [TreeBuilder() for _ in range(self.config.pack_size)]
                 frontier: list[NodeShard] = []
-                leaf_assignments: list[dict[int, torch.Tensor]] = [
-                    {} for _ in range(self.config.pack_size)
-                ]
+                leaf_assignments: list[dict[int, torch.Tensor]] = [{} for _ in range(self.config.pack_size)]
 
                 for t_id in range(self.config.pack_size):
                     shard_rows = list(base_era_rows)
                     frontier.append(NodeShard(tree_id=t_id, node_id=0, depth=0, era_rows=shard_rows))
-                    rows_root = torch.cat([r for r in shard_rows if r.numel() > 0], dim=0)
+                    rows_root = torch.cat([r for r in shard_rows if r.numel() > 0], 0)
                     leaf_assignments[t_id][0] = rows_root
                     if rows_root.numel() == 0:
                         pack_builders[t_id].set_leaf(0, 0.0)
                     else:
                         g = float(grad[rows_root].sum().item())
                         h = float(hess[rows_root].sum().item())
-                        val = -g / (h + self.config.lambda_l2)
-                        pack_builders[t_id].set_leaf(0, val)
+                        pack_builders[t_id].set_leaf(0, -g / (h + self.config.lambda_l2))
 
-                # Depth loop (shared feature subset per depth)
                 for depth in range(self.config.max_depth):
                     active_nodes = [n for n in frontier if self._node_has_capacity(n)]
                     if not active_nodes:
                         break
-
-                    feat_subset = self._sample_features(F)  # shared across pack
+                    feat_subset = self._sample_features(F)
                     stats_depth = DepthInstrumentation()
 
-                    # Batched node processing
                     decisions, stats_batch = self._find_best_splits_batched(
                         active_nodes, grad, hess, bins, feat_subset
                     )
                     stats_depth += stats_batch
 
-                    # Apply decisions → grow frontier
                     next_frontier: list[NodeShard] = []
                     flatten_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
                     for node, dec in zip(active_nodes, decisions):
@@ -523,18 +540,16 @@ class PackBoost:
                             continue
 
                         left_id, right_id = tb.split(node.node_id, dec.feature, dec.threshold)
-                        lv = -dec.left_grad / (dec.left_hess + self.config.lambda_l2)
-                        rv = -dec.right_grad / (dec.right_hess + self.config.lambda_l2)
-                        tb.set_leaf(left_id, lv)
-                        tb.set_leaf(right_id, rv)
+                        tb.set_leaf(left_id, -dec.left_grad / (dec.left_hess + self.config.lambda_l2))
+                        tb.set_leaf(right_id, -dec.right_grad / (dec.right_hess + self.config.lambda_l2))
 
-                        cache_key = id(dec)
-                        if cache_key in flatten_cache:
-                            left_all, right_all = flatten_cache[cache_key]
+                        ck = id(dec)
+                        if ck in flatten_cache:
+                            left_all, right_all = flatten_cache[ck]
                         else:
                             left_all, _ = self._stack_node_rows(dec.left_rows)
                             right_all, _ = self._stack_node_rows(dec.right_rows)
-                            flatten_cache[cache_key] = (left_all, right_all)
+                            flatten_cache[ck] = (left_all, right_all)
 
                         leaf_map.pop(node.node_id, None)
                         leaf_map[left_id] = left_all
@@ -545,7 +560,6 @@ class PackBoost:
 
                     frontier = next_frontier
 
-                    # Logs
                     depth_log = stats_depth.to_dict()
                     depth_log.update({
                         "depth": depth,
@@ -562,66 +576,51 @@ class PackBoost:
                     if self._logger.isEnabledFor(logging.INFO):
                         self._logger.info(json.dumps(depth_log))
 
-                # Pack prediction and averaging (lr / B)
+                # Aggregate pack contribution
                 pack_sum = torch.zeros_like(preds)
                 per_tree_w = float(self.config.learning_rate) / float(self.config.pack_size)
 
-                # Build trees and collect the list for this pack
                 pack_trees: list[Tree] = []
                 for t_id, tb in enumerate(pack_builders):
                     tr = tb.build()
                     pack_trees.append(tr)
                     self._trees.append(tr)
-
-                    # training-time contribution on the training rows (unchanged)
                     leaves = leaf_assignments[t_id]
                     if leaves:
                         for leaf_id, rows_all in leaves.items():
                             if rows_all.numel() == 0:
                                 continue
-                            value = float(tr.nodes[leaf_id].value)
-                            contrib = torch.full(
-                                (rows_all.numel(),),
-                                value,
-                                dtype=torch.float32,
-                                device=self._device,
-                            )
-                            pack_sum.index_add_(0, rows_all, contrib)
-
+                            pack_sum.index_add_(0, rows_all, torch.full((rows_all.numel(),), float(tr.nodes[leaf_id].value),
+                                                                        dtype=torch.float32, device=self._device))
                 preds += per_tree_w * pack_sum
                 self._tree_weight = per_tree_w
                 self._trained_pack_size = int(self.config.pack_size)
 
-                # Cache this pack's flattened trees for fast eval/predict on CUDA
-                if (
-                    (self._device.type == "cuda")
-                    and (self._cuda_backend is not None)
-                    and (not self._disable_pack_predict)
-                ):
-                    pack = self._pack_trees_cuda(pack_trees, self._device)
-                    self._packed_forest.append(pack)
+                if (self._device.type == "cuda") and (self._cuda_backend is not None) and (not self._disable_pack_predict):
+                    self._packed_forest.append(self._pack_trees_cuda(pack_trees, self._device))
 
-                # Optionally delay eval to reduce overhead; compute only on certain rounds
-                eval_every = int(os.getenv("PACKBOOST_EVAL_EVERY", "1"))
-                evaluate_now = (
-                    bool(eval_states)
-                    and (((round_idx + 1) % max(1, eval_every)) == 0 or (round_idx + 1) == num_rounds)
-                )
+                # ===== evaluation gating (0 or negative disables completely) =====
+                eval_every_env = os.getenv("PACKBOOST_EVAL_EVERY", "1")
+                try:
+                    eval_every = int(eval_every_env)
+                except Exception:
+                    eval_every = 1
+                if eval_states and eval_every > 0:
+                    evaluate_now = (((round_idx + 1) % eval_every) == 0) or ((round_idx + 1) == num_rounds)
+                else:
+                    evaluate_now = False
+
                 if evaluate_now:
                     for state in eval_states:
-                        bins_eval: torch.Tensor = state["bins"]  # type: ignore[assignment]
                         y_eval_tensor: torch.Tensor = state["y_tensor"]  # type: ignore[assignment]
                         preds_eval = torch.zeros_like(y_eval_tensor)
-                        # Fast path: use cached packs on CUDA
-                        if (
-                            self._packed_forest
-                            and self._device.type == "cuda"
-                            and self._cuda_backend is not None
-                            and not self._disable_pack_predict
-                        ):
+                        if (self._packed_forest and self._device.type == "cuda"
+                            and self._cuda_backend is not None and not self._disable_pack_predict):
+                            bins_fm_u8 = state["bins_fm_u8"]  # type: ignore[index]
                             for p in self._packed_forest:
                                 out_add = self._cuda_backend.predict_pack_cuda(
-                                    (state.get("bins_fm") if state.get("bins_fm") is not None else bins_eval.to(torch.uint8).t().contiguous()),
+                                    bins_fm_u8 if bins_fm_u8 is not None
+                                    else state["bins"].to(torch.uint8).t().contiguous(),  # type: ignore[index]
                                     p["feature"], p["threshold"],
                                     p["left_abs"], p["right_abs"],
                                     p["value"], p["is_leaf"], p["offsets"],
@@ -629,14 +628,28 @@ class PackBoost:
                                 )
                                 preds_eval.add_(out_add)
                         else:
-                            # Fallback: sum across all trees
-                            for tr in self._trees:
-                                preds_eval.add_(self._tree_weight * tr.predict_bins(bins_eval))
-                        state["preds"] = preds_eval  # type: ignore[index]
-
+                            # CPU or per-tree CUDA fallback
+                            bins_eval: torch.Tensor = state["bins"]  # type: ignore[index]
+                            if self._device.type == "cuda" and self._cuda_backend is not None:
+                                bins_fm_u8 = bins_eval.to(torch.uint8).t().contiguous()
+                                for tr in self._trees:
+                                    c = tr._ensure_compiled(self._device)
+                                    out = self._cuda_backend.predict_bins_cuda(
+                                        bins_fm_u8,
+                                        c["feature"].to(torch.int32),
+                                        c["threshold"].to(torch.int32),
+                                        c["left"].to(torch.int32),
+                                        c["right"].to(torch.int32),
+                                        c["value"].to(torch.float32),
+                                        c["is_leaf"],
+                                    )
+                                    preds_eval.add_(self._tree_weight * out)
+                            else:
+                                for tr in self._trees:
+                                    preds_eval.add_(self._tree_weight * tr.predict_bins(bins_eval))
+                        state["preds"] = preds_eval
                 round_elapsed = perf_counter() - round_start
                 log_metrics(round_idx, round_elapsed)
-
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -672,8 +685,24 @@ class PackBoost:
                     pred.add_(out_add)
                 return pred.cpu().numpy()
 
-            # Fallback: per-tree (CPU or CUDA)
+            # Fallback: per-tree — optimized CUDA path with single FM build
             pred = torch.zeros(bins.shape[0], dtype=torch.float32, device=self._device)
+            if self._device.type == "cuda" and self._cuda_backend is not None:
+                bins_fm_pred = bins.to(torch.uint8).t().contiguous()
+                for tr in self._trees:
+                    c = tr._ensure_compiled(self._device)
+                    out = self._cuda_backend.predict_bins_cuda(
+                        bins_fm_pred,
+                        c["feature"].to(torch.int32),
+                        c["threshold"].to(torch.int32),
+                        c["left"].to(torch.int32),
+                        c["right"].to(torch.int32),
+                        c["value"].to(torch.float32),
+                        c["is_leaf"],
+                    )
+                    pred.add_(self._tree_weight * out)
+                return pred.cpu().numpy()
+            # CPU fallback
             for tr in self._trees:
                 pred += self._tree_weight * tr.predict_bins(bins)
             return pred.cpu().numpy()
@@ -1260,12 +1289,7 @@ class PackBoost:
         return decisions, stats
 
     def _find_best_splits_batched_cuda(
-        self,
-        nodes: Sequence[NodeShard],
-        grad: torch.Tensor,
-        hess: torch.Tensor,
-        bins: torch.Tensor,
-        feature_subset: torch.Tensor,
+        self, nodes, grad, hess, bins, feature_subset,
     ) -> tuple[list[SplitDecision | None], DepthInstrumentation]:
         stats = DepthInstrumentation()
         M = len(nodes)
@@ -1284,9 +1308,9 @@ class PackBoost:
             stats.nodes_skipped += M
             return decisions, stats
         feat_ids_i64 = feat_ids.to(torch.int64)
-
         lam_l2 = float(self.config.lambda_l2)
 
+        # ----- build compact contexts -----
         contexts: list[_NodeContext] = []
         index_map: list[int] = []
         row_chunks: list[torch.Tensor] = []
@@ -1299,59 +1323,43 @@ class PackBoost:
 
         for idx, node in enumerate(nodes):
             all_rows, era_ids = self._stack_node_rows(node.era_rows)
-            if all_rows.device != self._device:
-                all_rows = all_rows.to(self._device)
-            if era_ids.device != self._device:
-                era_ids = era_ids.to(self._device)
-            all_rows = all_rows.to(dtype=torch.int64).contiguous()
-            era_ids = era_ids.to(dtype=torch.int16).contiguous()
+            if all_rows.device != self._device: all_rows = all_rows.to(self._device)
+            if era_ids.device  != self._device: era_ids  = era_ids.to(self._device)
+            all_rows = all_rows.to(torch.int64).contiguous()
+            era_ids  = era_ids.to(torch.int16).contiguous()
             total_count = int(all_rows.numel())
             if total_count < 2 * self.config.min_samples_leaf:
                 stats.nodes_skipped += 1
                 continue
 
-            duplicate_idx: int | None = None
-            for ctx_idx, rows_ref in enumerate(context_rows):
-                if rows_ref.shape[0] != all_rows.shape[0]:
-                    continue
-                if not torch.equal(rows_ref, all_rows):
-                    continue
-                if not torch.equal(context_era_ids[ctx_idx], era_ids):
-                    continue
-                duplicate_idx = ctx_idx
-                break
-            if duplicate_idx is not None:
-                duplicate_map[idx] = duplicate_idx
+            dup: int | None = None
+            for j, rows_ref in enumerate(context_rows):
+                if rows_ref.shape[0] != all_rows.shape[0]: continue
+                if not torch.equal(rows_ref, all_rows):    continue
+                if not torch.equal(context_era_ids[j], era_ids): continue
+                dup = j; break
+            if dup is not None:
+                duplicate_map[idx] = dup
                 continue
 
-            g_rows = grad.index_select(0, all_rows)
-            h_rows = hess.index_select(0, all_rows)
+            g_rows = grad.index_select(0, all_rows).contiguous()
+            h_rows = hess.index_select(0, all_rows).contiguous()
             g_tot = float(g_rows.sum().item())
             h_tot = float(h_rows.sum().item())
-
-            era_counts = torch.tensor(
+            era_w = self._compute_era_weights(torch.tensor(
                 [float(r.numel()) for r in node.era_rows],
-                dtype=torch.float32,
-                device=self._device,
-            )
-            era_w = self._compute_era_weights(era_counts)
+                dtype=torch.float32, device=self._device,
+            ))
 
-            ctx = _NodeContext(
-                shard=node,
-                era_weights=era_w,
-                parent_dir=torch.tensor(0.0, device=self._device),
-                total_grad=g_tot,
-                total_hess=h_tot,
-                total_count=total_count,
-                row_start=row_start,
-                row_count=total_count,
-            )
-            contexts.append(ctx)
+            contexts.append(_NodeContext(
+                shard=node, era_weights=era_w, parent_dir=torch.tensor(0.0, device=self._device),
+                total_grad=g_tot, total_hess=h_tot, total_count=total_count,
+                row_start=row_start, row_count=total_count,
+            ))
             index_map.append(idx)
-
             row_chunks.append(all_rows)
-            grad_chunks.append(g_rows.contiguous())
-            hess_chunks.append(h_rows.contiguous())
+            grad_chunks.append(g_rows)
+            hess_chunks.append(h_rows)
             context_rows.append(all_rows)
             context_era_ids.append(era_ids)
             row_start += total_count
@@ -1359,84 +1367,54 @@ class PackBoost:
 
         if not contexts:
             return decisions, stats
-
         if duplicate_map:
             stats.nodes_collapsed += len(duplicate_map)
 
         stats.nodes_processed += len(contexts)
         Nnodes = len(contexts)
-        expected_eras = max(1, max(len(ctx.shard.era_rows) for ctx in contexts))
-        block_size = int(feat_ids.numel())
-        stats.block_size = max(stats.block_size, block_size)
+        expected_eras = max(1, max(len(c.shard.era_rows) for c in contexts))
+        stats.block_size = max(stats.block_size, int(feat_ids.numel()))
 
-        rows_cat = torch.cat(row_chunks, 0).to(device=self._device)
-        rows_cat_i32 = rows_cat.to(dtype=torch.int32).contiguous()
-        grad_cat = torch.cat(grad_chunks, 0).contiguous()
-        hess_cat = torch.cat(hess_chunks, 0).contiguous()
+        rows_cat      = torch.cat(row_chunks, 0).to(self._device)
+        rows_cat_i32  = rows_cat.to(torch.int32).contiguous()
+        grad_cat      = torch.cat(grad_chunks, 0).contiguous()
+        hess_cat      = torch.cat(hess_chunks, 0).contiguous()
+        node_offsets  = [c.row_start for c in contexts] + [row_start]
+        node_row_splits = torch.tensor(node_offsets, dtype=torch.int32, device=self._device)
 
-        node_row_offsets: list[int] = [ctx.row_start for ctx in contexts]
-        node_row_offsets.append(row_start)
-        node_row_splits = torch.tensor(
-            node_row_offsets, dtype=torch.int32, device=self._device
-        ).contiguous()
-        if int(node_row_splits[-1].item()) != int(rows_cat.shape[0]):
-            raise RuntimeError("node_row_splits mismatch rows_cat length in CUDA path")
-
+        # ---- RELATIVE era offsets (0..span) ----
         era_offset_rows: list[list[int]] = []
         for ctx in contexts:
-            prefix: list[int] = [0]
-            running = 0
+            pref: list[int] = [0]
+            run = 0
             for rows_tensor in ctx.shard.era_rows:
-                cnt = int(rows_tensor.numel())
-                running += cnt
-                prefix.append(running)
-            while len(prefix) < expected_eras + 1:
-                prefix.append(running)
-            prefix = [p + ctx.row_start for p in prefix]
-            era_offset_rows.append(prefix)
-        node_era_splits = torch.tensor(
-            era_offset_rows, dtype=torch.int32, device=self._device
-        ).contiguous()
-        if node_era_splits.shape[1] != (expected_eras + 1):
-            raise RuntimeError("node_era_splits has unexpected width")
-        if not torch.equal(node_era_splits[:, 0], node_row_splits[:-1]):
-            raise RuntimeError("node_era_splits start offsets mismatch node_row_splits")
-        if not torch.equal(node_era_splits[:, -1], node_row_splits[1:]):
-            raise RuntimeError("node_era_splits end offsets mismatch node_row_splits")
+                run += int(rows_tensor.numel())
+                pref.append(run)
+            while len(pref) < expected_eras + 1:
+                pref.append(run)
+            era_offset_rows.append(pref)   # *** RELATIVE; no +row_start ***
+        node_era_splits = torch.tensor(era_offset_rows, dtype=torch.int32, device=self._device).contiguous()
+
+        spans = node_row_splits[1:] - node_row_splits[:-1]
+        if (node_era_splits[:, 0] != 0).any() or (node_era_splits[:, -1] != spans).any():
+            raise RuntimeError("node_era_splits must be relative (0..span) for each node.")
         if (node_era_splits[:, 1:] - node_era_splits[:, :-1] < 0).any():
-            raise RuntimeError("node_era_splits offsets must be non-decreasing")
+            raise RuntimeError("node_era_splits must be non-decreasing per node.")
 
-        weight_rows: list[torch.Tensor] = []
-        for c in contexts:
-            w = c.era_weights.to(dtype=torch.float32)
-            if w.numel() == 0:
-                w = torch.ones((1,), dtype=torch.float32, device=self._device)
-            if w.numel() < expected_eras:
-                pad = torch.zeros((expected_eras - w.numel(),), dtype=torch.float32, device=self._device)
-                w = torch.cat([w, pad])
-            weight_rows.append(w)
-        era_weights_tensor = torch.stack(weight_rows, 0).contiguous()
-        total_grad_nodes = torch.tensor(
-            [c.total_grad for c in contexts], dtype=torch.float32, device=self._device
-        )
-        total_hess_nodes = torch.tensor(
-            [c.total_hess for c in contexts], dtype=torch.float32, device=self._device
-        )
-        total_count_nodes = torch.tensor(
-            [c.total_count for c in contexts], dtype=torch.int64, device=self._device
-        )
-
+        # feature-major int8 bins for frontier kernels
+        bins_fm_i8 = self._bins_fm_i8 if self._bins_fm_i8 is not None else bins.t().contiguous()
+        # quick sanity
+        if bins_fm_i8.dtype != torch.int8 or not bins_fm_i8.is_contiguous():
+            bins_fm_i8 = bins_fm_i8.to(torch.int8).contiguous()
+        # ---- split scoring kernel ----
         result = self._cuda_backend.find_best_splits_batched_cuda(
-            (bins_fm if 'bins_fm' in locals() and bins_fm is not None else bins),
-            grad_cat,
-            hess_cat,
+            bins_fm_i8, grad_cat, hess_cat,
             rows_cat_i32,
-            node_row_splits,
-            node_era_splits,
-            era_weights_tensor,
-            total_grad_nodes,
-            total_hess_nodes,
-            total_count_nodes,
+            node_row_splits, node_era_splits,
+            torch.stack([c.era_weights for c in contexts], 0).contiguous(),
+            torch.tensor([c.total_grad for c in contexts], dtype=torch.float32, device=self._device),
+            torch.tensor([c.total_hess for c in contexts], dtype=torch.float32, device=self._device),
+            torch.tensor([c.total_count for c in contexts], dtype=torch.int64,   device=self._device),
             feat_ids,
             int(self.config.max_bins),
             int(self.config.k_cuts),
@@ -1447,114 +1425,140 @@ class PackBoost:
             int(self.config.min_samples_leaf),
             int(rows_cat_i32.shape[0]),
         )
+        stats.score_ms += float(result.get("kernel_ms", 0.0))
 
-        kernel_ms = float(result.get("kernel_ms", 0.0))
+        scores      = result["scores"].to("cpu").contiguous().numpy()
+        thresholds  = result["thresholds"].to("cpu").contiguous().numpy()
+        left_grad   = result["left_grad"].to("cpu").contiguous().numpy()
+        left_hess   = result["left_hess"].to("cpu").contiguous().numpy()
+        left_count  = result["left_count"].to("cpu").contiguous().numpy()
+        feat_list   = feat_ids_i64.to("cpu").tolist()
+        tot_g_list  = [c.total_grad for c in contexts]
+        tot_h_list  = [c.total_hess for c in contexts]
+        tot_c_list  = [c.total_count for c in contexts]
 
-        scores_cpu = result["scores"].to("cpu").contiguous()
-        thresholds_cpu = result["thresholds"].to("cpu").contiguous()
-        left_grad_cpu = result["left_grad"].to("cpu").contiguous()
-        left_hess_cpu = result["left_hess"].to("cpu").contiguous()
-        left_count_cpu = result["left_count"].to("cpu").contiguous()
+        best_feat = torch.full((Nnodes,), -1, dtype=torch.int32, device=self._device)
+        best_thr  = torch.full((Nnodes,), -1, dtype=torch.int32, device=self._device)
+        best_scr  = torch.full((Nnodes,), float("-inf"), device=self._device)
+        best_lg   = torch.zeros(Nnodes, dtype=torch.float32, device=self._device)
+        best_lh   = torch.zeros(Nnodes, dtype=torch.float32, device=self._device)
+        best_lc   = torch.full((Nnodes,), -1, dtype=torch.int64, device=self._device)
 
-        feat_ids_list = feat_ids_i64.to(torch.device("cpu")).tolist()
-        total_grad_list = total_grad_nodes.to(torch.device("cpu")).tolist()
-        total_hess_list = total_hess_nodes.to(torch.device("cpu")).tolist()
-        total_count_list = total_count_nodes.to(torch.device("cpu")).tolist()
+        for cid in range(Nnodes):
+            sc  = scores[cid]; th = thresholds[cid]
+            lg  = left_grad[cid]; lh = left_hess[cid]; lc = left_count[cid]
+            best = float("-inf"); bf=-1; bt=-1; blg=0.0; blh=0.0; blc=-1
+            tot_cnt = int(tot_c_list[cid])
 
-        scores_np = scores_cpu.numpy()
-        thresholds_np = thresholds_cpu.numpy()
-        left_grad_np = left_grad_cpu.numpy()
-        left_hess_np = left_hess_cpu.numpy()
-        left_count_np = left_count_cpu.numpy()
-
-        for cid, ctx in enumerate(contexts):
-            node_idx = index_map[cid]
-            node_scores = scores_np[cid]
-            node_thresholds = thresholds_np[cid]
-            node_left_grad = left_grad_np[cid]
-            node_left_hess = left_hess_np[cid]
-            node_left_count = left_count_np[cid]
-
-            best_score = float("-inf")
-            best_feature = -1
-            best_threshold = -1
-            best_left_grad = 0.0
-            best_left_hess = 0.0
-            best_left_count = 0
-
-            total_grad_node = float(total_grad_list[cid])
-            total_hess_node = float(total_hess_list[cid])
-            total_count_node = int(total_count_list[cid])
-
-            for f_index, feature_global in enumerate(feat_ids_list):
-                score_val = float(node_scores[f_index])
-                threshold_val = int(node_thresholds[f_index])
-                if threshold_val < 0 or not math.isfinite(score_val):
+            for j, fglob in enumerate(feat_list):
+                sv = float(sc[j]); tv = int(th[j]); if_bad = (tv < 0) or (not math.isfinite(sv))
+                if if_bad: continue
+                lcj = int(lc[j]); rcj = tot_cnt - lcj
+                if lcj < self.config.min_samples_leaf or rcj < self.config.min_samples_leaf:
                     continue
-                left_count_val = int(node_left_count[f_index])
-                right_count_val = total_count_node - left_count_val
-                if (
-                    left_count_val < self.config.min_samples_leaf
-                    or right_count_val < self.config.min_samples_leaf
-                ):
-                    continue
-
-                better = score_val > best_score
-                if not better and abs(score_val - best_score) <= 1e-12:
-                    if left_count_val > best_left_count:
-                        better = True
-                    elif left_count_val == best_left_count:
-                        if feature_global > best_feature:
-                            better = True
-                        elif feature_global == best_feature and threshold_val > best_threshold:
-                            better = True
-
+                better = (sv > best) or (abs(sv-best) <= 1e-12 and (lcj > blc or (lcj==blc and (fglob>bf or (fglob==bf and tv>bt)))))
                 if better:
-                    best_score = score_val
-                    best_feature = int(feature_global)
-                    best_threshold = threshold_val
-                    best_left_grad = float(node_left_grad[f_index])
-                    best_left_hess = float(node_left_hess[f_index])
-                    best_left_count = left_count_val
+                    best, bf, bt, blg, blh, blc = sv, int(fglob), tv, float(lg[j]), float(lh[j]), lcj
 
-            if best_feature < 0:
-                decisions[node_idx] = None
-                continue
+            best_scr[cid]=best; best_feat[cid]=bf; best_thr[cid]=bt; best_lg[cid]=blg; best_lh[cid]=blh; best_lc[cid]=blc
 
-            right_grad = total_grad_node - best_left_grad
-            right_hess = total_hess_node - best_left_hess
-            right_count = total_count_node - best_left_count
-
-            left_rows, right_rows = self._partition_rows(
-                bins,
-                ctx.shard.era_rows,
-                best_feature,
-                best_threshold,
+        sel_mask = best_feat >= 0
+        if torch.any(sel_mask):
+            sel_idx = torch.nonzero(sel_mask, as_tuple=False).view(-1)
+            # Compact splits for selected nodes
+            node_row_splits_sel = torch.tensor(
+                [contexts[i].row_start for i in sel_idx.tolist()] + [row_start],
+                dtype=torch.int32, device=self._device
             )
+            node_era_splits_sel = node_era_splits.index_select(0, sel_idx).contiguous()
+            feat_sel = best_feat.index_select(0, sel_idx).to(torch.int32).contiguous()
+            thr_sel  = best_thr.index_select(0, sel_idx).to(torch.int32).contiguous()
 
-            decisions[node_idx] = SplitDecision(
-                feature=best_feature,
-                threshold=best_threshold,
-                score=best_score,
-                left_grad=best_left_grad,
-                left_hess=best_left_hess,
-                right_grad=right_grad,
-                right_hess=right_hess,
-                left_count=best_left_count,
-                right_count=right_count,
-                left_rows=left_rows,
-                right_rows=right_rows,
-            )
+            # Try backend partition; if the shim wants a different type and raises
+            # an AttributeError (e.g. '.slice'), fall back to Python partition.
+            used_cuda_partition = False
+            try:
+                part = self._cuda_backend.partition_frontier_cuda(
+                    (self._bins_fm_i8 if self._bins_fm_i8 is not None else bins.t().contiguous()),
+                    rows_cat_i32,
+                    node_row_splits_sel,
+                    node_era_splits_sel,
+                    feat_sel,
+                    thr_sel,
+                )
+                used_cuda_partition = True
+            except (AttributeError, TypeError) as _shim_issue:
+                used_cuda_partition = False
 
+            if used_cuda_partition:
+                part_start = perf_counter()
+                left_idx:  torch.Tensor = part["left_index"]
+                right_idx: torch.Tensor = part["right_index"]
+                left_spl:  torch.Tensor = part["left_splits"].to(torch.int64).contiguous()
+                right_spl: torch.Tensor = part["right_splits"].to(torch.int64).contiguous()
+                stats.partition_ms += (perf_counter() - part_start) * 1000.0
+
+                expected_eras = node_era_splits_sel.shape[1] - 1
+                for j, cid in enumerate(sel_idx.tolist()):
+                    node_idx = index_map[cid]
+                    f = int(best_feat[cid].item()); t = int(best_thr[cid].item())
+                    s = float(best_scr[cid].item())
+                    Ls: list[torch.Tensor] = []; Rs: list[torch.Tensor] = []
+                    for e in range(expected_eras):
+                        lb, le = int(left_spl[j, e].item()),  int(left_spl[j, e+1].item())
+                        rb, re = int(right_spl[j, e].item()), int(right_spl[j, e+1].item())
+                        Ls.append(left_idx[lb:le].to(torch.int64, device=self._device))
+                        Rs.append(right_idx[rb:re].to(torch.int64, device=self._device))
+
+                    l_cnt = int((left_spl[j, -1] - left_spl[j, 0]).item())
+                    r_cnt = int((right_spl[j, -1] - right_spl[j, 0]).item())
+                    if l_cnt > 0:
+                        l_flat = left_idx[left_spl[j, 0]: left_spl[j, -1]].to(torch.int64)
+                        l_g = float(grad.index_select(0, l_flat).sum().item())
+                        l_h = float(hess.index_select(0, l_flat).sum().item())
+                    else:
+                        l_g = 0.0; l_h = 0.0
+                    r_g = float(tot_g_list[cid] - l_g)
+                    r_h = float(tot_h_list[cid] - l_h)
+
+                    decisions[node_idx] = SplitDecision(
+                        feature=f, threshold=t, score=s,
+                        left_grad=l_g, left_hess=l_h, right_grad=r_g, right_hess=r_h,
+                        left_count=l_cnt, right_count=r_cnt,
+                        left_rows=Ls, right_rows=Rs,
+                    )
+
+            else:
+                # Fallback: safe Python partition on *row-major* bins
+                for cid in sel_idx.tolist():
+                    node_idx = index_map[cid]
+                    f = int(best_feat[cid].item()); t = int(best_thr[cid].item())
+                    s = float(best_scr[cid].item())
+                    Ls, Rs = self._partition_rows(bins, contexts[cid].shard.era_rows, f, t)  # row-major!
+                    l_cnt = sum(int(x.numel()) for x in Ls)
+                    r_cnt = sum(int(x.numel()) for x in Rs)
+                    l_g = float(grad.index_select(0, torch.cat([x for x in Ls if x.numel()>0], 0)).sum().item()) if l_cnt>0 else 0.0
+                    l_h = float(hess.index_select(0, torch.cat([x for x in Ls if x.numel()>0], 0)).sum().item()) if l_cnt>0 else 0.0
+                    r_g = float(tot_g_list[cid] - l_g)
+                    r_h = float(tot_h_list[cid] - l_h)
+                    decisions[node_idx] = SplitDecision(
+                        feature=f, threshold=t, score=s,
+                        left_grad=l_g, left_hess=l_h, right_grad=r_g, right_hess=r_h,
+                        left_count=l_cnt, right_count=r_cnt,
+                        left_rows=Ls, right_rows=Rs,
+                    )
+
+        # propagate decisions to duplicates
         if duplicate_map:
             for dup_idx, ctx_idx in duplicate_map.items():
-                rep_node = index_map[ctx_idx]
-                decisions[dup_idx] = decisions[rep_node]
+                ref = index_map[ctx_idx]
+                decisions[dup_idx] = decisions[ref]
 
         stats.feature_blocks += 1
-        stats.score_ms += kernel_ms
         stats.nodes_subtract_ok += len(contexts)
         return decisions, stats
+
+
 
     def _mass_cut_indices(self, counts_block: torch.Tensor, k: int) -> torch.Tensor:
         """Per-feature cut selection by mass quantiles over (nodes, eras)."""
