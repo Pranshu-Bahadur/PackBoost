@@ -36,6 +36,11 @@ __device__ inline int warp_reduce_sum_int(int v){
   return v;
 }
 
+// Feature-major accessor: bins on device are [F, N]
+__device__ __forceinline__ int load_bin_colmajor(const uint8_t* bins, int N, int row, int feat){
+  return int(bins[(size_t)feat * (size_t)N + (size_t)row]);
+}
+
 // Safe Hillis–Steele inclusive scan on first n entries of g/h/c
 __device__ inline void block_scan_prefix(float* g, float* h, int* c, int n) {
   for (int off = 1; off < n; off <<= 1) {
@@ -53,8 +58,8 @@ __device__ inline void block_scan_prefix(float* g, float* h, int* c, int n) {
 
 template<int TPB>
 __global__ void frontier_count_kernel(
-    const int8_t*  __restrict__ bins_rowmajor,   // [N,F] row-major int8
-    int            bins_stride,                  // F
+    const int8_t*  __restrict__ bins_colmajor,   // [F,N] feature-major int8
+    int            rows_dataset,                 // N
     const int32_t* __restrict__ rows_index,      // [Rcat] -> dataset row ids
     const int32_t* __restrict__ node_row_splits, // [Nsel+1] offsets into rows_index
     const int32_t* __restrict__ node_era_splits, // [Nsel*(E+1)] offsets within node span
@@ -83,8 +88,7 @@ __global__ void frontier_count_kernel(
         for (int i = threadIdx.x; i < len; i += TPB) {
             const int32_t pos  = node_base + beg + i;
             const int32_t rid  = rows_index[pos];
-            const long long off= (long long)rid * (long long)bins_stride + (long long)feat;
-            const int bin      = int((unsigned char)bins_rowmajor[off]);
+            const int bin      = load_bin_colmajor(reinterpret_cast<const uint8_t*>(bins_colmajor), rows_dataset, rid, feat);
             local += (bin <= thr);
         }
 
@@ -106,8 +110,8 @@ __device__ __forceinline__ unsigned lane_id_u() { return threadIdx.x & (WARP_SIZ
 // Each block handles one node; per era we stream rows and do warp-aggregated atomics.
 template<int TPB>
 __global__ void frontier_scatter_kernel(
-    const int8_t*  __restrict__ bins_rowmajor,   // [N,F]
-    int            bins_stride,                  // F
+    const int8_t*  __restrict__ bins_colmajor,   // [F,N]
+    int            rows_dataset,                 // N
     const int32_t* __restrict__ rows_index,      // [Rcat]
     const int32_t* __restrict__ node_row_splits, // [Nsel+1]
     const int32_t* __restrict__ node_era_splits, // [Nsel*(E+1)]
@@ -153,8 +157,7 @@ __global__ void frontier_scatter_kernel(
             if (active) {
                 const int32_t pos  = node_base + beg + i;
                 rid = rows_index[pos];
-                const long long off= (long long)rid * (long long)bins_stride + (long long)feat;
-                bin = int((unsigned char)bins_rowmajor[off]);
+                bin = load_bin_colmajor(reinterpret_cast<const uint8_t*>(bins_colmajor), rows_dataset, rid, feat);
             }
             const int is_left  = active && (bin <= thr);
             const int is_right = active && !is_left;
@@ -188,8 +191,7 @@ __global__ void frontier_scatter_kernel(
 
 
 __global__ void cuda_predict_bins_kernel(
-    const uint8_t* __restrict__ bins_rowmajor,  // [N, F] (row-major)
-    int bins_stride,                             // = F
+    const uint8_t* __restrict__ bins_colmajor,  // [F, N] (feature-major)
     int num_rows,
 
     const int32_t* __restrict__ feature,        // [num_nodes]
@@ -217,7 +219,7 @@ __global__ void cuda_predict_bins_kernel(
             }
             const int f   = feature[node];
             const int thr = threshold[node];
-            const int v   = int(bins_rowmajor[(size_t)row * (size_t)bins_stride + (size_t)f]);
+            const int v   = load_bin_colmajor(bins_colmajor, num_rows, row, f);
             const bool go_left = (v <= thr);
             node = go_left ? left[node] : right[node];
 
@@ -273,7 +275,7 @@ __global__ void cuda_find_best_splits_kernel(
   const int feature_id = feature_ids[foff];
   const int out_index  = node_id * num_features + foff;
 
-  if(feature_id<0 || feature_id>=bins_stride || num_bins<=1){
+  if(feature_id<0 || feature_id>=num_features || num_bins<=1){
     if(threadIdx.x==0){
       out_scores[out_index]=NEG_INF; out_thresholds[out_index]=-1;
       out_left_grad[out_index]=0.f; out_left_hess[out_index]=0.f; out_left_count[out_index]=0;
@@ -357,8 +359,7 @@ __global__ void cuda_find_best_splits_kernel(
 
     for(int r=row_start+threadIdx.x; r<row_end; r+=blockDim.x){
       const int32_t ridx = rows_index[r];
-      const long long off = (long long)ridx * (long long)bins_stride + (long long)feature_id; // row-major
-      const int bin = int((unsigned char)bins_rowmajor[off]);
+      const int bin = load_bin_colmajor(reinterpret_cast<const uint8_t*>(bins_rowmajor), bins_stride, ridx, feature_id);
       if(bin>=0 && bin<num_bins) atomicAdd(&cnt_w[warp_id*num_bins+bin],1);
     }
     __syncthreads();
@@ -445,8 +446,7 @@ __global__ void cuda_find_best_splits_kernel(
     // build per-warp histograms
     for(int r=es+threadIdx.x; r<ee; r+=blockDim.x){
       const int32_t ridx = rows_index[r];
-      const long long off = (long long)ridx * (long long)bins_stride + (long long)feature_id;
-      const int bin = int((unsigned char)bins_rowmajor[off]);
+      const int bin = load_bin_colmajor(reinterpret_cast<const uint8_t*>(bins_rowmajor), bins_stride, ridx, feature_id);
       if(bin>=0 && bin<num_bins){
         const float g=grad[r], h=hess[r];
         atomicAdd(&cnt_w[warp_id*num_bins+bin],1);
@@ -600,8 +600,7 @@ py::dict find_best_splits_batched_cuda(
   // Shapes
   py::tuple bshape = py::tuple(bins.attr("shape"));   // [N,F]
   const int rows_dataset = (int)py::int_(bshape[0]);
-  const int bins_stride  = (int)py::int_(bshape[1]);
-  (void)rows_dataset;
+  const int num_features_all  = (int)py::int_(bshape[1]);
 
   py::tuple nshape = py::tuple(node_row_splits.attr("shape"));
   const int num_nodes = (int)py::int_(nshape[0]) - 1;
@@ -616,7 +615,9 @@ py::dict find_best_splits_batched_cuda(
   const int cut_mode = (cut_selection=="mass") ? 1 : 0;
 
   // Raw pointers
-  const uintptr_t bins_ptr      = py::int_(bins.attr("data_ptr")());
+  // Transpose bins to feature-major [F, N] for coalesced loads
+  py::object bins_col = bins.attr("t")().attr("contiguous")();
+  const uintptr_t bins_ptr      = py::int_(bins_col.attr("data_ptr")());
   const uintptr_t grad_ptr      = py::int_(grad.attr("data_ptr")());
   const uintptr_t hess_ptr      = py::int_(hess.attr("data_ptr")());
   const uintptr_t rows_idx_ptr  = py::int_(rows_index.attr("data_ptr")());
@@ -674,7 +675,7 @@ py::dict find_best_splits_batched_cuda(
 
   cuda_find_best_splits_kernel<<<grid, block, shmem>>>(
     reinterpret_cast<const int8_t*>(bins_ptr),
-    (int)bins_stride,
+    (int)rows_dataset,
     reinterpret_cast<const float*>(grad_ptr),
     reinterpret_cast<const float*>(hess_ptr),
     reinterpret_cast<const int32_t*>(rows_idx_ptr),
@@ -727,7 +728,7 @@ py::dict partition_frontier_cuda(
 
   // Shapes & meta
   py::tuple bshape = py::tuple(bins.attr("shape"));    // [N,F]
-  const int F = (int)py::int_(bshape[1]);
+  const int N = (int)py::int_(bshape[0]);
 
   py::tuple nshape = py::tuple(node_row_splits.attr("shape")); // [Nsel+1]
   const int Nsel = (int)py::int_(nshape[0]) - 1;
@@ -749,8 +750,9 @@ py::dict partition_frontier_cuda(
   py::object device = bins.attr("device");
   auto opts_i32 = py::dict("device"_a=device, "dtype"_a=torch.attr("int32"));
 
-  // Pointers
-  const uintptr_t bins_ptr  = py::int_(bins.attr("contiguous")().attr("data_ptr")());
+  // Pointers (transpose to feature-major [F,N])
+  py::object bins_col = bins.attr("t")().attr("contiguous")();
+  const uintptr_t bins_ptr  = py::int_(bins_col.attr("data_ptr")());
   const uintptr_t rows_ptr  = py::int_(rows_index.attr("data_ptr")());
   const uintptr_t nrow_ptr  = py::int_(node_row_splits.attr("data_ptr")());
   const uintptr_t nera_ptr  = py::int_(node_era_splits.attr("data_ptr")());
@@ -766,7 +768,7 @@ py::dict partition_frontier_cuda(
     dim3 block(THREADS, 1, 1);
     frontier_count_kernel<THREADS><<<grid, block>>>(
       reinterpret_cast<const int8_t*>(bins_ptr),
-      (int)F,
+      (int)N,
       reinterpret_cast<const int32_t*>(rows_ptr),
       reinterpret_cast<const int32_t*>(nrow_ptr),
       reinterpret_cast<const int32_t*>(nera_ptr),
@@ -826,7 +828,7 @@ py::dict partition_frontier_cuda(
     dim3 block(THREADS, 1, 1);
     size_t shmem = sizeof(int32_t) * (size_t)E * 2;   // curL[E] + curR[E]
     frontier_scatter_kernel<THREADS><<<grid, block, shmem>>>(
-      reinterpret_cast<const int8_t*>(bins_ptr), (int)F,
+      reinterpret_cast<const int8_t*>(bins_ptr), (int)N,
       reinterpret_cast<const int32_t*>(rows_ptr),
       reinterpret_cast<const int32_t*>(nrow_ptr),
       reinterpret_cast<const int32_t*>(nera_ptr),
@@ -888,7 +890,9 @@ py::object predict_bins_cuda(
                                    "dtype"_a=torch.attr("float32"));
 
     // raw ptrs
-    const uintptr_t bins_ptr  = py::int_(bins.attr("data_ptr")());
+    // Transpose to feature-major for coalesced reads
+    py::object bins_col = bins.attr("t")().attr("contiguous")();
+    const uintptr_t bins_ptr  = py::int_(bins_col.attr("data_ptr")());
     const uintptr_t feat_ptr  = py::int_(feature.attr("data_ptr")());
     const uintptr_t thr_ptr   = py::int_(threshold.attr("data_ptr")());
     const uintptr_t left_ptr  = py::int_(left.attr("data_ptr")());
@@ -904,7 +908,7 @@ py::object predict_bins_cuda(
     blocks = std::min(blocks, 65535);  // 1D grid cap
 
     cuda_predict_bins_kernel<<<blocks, threads>>>(
-        reinterpret_cast<const uint8_t*>(bins_ptr), F, N,
+        reinterpret_cast<const uint8_t*>(bins_ptr), N,
         reinterpret_cast<const int32_t*>(feat_ptr),
         reinterpret_cast<const int32_t*>(thr_ptr),
         reinterpret_cast<const int32_t*>(left_ptr),
@@ -957,7 +961,7 @@ __global__ void predict_pack_kernel(
                   if (is_leaf[node]) { leaf_val = value[node]; break; }
                   const int f   = feature[node];
                   const int thr = threshold[node];
-                  const int v   = int(bins[(size_t)row * (size_t)F + (size_t)f]);
+                  const int v   = load_bin_colmajor(bins, N, row, f);
                   node = (v <= thr) ? left_abs[node] : right_abs[node];
                   if (node < offsets[t] || node >= node_end) { leaf_val = 0.0f; break; } // guard
               }
@@ -997,7 +1001,9 @@ py::object predict_pack_cuda(
                                  "device"_a=bins.attr("device"),
                                  "dtype"_a=torch.attr("float32"));
 
-  const uintptr_t bins_ptr = py::int_(bins.attr("contiguous")().attr("data_ptr")());
+  // Ensure feature-major [F,N]
+  py::object bins_col = bins.attr("t")().attr("contiguous")();
+  const uintptr_t bins_ptr = py::int_(bins_col.attr("data_ptr")());
   const uintptr_t f_ptr    = py::int_(feature.attr("data_ptr")());
   const uintptr_t t_ptr    = py::int_(threshold.attr("data_ptr")());
   const uintptr_t l_ptr    = py::int_(left_abs.attr("data_ptr")());
