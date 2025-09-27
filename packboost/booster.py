@@ -580,7 +580,7 @@ class PackBoost:
 
                 # Aggregate pack contribution
                 pack_sum = torch.zeros_like(preds)
-                per_tree_w = float(self.config.learning_rate) / float(self.config.pack_size)
+                per_tree_w = float(self.config.learning_rate)# / float(self.config.pack_size)
 
                 pack_trees: list[Tree] = []
                 for t_id, tb in enumerate(pack_builders):
@@ -717,7 +717,7 @@ class PackBoost:
 
         return self._round_metrics
 
-    def predict_packwise(self, X: np.ndarray, block_size_trees: int = 800 // 8) -> np.ndarray:
+    def predict_packwise(self, X: np.ndarray, block_size_trees: int = 8) -> np.ndarray:
         if block_size_trees <= 0:
             raise ValueError("block_size_trees must be positive")
         if self._binner is None:

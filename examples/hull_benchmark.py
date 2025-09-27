@@ -1,7 +1,6 @@
 # examples/hull_benchmark.py
-#2.89 Sharpe Config:
-#python examples/hull_benchmark.py  --data datasets/train.csv --era-size 180 --holdout-eras 1 --to-signal-mult 1600 --lastn 180  --impute ffill --target-col forward_excess
-from __future__ import annotations
+#3.3891 Hull Sharpe Config:
+#PACKBOOST_DISABLE_NATIVE_CPU=0 python examples/hull_benchmark.py  --data datasets/train.csv --era-size 180 --holdout-eras 1 --to-signal-mult 400 --lastn 180  --impute ffill --target-col forward_returnsfrom __future__ import annotations
 import sys, time, argparse, warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -432,16 +431,16 @@ def main():
                     help="Number of last global date_id rows to evaluate on (leak-free).")
 
     # PB hyperparams
-    ap.add_argument("--n-trees", type=int, default=8000)
-    ap.add_argument("--pack-size", type=int, default=32)
-    ap.add_argument("--max-depth", type=int, default=7)
-    ap.add_argument("--learning-rate", type=float, default=0.07)
+    ap.add_argument("--n-trees", type=int, default=800)
+    ap.add_argument("--pack-size", type=int, default=4)
+    ap.add_argument("--max-depth", type=int, default=5)
+    ap.add_argument("--learning-rate", type=float, default=0.1)
     ap.add_argument("--lambda-l2", type=float, default=1e-6)
     ap.add_argument("--lambda-dro", type=float, default=0.0)
     ap.add_argument("--min-samples-leaf", type=int, default=1)
     ap.add_argument("--max-bins", type=int, default=8)
-    ap.add_argument("--k-cuts", type=int, default=7)
-    ap.add_argument("--layer-feature-fraction", type=float, default=0.5)
+    ap.add_argument("--k-cuts", type=int, default=6)
+    ap.add_argument("--layer-feature-fraction", type=float, default=0.1)
     ap.add_argument("--direction-weight", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--prebinned", action="store_true",

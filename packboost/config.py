@@ -76,15 +76,15 @@ class PackBoostConfig:
 
     # --- new: on-the-fly K-cut controls ---
     k_cuts: int = 0  # 0 = full sweep (bins-1); else evaluate exactly k_cuts thresholds
-    cut_selection: Literal["even", "mass"] = "even"
+    cut_selection: Literal["even", "mass"] = "mass"
     # --------------------------------------
 
     layer_feature_fraction: float = 1.0
     era_alpha: float = 0.0
     era_tile_size: int = 32
-    histogram_mode: Literal["rebuild", "subtract", "auto"] = "subtract"
+    histogram_mode: Literal["rebuild", "subtract", "auto"] = "rebuild"
     feature_block_size: int = 32
     enable_node_batching: bool = True
     random_state: int | None = None
-    device: str = "cuda"
+    device: str = "cuda" #cpu
     prebinned: bool = False
