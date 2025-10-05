@@ -1,3 +1,6 @@
+# Note: Current repo is not viable - use at your own risk. I am currently studying Murky's ExtraFastBooster in depth and will rework this repo - hopefully soon. Then layer on DES. Currently, this repo is an example of why agentic vibe coding is a flawed strategy for complex systems.
+
+
 # PackBoost
 
 PackBoost is a fast, era-aware gradient boosting library that combines Murky's
