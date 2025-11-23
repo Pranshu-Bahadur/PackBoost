@@ -698,19 +698,17 @@ class PackBoost(BaseEstimator, RegressorMixin):
             V_ts[f, 2 * idx + 1] = v1_q[mask]
 
             # Feature indices: I = F[tree_set, 32*k* + lane*] (store as uint16)
-            feat_pos    = (k_star.to(torch.int64) * lanes + chosen_lane.to(torch.int64))  # [n]
-            vals_u16_all = (F_row_u.index_select(0, feat_pos) & 0xFFFF).to(torch.uint16)  # [n]
-            vals_u16     = vals_u16_all[idx]                                             # [num_valid]
+            feat_pos      = (k_star.to(torch.int64) * lanes + chosen_lane.to(torch.int64))  # [n]
+            vals_i32_all  = (F_row_u.index_select(0, feat_pos) & 0xFFFF).to(torch.int32)    # [n], stay int32
+            vals_i32      = vals_i32_all[idx]                                              # [num_valid]
 
-            # uint16 + bool/index assignment is not implemented on CPU, so:
-            # - work in int32 scratch row
-            # - assign with integer indexing
-            # - cast back and copy into I_ts
+            # Work in int32 scratch row, then cast to uint16 once
             row_i32 = I_ts[f].to(torch.int32)        # [nodes]
-            row_i32[idx] = vals_u16.to(torch.int32)  # write only valid leaves
-            I_ts[f].copy_(row_i32.to(torch.uint16))
+            row_i32[idx] = vals_i32                  # write only valid leaves
+            I_ts[f].copy_(row_i32.to(torch.uint16))  # final cast, no indexing on uint16
 
         return V, I
+
 
 
 
