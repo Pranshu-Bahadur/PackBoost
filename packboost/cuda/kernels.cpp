@@ -63,13 +63,19 @@ torch::Tensor h_sm(
     int max_depth);
 
 void cut_cuda_launcher(
-    torch::Tensor F,      // int16 (stores uint16)
+    torch::Tensor F,      // uint16 (stores uint16)
     torch::Tensor FST,    // uint8
     torch::Tensor H,      // int64
     torch::Tensor H0,     // int64
     torch::Tensor V,      // int32
     torch::Tensor I,      // int16 (stores uint16)
-    int tree_set, double L2, double lr, int qgrad_bits, int max_depth);
+    int tree_set,
+    double L2,
+    double lr,
+    int qgrad_bits,
+    int max_depth,
+    double min_child_weight,
+    double min_split_gain);
 
 
 static void launch_advpred(
@@ -107,7 +113,13 @@ void cut_des_cuda_launcher(
     torch::Tensor H0,  // [K0, nodes, E, 2]     int64
     torch::Tensor V,   // [rounds, K0, 2*nodes] int32
     torch::Tensor I,   // [rounds, K0, nodes]   uint16
-    int tree_set, double L2, double lr, int qgrad_bits, int max_depth);
+    int tree_set,
+    double L2,
+    double lr,
+    int qgrad_bits,
+    int max_depth,
+    double min_child_weight,
+    double min_split_gain);
 
 namespace {
 

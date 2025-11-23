@@ -51,7 +51,7 @@ __global__ void advance_and_predict_kernel(
       L_new[off_new] = (LeafT)leaf_new;
     }
 
-    const int add = V[Vbase + (size_t)(2 * lo + 1 + (int)bit)];
+    const int add = V[Vbase + (size_t)(2 * lo + (int)bit)];
     atomicAdd(&P[k], add);
   }
 }

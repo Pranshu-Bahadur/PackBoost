@@ -23,6 +23,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
             *,
             lr: float = 0.07,
             L2: float = 100_000.0,
+            min_child_weight: float = 20.0,
+            min_split_gain: float = 0.0,
             nfeatsets: int = 32,
             qgrad_bits: int = 12,
             seed: int = 42,
@@ -35,6 +37,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.nfeatsets = int(nfeatsets)
         self.nfolds    = int(nfolds)
         self.max_depth = int(max_depth)
+        self.min_child_weight = float(min_child_weight)
+        self.min_split_gain   = float(min_split_gain)
+
         D   = self.max_depth
         Dm  = max(D - 1, 0)
         nodes  = (1 << D) - 1
@@ -81,8 +86,10 @@ class PackBoost(BaseEstimator, RegressorMixin):
         # ---------- schedules ----------
         rng = np.random.RandomState(seed)
         if bF >= (1 << 16):
-            raise ValueError(f"encode_cuts produced {bF} bitplanes (4*F). "
-                            f"Schedule dtype is uint16; reduce F or extend to uint32.")
+            raise ValueError(
+                f"encode_cuts produced {bF} bitplanes (4*F). "
+                f"Schedule dtype is uint16; reduce F or extend to uint32."
+            )
         Fsch_cpu = torch.from_numpy(
             rng.randint(0, bF, size=(rounds, lanes * nfeatsets), dtype=np.uint16)
         ).contiguous()
@@ -149,24 +156,35 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 #   h_des  -> [K1, E, (2**D-1), 2, 32]
                 #   cut_des expects H0 in nodes-major: [K0, nodes, E, 2]
                 if int(era_ends[-1].item()) != N:
-                    raise ValueError(f"era_ends[-1] must equal N ({N}), got {int(era_ends[-1].item())}")
+                    raise ValueError(
+                        f"era_ends[-1] must equal N ({N}), got {int(era_ends[-1].item())}"
+                    )
 
                 H0_all = self.h0_des(G, LE, int(max_depth), era_ends)            # [K0, 2**D, E, 2]
-                H0e    = H0_all[:, :nodes, :, :].contiguous()                    # [K0, nodes, E, 2]  (NO permute)
+                H0e    = H0_all[:, :nodes, :, :].contiguous()                    # [K0, nodes, E, 2]
                 He     = self.h_des(XS, G, LF, int(max_depth), era_ends)         # [K1, E, nodes, 2, 32]
 
-                self.cut_des(self.Fsch, FST, He, H0e, V, I,
-                            tree_set=t, L2=L2, lr=lr_per_fold,
-                            qgrad_bits=qgrad_bits, max_depth=D)
+                self.cut_des(
+                    self.Fsch, FST, He, H0e, V, I,
+                    tree_set=t, L2=L2, lr=lr_per_fold,
+                    qgrad_bits=qgrad_bits, max_depth=D,
+                    min_child_weight=min_child_weight,
+                    min_split_gain=min_split_gain,
+                )
 
                 del He, H0_all, H0e
             else:
                 # Non-DES path (single era)
                 H  = self.H (XS, G, LF, D).contiguous()                          # [K1, nodes, 2, 32]
                 H0 = self.h0(G, LE, D).contiguous()                              # [K0, 2**D, 2]
-                self.cut(self.Fsch, FST, H, H0[:, : H.size(1), :].contiguous(),  # -> [K0, nodes, 2]
-                        V, I, tree_set=t, L2=L2, lr=lr_per_fold,
-                        qgrad_bits=qgrad_bits, max_depth=D)
+                self.cut(
+                    self.Fsch, FST, H, H0[:, : H.size(1), :].contiguous(),       # -> [K0, nodes, 2]
+                    V, I,
+                    tree_set=t, L2=L2, lr=lr_per_fold,
+                    qgrad_bits=qgrad_bits, max_depth=D,
+                    min_child_weight=min_child_weight,
+                    min_split_gain=min_split_gain,
+                )
                 del H, H0
 
             # (f) advance + predict
@@ -198,6 +216,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.I    = I
         self.X_packed_ = XB
         return self
+
 
 
 
@@ -498,19 +517,26 @@ class PackBoost(BaseEstimator, RegressorMixin):
         H = torch.stack([H_sum, H_cnt], dim=2).contiguous()
         return H
 
-    def cut(self,
-            F:  torch.Tensor,   # [rounds, 32*K1]        uint16 (preferred) or int16 storage
-            FST:torch.Tensor,   # [rounds, K1, D]        uint8
-            H:  torch.Tensor,   # [K1, nodes, 2, 32]     int64
-            H0: torch.Tensor,   # [K0, nodes, 2]         int64
-            V:  torch.Tensor,   # [rounds, K0, 2*nodes]  int32 (OUT)
-            I:  torch.Tensor,   # [rounds, K0, nodes]    uint16 (OUT; legacy int16 also accepted)
-            tree_set: int,
-            L2: float,
-            lr: float,
-            qgrad_bits: int,
-            max_depth: int):
-        use_cuda = (F.is_cuda or FST.is_cuda or H.is_cuda or H0.is_cuda or V.is_cuda or I.is_cuda)
+    def cut(
+        self,
+        F:  torch.Tensor,   # [rounds, 32*K1]        uint16 (preferred) or int16 storage
+        FST:torch.Tensor,   # [rounds, K1, D]        uint8
+        H:  torch.Tensor,   # [K1, nodes, 2, 32]     int64
+        H0: torch.Tensor,   # [K0, nodes, 2]         int64
+        V:  torch.Tensor,   # [rounds, K0, 2*nodes]  int32 (OUT)
+        I:  torch.Tensor,   # [rounds, K0, nodes]    uint16 (OUT; legacy int16 also accepted)
+        tree_set: int,
+        L2: float,
+        lr: float,
+        qgrad_bits: int,
+        max_depth: int,
+        min_child_weight: float = 20.0,
+        min_split_gain: float = 0.0,
+    ):
+        use_cuda = (
+            F.is_cuda or FST.is_cuda or H.is_cuda or
+            H0.is_cuda or V.is_cuda or I.is_cuda
+        )
         if use_cuda and torch.cuda.is_available():
             from packboost.cuda import kernels
             kernels.cut_cuda(
@@ -519,6 +545,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 V, I,
                 int(tree_set), float(L2), float(lr),
                 int(qgrad_bits), int(max_depth),
+                float(min_child_weight), float(min_split_gain),
             )
             return V, I
 
@@ -532,22 +559,30 @@ class PackBoost(BaseEstimator, RegressorMixin):
         assert nodes == (1 << max_depth) - 1
         assert I.dtype in (torch.uint16, torch.int16), "I must be uint16 or int16"
 
+        use_min_child = (min_child_weight > 0.0)
+        use_min_gain  = (min_split_gain  > 0.0)
+
         # depth(leaf) = floor(log2(leaf+1))
         leaves = torch.arange(nodes, device=device, dtype=torch.float32) + 1.0
         depth  = torch.floor(torch.log2(leaves)).to(torch.long)  # [nodes]
 
         # L2 scaling & qscale (match CUDA)
         L2_eff = torch.tensor(L2, dtype=torch.float32, device=device) * torch.pow(
-            torch.tensor(2.0, dtype=torch.float32, device=device), 5.0 - depth.float()
+            torch.tensor(2.0, dtype=torch.float32, device=device),
+            5.0 - depth.float()
         )  # [nodes]
         shift  = 31 - int(qgrad_bits)  # matches CUDA kernel
         qscale = torch.tensor(lr, dtype=torch.float32, device=device) * float(1 << shift) * torch.pow(
-            torch.tensor(2.0, dtype=torch.float32, device=device), -(float(max_depth) - depth.float())
+            torch.tensor(2.0, dtype=torch.float32, device=device),
+            -(float(max_depth) - depth.float())
         )  # [nodes]
 
         # fold routing per (k, leaf)
         FST_ts = FST[tree_set]  # [K1, D]
-        tf_all = FST_ts.gather(1, depth.unsqueeze(0).expand(K1, nodes)).to(torch.long)  # [K1, nodes]
+        tf_all = FST_ts.gather(
+            1,
+            depth.unsqueeze(0).expand(K1, nodes)
+        ).to(torch.long)  # [K1, nodes]
 
         # Stats
         H_sum = H[:, :, 0, :].to(torch.float32)  # [K1, nodes, 32]
@@ -563,13 +598,25 @@ class PackBoost(BaseEstimator, RegressorMixin):
         # Broadcasts
         L2e = L2_eff.view(1, nodes, 1)
         G0  = H_sum                                  # [K1, n, 32]
-        N0  = H_cnt
+        N0  = H_cnt                                  # [K1, n, 32]
         G1  = G01.unsqueeze(-1) - G0                 # [K1, n, 32]
-        N1  = N01.unsqueeze(-1) - N0
+        N1  = N01.unsqueeze(-1) - N0                 # [K1, n, 32]
 
         V0f = G0 / (N0 + L2e)                        # [K1, n, 32]
         V1f = G1 / (N1 + L2e)                        # [K1, n, 32]
-        S   = (G0 * V0f) + (G1 * V1f)                # [K1, n, 32]
+        S   = (G0 * V0f) + (G1 * V1f)                # [K1, n, 32]  gain per lane
+
+        # Validity mask for min_child_weight / min_split_gain
+        if use_min_child or use_min_gain:
+            valid = torch.ones_like(S, dtype=torch.bool, device=device)
+            if use_min_child:
+                thr = float(min_child_weight)
+                valid &= (N0 >= thr) & (N1 >= thr)
+            if use_min_gain:
+                thr_g = float(min_split_gain)
+                valid &= (S >= thr_g)
+        else:
+            valid = torch.ones_like(S, dtype=torch.bool, device=device)
 
         # Bit-cast float32 -> int32 for tie-consistent compares (CPU: round-trip via NumPy)
         S_bits = torch.from_numpy(S.contiguous().cpu().numpy().view(np.int32)).to(device=device)  # [K1,n,32] int32
@@ -593,7 +640,17 @@ class PackBoost(BaseEstimator, RegressorMixin):
             Mf = (tf_all == f)  # [K1, n]
             if not Mf.any().item():
                 continue
-            Mf3 = Mf.unsqueeze(-1).expand(K1, nodes, lanes)  # [K1, n, 32]
+
+            Mf3 = Mf.unsqueeze(-1).expand(K1, nodes, lanes)   # [K1, n, 32]
+            valid3 = valid & Mf3                              # only candidates that both route here AND satisfy constraints
+
+            # If no valid candidate anywhere for this fold, skip
+            if not valid3.any().item():
+                continue
+
+            # Which leaves have at least one valid candidate for this fold?
+            # Shape: [nodes] bool
+            valid_leaf = valid3.any(dim=0).any(dim=1)  # any over (k, lane) for each leaf
 
             # Lexicographic key:
             #   high 32 bits = S_bits (score compare)
@@ -601,7 +658,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             key_hi = S_bits.to(torch.int64)
             key_lo = (0xFFFFFFFF - k_idx)  # fits in int64
             key    = (key_hi << 32) | key_lo
-            key    = torch.where(Mf3, key, torch.full_like(key, min_i64))
+            key    = torch.where(valid3, key, torch.full_like(key, min_i64))
 
             # Per-lane max over k (earliest k on ties)
             key_lane_max, argk_lane = key.max(dim=0)                  # [n, 32], [n, 32]
@@ -627,17 +684,27 @@ class PackBoost(BaseEstimator, RegressorMixin):
             V0_sel = G0_sel / (N0_sel + L2_sel)
             V1_sel = (G01_sel - G0_sel) / ((N01_sel - N0_sel) + L2_sel)
 
+            # Only write leaves that had at least one valid candidate
+            mask = valid_leaf
+            if not mask.any().item():
+                continue
+
+            idx = nodes_ar[mask]
+
             # Quantize to int32 (CUDA uses trunc toward zero)
-            V_ts[f, 2*nodes_ar    ] = torch.trunc(qs_sel * V0_sel).to(torch.int32)
-            V_ts[f, 2*nodes_ar + 1] = torch.trunc(qs_sel * V1_sel).to(torch.int32)
+            v0_q = torch.trunc(qs_sel * V0_sel).to(torch.int32)
+            v1_q = torch.trunc(qs_sel * V1_sel).to(torch.int32)
+
+            V_ts[f, 2 * idx    ] = v0_q[mask]
+            V_ts[f, 2 * idx + 1] = v1_q[mask]
 
             # Feature indices: I = F[tree_set, 32*k* + lane*] (store as uint16)
             feat_pos = (k_star.to(torch.int64) * lanes + chosen_lane.to(torch.int64))  # [n]
-            # new — gather as int64, mask to u16 range, cast once, then row-copy
-            vals_u16 = (F_row_u.index_select(0, feat_pos) & 0xFFFF).to(torch.uint16)  # [nodes]
-            I_ts[f].copy_(vals_u16)  # write the entire row; avoids index_put on UInt16
+            vals_u16 = (F_row_u.index_select(0, feat_pos) & 0xFFFF).to(torch.uint16)   # [nodes]
+            I_ts[f, mask] = vals_u16[mask]
 
         return V, I
+
 
 
     def advance_and_predict(self,
@@ -705,7 +772,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                     else:
                         raise AssertionError("L_new must be uint8 or uint16")
 
-                add_idx = (2 * lo + 1 + x).to(torch.long)
+                add_idx = (2 * lo + x).to(torch.long)
                 P.add_(V[tree_set, f].gather(0, add_idx))
 
         return P, L_new
@@ -906,19 +973,23 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         return He.contiguous()
 
-    def cut_des(self,
-                F:  torch.Tensor,   # [rounds, 32*K1] uint16
-                FST:torch.Tensor,   # [rounds, K1, D] uint8
-                H:  torch.Tensor,   # [K1, E, nodes, 2, 32] (lane-resolved, ERA-MAJOR)
-                H0: torch.Tensor,   # [K0, nodes, E, 2]     (parent totals per era)
-                V:  torch.Tensor,   # [rounds, K0, 2*nodes] int32
-                I:  torch.Tensor,   # [rounds, K0, nodes]   uint16
-                *,
-                tree_set: int,
-                L2: float,
-                lr: float,
-                qgrad_bits: int,
-                max_depth: int):
+    def cut_des(
+        self,
+        F:  torch.Tensor,   # [rounds, 32*K1] uint16
+        FST:torch.Tensor,   # [rounds, K1, D] uint8
+        H:  torch.Tensor,   # [K1, E, nodes, 2, 32] (lane-resolved, ERA-MAJOR)
+        H0: torch.Tensor,   # [K0, nodes, E, 2]     (parent totals per era)
+        V:  torch.Tensor,   # [rounds, K0, 2*nodes] int32
+        I:  torch.Tensor,   # [rounds, K0, nodes]   uint16
+        *,
+        tree_set: int,
+        L2: float,
+        lr: float,
+        qgrad_bits: int,
+        max_depth: int,
+        min_child_weight: float = 20.0,
+        min_split_gain: float = 0.0,
+    ):
         use_cuda = any(t.is_cuda for t in (F, FST, H, H0, V, I)) and torch.cuda.is_available()
         if use_cuda:
             from packboost.cuda import kernels
@@ -927,7 +998,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 H.contiguous(), H0.contiguous(),     # NOTE: no permute; kernel expects [K0,nodes,E,2]
                 V, I,
                 int(tree_set), float(L2), float(lr),
-                int(qgrad_bits), int(max_depth)
+                int(qgrad_bits), int(max_depth),
+                float(min_child_weight), float(min_split_gain),
             )
             return V, I
 
@@ -944,31 +1016,49 @@ class PackBoost(BaseEstimator, RegressorMixin):
         D = int(FST.shape[2])
         assert nodes == (1 << max_depth) - 1 and D >= max_depth, "depth mismatch"
 
+        use_min_child = (min_child_weight > 0.0)
+        use_min_gain  = (min_split_gain  > 0.0)
+
         # Only the selected tree_set row of F matters here
-        K1x32 = int(F.shape[1]); assert K1x32 == 32 * K1
+        K1x32 = int(F.shape[1])
+        assert K1x32 == 32 * K1
         F_row = (F[int(tree_set)].to(torch.int64) & 0xFFFF)  # [32*K1] as unsigned
 
         # depth per leaf
         leaf_ids = torch.arange(nodes, device=device, dtype=torch.long)
-        depth = torch.floor(torch.log2(leaf_ids.to(torch.float32) + 1.0)).to(torch.long)  # [nodes]
+        depth = torch.floor(
+            leaf_ids.to(torch.float32) + 1.0
+        ).log2().to(torch.long)  # [nodes]
 
         # per-leaf scalars
-        L2_eff = (torch.tensor(L2, dtype=torch.float32, device=device)
-                * torch.pow(torch.tensor(2.0, device=device), 5.0 - depth.to(torch.float32)))
-        qscale = (torch.tensor(lr, dtype=torch.float32, device=device) * float(1 << (31 - int(qgrad_bits)))
-                * torch.pow(torch.tensor(2.0, device=device), -(float(max_depth) - depth.to(torch.float32))))
+        L2_eff = (
+            torch.tensor(L2, dtype=torch.float32, device=device)
+            * torch.pow(torch.tensor(2.0, device=device), 5.0 - depth.to(torch.float32))
+        )
+        qscale = (
+            torch.tensor(lr, dtype=torch.float32, device=device)
+            * float(1 << (31 - int(qgrad_bits)))
+            * torch.pow(
+                torch.tensor(2.0, device=device),
+                -(float(max_depth) - depth.to(torch.float32)),
+            )
+        )
 
         # fold assignment per (k, node): FST[tree_set, k, depth[node]]
         tf_all = FST[int(tree_set)][:, depth].to(torch.long)  # [K1, nodes]
 
         for n in range(nodes):
-            d  = int(depth[n])
-            L2n= float(L2_eff[n].item())
-            qsn= float(qscale[n].item())
+            d   = int(depth[n])
+            L2n = float(L2_eff[n].item())
+            qsn = float(qscale[n].item())
 
             # lane-local best per fold
-            best_dir   = torch.full((32, K0), float('-inf'), dtype=torch.float32, device=device)
-            best_sbits = torch.full((32, K0), torch.iinfo(torch.int32).min, dtype=torch.int32,   device=device)
+            best_dir   = torch.full(
+                (32, K0), float("-inf"), dtype=torch.float32, device=device
+            )
+            best_sbits = torch.full(
+                (32, K0), torch.iinfo(torch.int32).min, dtype=torch.int32, device=device
+            )
             best_vl    = torch.zeros((32, K0), dtype=torch.int32, device=device)
             best_vr    = torch.zeros((32, K0), dtype=torch.int32, device=device)
             best_k     = torch.full((32, K0), -1, dtype=torch.int32, device=device)
@@ -989,6 +1079,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                     G1 = GT - G0
                     N1 = HT - N0
 
+                    # Directional score (per-era sign of V1 - V0; only eras with N0>0,N1>0)
                     valid = (N0 > 0.0) & (N1 > 0.0)
                     eras_used = int(valid.sum().item())
                     if eras_used > 0:
@@ -1000,22 +1091,48 @@ class PackBoost(BaseEstimator, RegressorMixin):
                         dir_score = 0.0
 
                     # classic pooled gain S using lane-local left and parent pooled across eras
-                    G0_tot = G0.sum().item(); N0_tot = N0.sum().item()
-                    GT_tot = GT.sum().item(); HT_tot = HT.sum().item()
-                    G1_tot = GT_tot - G0_tot; N1_tot = HT_tot - N0_tot
-                    V0f = (G0_tot / (N0_tot + L2n)) if N0_tot > 0 else 0.0
-                    V1f = (G1_tot / (N1_tot + L2n)) if N1_tot > 0 else 0.0
-                    S   = (G0_tot * V0f) + (G1_tot * V1f)
+                    G0_tot = G0.sum().item()
+                    N0_tot = N0.sum().item()
+                    GT_tot = GT.sum().item()
+                    HT_tot = HT.sum().item()
+                    G1_tot = GT_tot - G0_tot
+                    N1_tot = HT_tot - N0_tot
+
+                    V0f = (G0_tot / (N0_tot + L2n)) if N0_tot > 0.0 else 0.0
+                    V1f = (G1_tot / (N1_tot + L2n)) if N1_tot > 0.0 else 0.0
+                    S    = (G0_tot * V0f) + (G1_tot * V1f)
+
+                    # min_child_weight / min_split_gain gating (match CUDA semantics)
+                    if use_min_child:
+                        if (N0_tot < float(min_child_weight)) or (N1_tot < float(min_child_weight)):
+                            continue
+                    if use_min_gain:
+                        if S < float(min_split_gain):
+                            continue
 
                     # float32 bit-pattern tie value
-                    S_bits = torch.tensor([S], dtype=torch.float32, device=device).view(torch.int32)[0].item()
+                    S_bits = (
+                        torch.tensor([S], dtype=torch.float32, device=device)
+                        .view(torch.int32)[0]
+                        .item()
+                    )
 
-                    if (dir_score > best_dir[lane, f].item()) or \
-                    (dir_score == best_dir[lane, f].item() and S_bits > best_sbits[lane, f].item()):
+                    # (dir, S_bits) lexicographic compare
+                    if (
+                        dir_score > best_dir[lane, f].item()
+                        or (
+                            dir_score == best_dir[lane, f].item()
+                            and S_bits > best_sbits[lane, f].item()
+                        )
+                    ):
                         best_dir  [lane, f] = dir_score
                         best_sbits[lane, f] = S_bits
-                        best_vl   [lane, f] = int(torch.trunc(torch.tensor(qsn * V0f, device=device)).item())
-                        best_vr   [lane, f] = int(torch.trunc(torch.tensor(qsn * V1f, device=device)).item())
+                        best_vl   [lane, f] = int(
+                            torch.trunc(torch.tensor(qsn * V0f, device=device)).item()
+                        )
+                        best_vr   [lane, f] = int(
+                            torch.trunc(torch.tensor(qsn * V1f, device=device)).item()
+                        )
                         best_k    [lane, f] = k
 
             # reduce across lanes per fold: max(dir) -> max(S_bits) -> highest lane id
@@ -1023,28 +1140,32 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 dir_col = best_dir[:, f]
                 if not torch.isfinite(dir_col).any():
                     continue
-                max_dir = torch.nan_to_num(dir_col, nan=-float('inf')).max().item()
+
+                max_dir = torch.nan_to_num(dir_col, nan=-float("inf")).max().item()
                 m_dir = (best_dir[:, f] == max_dir)
 
                 sbits_masked = torch.where(
                     m_dir,
                     best_sbits[:, f],
-                    torch.full_like(best_sbits[:, f], torch.iinfo(torch.int32).min)
+                    torch.full_like(best_sbits[:, f], torch.iinfo(torch.int32).min),
                 )
                 max_sbits = sbits_masked.max().item()
                 winners = m_dir & (best_sbits[:, f] == max_sbits)
                 if not winners.any():
                     continue
 
-                winner_lane = int(torch.nonzero(winners, as_tuple=False).flatten().max().item())
+                winner_lane = int(
+                    torch.nonzero(winners, as_tuple=False).flatten().max().item()
+                )
                 k_star = int(best_k[winner_lane, f].item())
                 if k_star < 0:
                     continue
 
-                V[int(tree_set), f, 2*n    ] = int(best_vl[winner_lane, f].item())
-                V[int(tree_set), f, 2*n + 1] = int(best_vr[winner_lane, f].item())
+                V[int(tree_set), f, 2 * n    ] = int(best_vl[winner_lane, f].item())
+                V[int(tree_set), f, 2 * n + 1] = int(best_vr[winner_lane, f].item())
 
                 feat_pos = k_star * 32 + winner_lane
                 I[int(tree_set), f, n] = (F_row[feat_pos] & 0xFFFF).to(torch.uint16)
 
         return V, I
+
