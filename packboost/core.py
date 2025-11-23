@@ -778,7 +778,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                     else:
                         raise AssertionError("L_new must be uint8 or uint16")
 
-                add_idx = (2 * lo + x).to(torch.long)
+                add_idx = (2 * lo + 1 + x).to(torch.long)
                 P.add_(V[tree_set, f].gather(0, add_idx))
 
         return P, L_new
