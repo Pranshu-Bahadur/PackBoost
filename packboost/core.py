@@ -641,15 +641,14 @@ class PackBoost(BaseEstimator, RegressorMixin):
             if not Mf.any().item():
                 continue
 
-            Mf3 = Mf.unsqueeze(-1).expand(K1, nodes, lanes)   # [K1, n, 32]
-            valid3 = valid & Mf3                              # only candidates that both route here AND satisfy constraints
+            Mf3    = Mf.unsqueeze(-1).expand(K1, nodes, lanes)   # [K1, n, 32]
+            valid3 = valid & Mf3                                 # only candidates that both route here AND satisfy constraints
 
             # If no valid candidate anywhere for this fold, skip
             if not valid3.any().item():
                 continue
 
-            # Which leaves have at least one valid candidate for this fold?
-            # Shape: [nodes] bool
+            # Which leaves have at least one valid candidate for this fold? [nodes] bool
             valid_leaf = valid3.any(dim=0).any(dim=1)  # any over (k, lane) for each leaf
 
             # Lexicographic key:
@@ -689,7 +688,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             if not mask.any().item():
                 continue
 
-            idx = nodes_ar[mask]
+            idx = nodes_ar[mask]  # [num_valid]
 
             # Quantize to int32 (CUDA uses trunc toward zero)
             v0_q = torch.trunc(qs_sel * V0_sel).to(torch.int32)
@@ -699,11 +698,20 @@ class PackBoost(BaseEstimator, RegressorMixin):
             V_ts[f, 2 * idx + 1] = v1_q[mask]
 
             # Feature indices: I = F[tree_set, 32*k* + lane*] (store as uint16)
-            feat_pos = (k_star.to(torch.int64) * lanes + chosen_lane.to(torch.int64))  # [n]
-            vals_u16 = (F_row_u.index_select(0, feat_pos) & 0xFFFF).to(torch.uint16)   # [nodes]
-            I_ts[f, mask] = vals_u16[mask]
+            feat_pos    = (k_star.to(torch.int64) * lanes + chosen_lane.to(torch.int64))  # [n]
+            vals_u16_all = (F_row_u.index_select(0, feat_pos) & 0xFFFF).to(torch.uint16)  # [n]
+            vals_u16     = vals_u16_all[idx]                                             # [num_valid]
+
+            # uint16 + bool/index assignment is not implemented on CPU, so:
+            # - work in int32 scratch row
+            # - assign with integer indexing
+            # - cast back and copy into I_ts
+            row_i32 = I_ts[f].to(torch.int32)        # [nodes]
+            row_i32[idx] = vals_u16.to(torch.int32)  # write only valid leaves
+            I_ts[f].copy_(row_i32.to(torch.uint16))
 
         return V, I
+
 
 
 
