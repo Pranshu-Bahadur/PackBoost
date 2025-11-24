@@ -1017,7 +1017,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         use_cuda = any(t.is_cuda for t in (F, FST, H, H0, V, I)) and torch.cuda.is_available()
         if use_cuda:
             from packboost.cuda import kernels
-            kernels.cut_des_cuda(
+            kernels.cut_cuda_des(
                 F.contiguous(), FST.contiguous(),
                 H.contiguous(), H0.contiguous(),
                 V, I,
