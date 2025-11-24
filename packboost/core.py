@@ -3,6 +3,9 @@ import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin
 from torch import Tensor
 import torch.nn.functional as Fn
+
+import os
+
 print('Installing kernels...')
 from packboost.cuda import kernels
 print('kernels successfully Installed!')
