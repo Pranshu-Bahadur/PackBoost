@@ -1,3 +1,4 @@
+// packboost/cuda/cut.cu
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
@@ -12,14 +13,17 @@ constexpr unsigned FULL_MASK = 0xFFFFFFFFu;
 #endif
 
 __device__ __forceinline__ int depth_from_leaf(int leaf) {
+  // node 0 -> depth 0, nodes 1..2 -> depth 1, etc.
   return 31 - __clz(static_cast<unsigned>(leaf + 1));
 }
 
 extern "C" __global__ void cut_cuda_kernel(
+    // inputs
     const uint16_t* __restrict__ F,      // [treesets, 32*K1]      (uint16)
     const uint8_t*  __restrict__ FST,    // [treesets, K1, D]      (uint8)
     const int64_t*  __restrict__ H,      // [K1, nodes, 2, 32]     (int64)
     const int64_t*  __restrict__ H0,     // [K0, nodes, 2]         (int64)
+    // outputs
     int32_t*        __restrict__ V,      // [treesets, K0, 2*nodes](int32)
     uint16_t*       __restrict__ I,      // [treesets, K0, nodes]  (uint16)
     // dims
@@ -41,23 +45,24 @@ extern "C" __global__ void cut_cuda_kernel(
   const int depth = depth_from_leaf(leaf);
   if ((unsigned)depth >= (unsigned)D) return;
 
-  // ---- per-fold scratch
+  // ---- per-fold scratch (lane-local bests)
   int       mxs[CUTCUDA_MAX_FOLDS];
   int       vls[CUTCUDA_MAX_FOLDS];
   int       vrs[CUTCUDA_MAX_FOLDS];
   uint16_t  fs [CUTCUDA_MAX_FOLDS];
-  float     g01s[CUTCUDA_MAX_FOLDS];
-  float     n01s[CUTCUDA_MAX_FOLDS];
+  float     g01s[CUTCUDA_MAX_FOLDS];   // parent grad (node-level)
+  float     n01s[CUTCUDA_MAX_FOLDS];   // parent count (node-level)
 
-  // sentinel init + fold totals
+  // sentinel init + parent totals (node-level, shared by all lanes)
   for (int f = 0; f < K0; ++f) {
-    mxs[f] = -100000000;              // negative -> smaller than any valid S_bits
+    mxs[f] = -100000000;              // negative sentinel < any valid S_bits
     vls[f] = 0;
     vrs[f] = 0;
     fs[f]  = 0;
+
     const size_t base = ((size_t)f * (size_t)nodes + (size_t)leaf) * 2u;
-    g01s[f] = (float)H0[base + 0];    // parent grad
-    n01s[f] = (float)H0[base + 1];    // parent count
+    g01s[f] = (float)H0[base + 0];    // parent grad (aggregated)
+    n01s[f] = (float)H0[base + 1];    // parent count (aggregated)
   }
 
   // scalars (match CPU pow; stay in fp32)
@@ -68,44 +73,88 @@ extern "C" __global__ void cut_cuda_kernel(
   const bool use_min_child = (min_child_weight > 0.0f);
   const bool use_min_gain  = (min_split_gain  > 0.0f);
 
-  // ---- per-candidate search (each lane keeps its own best per fold)
+  // ---- per-candidate search
   for (int k = 0; k < K1; ++k) {
+    // FST[tree_set, k, depth] -> fold id
     const size_t fst_idx =
         (((size_t)tree_set * (size_t)K1) + (size_t)k) * (size_t)D
         + (size_t)depth;
     const int tree_fold = (int)FST[fst_idx];
     if ((unsigned)tree_fold >= (unsigned)K0) continue;
 
+    // Lane-local stats for left child
     const size_t h_base =
         ((((size_t)k * (size_t)nodes) + (size_t)leaf) * 2u) * 32u
         + (size_t)wi;
 
-    const float G0 = __ll2float_rn(H[h_base + 0 * 32u]);  // left grad (lane)
-    const float N0 = __ll2float_rn(H[h_base + 1 * 32u]);  // left count (lane)
-    const float G1 = __fsub_rn(g01s[tree_fold], G0);      // right grad (lane)
-    const float N1 = __fsub_rn(n01s[tree_fold], N0);      // right count (lane)
+    const float G0_lane = __ll2float_rn(H[h_base + 0 * 32u]);  // left grad (lane)
+    const float N0_lane = __ll2float_rn(H[h_base + 1 * 32u]);  // left count (lane)
 
-    // --- min_child_weight constraint (per-lane count proxy) ---
-    if (use_min_child) {
-      if (N0 < min_child_weight || N1 < min_child_weight) {
-        continue;
+    // ---------------- node-level gating (min_child_weight / min_split_gain) ----------------
+    // First, aggregate G0/N0 across lanes to get node-level left stats for this candidate.
+    float G0_sum = G0_lane;
+    float N0_sum = N0_lane;
+
+    #pragma unroll
+    for (int offset = WARP_SIZE >> 1; offset > 0; offset >>= 1) {
+      G0_sum += __shfl_down_sync(FULL_MASK, G0_sum, offset, WARP_SIZE);
+      N0_sum += __shfl_down_sync(FULL_MASK, N0_sum, offset, WARP_SIZE);
+    }
+
+    // Broadcast node-level sums from lane 0
+    const float G0_node = __shfl_sync(FULL_MASK, G0_sum, 0, WARP_SIZE);
+    const float N0_node = __shfl_sync(FULL_MASK, N0_sum, 0, WARP_SIZE);
+
+    const float G01_node = g01s[tree_fold];
+    const float N01_node = n01s[tree_fold];
+    const float G1_node  = G01_node - G0_node;
+    const float N1_node  = N01_node - N0_node;
+
+    int keep = 1;
+    if (use_min_child || use_min_gain) {
+      // basic sanity: both children must have positive mass
+      if (N0_node <= 0.0f || N1_node <= 0.0f) {
+        keep = 0;
+      }
+      // min_child_weight on node-level counts
+      if (keep && use_min_child) {
+        if (N0_node < min_child_weight || N1_node < min_child_weight) {
+          keep = 0;
+        }
+      }
+      // min_split_gain on node-level gain
+      if (keep && use_min_gain) {
+        const float V0_node = G0_node / (N0_node + L2_eff);
+        const float V1_node = G1_node / (N1_node + L2_eff);
+        const float S0_node = G0_node * V0_node;
+        const float S1_node = G1_node * V1_node;
+        const float gain_node = S0_node + S1_node;
+        if (gain_node < min_split_gain) {
+          keep = 0;
+        }
       }
     }
 
-    const float V0f = __fdiv_rn(G0, __fadd_rn(N0, L2_eff));
-    const float V1f = __fdiv_rn(G1, __fadd_rn(N1, L2_eff));
-
-    const float S0 = __fmul_rn(G0, V0f);
-    const float S1 = __fmul_rn(G1, V1f);
-    const float gain = __fadd_rn(S0, S1);
-
-    // --- min_split_gain constraint ---
-    if (use_min_gain && gain < min_split_gain) {
-      continue;
+    // Broadcast lane-0 decision to all lanes
+    keep = __shfl_sync(FULL_MASK, keep, 0, WARP_SIZE);
+    if (!keep) {
+      continue;  // whole candidate (k, leaf, fold) is rejected
     }
 
-    const int S_bits = __float_as_int(gain);
+    // ---------------- lane-level scoring (unchanged semantics) ----------------
+    const float G1_lane = __fsub_rn(g01s[tree_fold], G0_lane);  // right grad (lane)
+    const float N1_lane = __fsub_rn(n01s[tree_fold], N0_lane);  // right count (lane)
 
+    const float V0f = __fdiv_rn(G0_lane, __fadd_rn(N0_lane, L2_eff));
+    const float V1f = __fdiv_rn(G1_lane, __fadd_rn(N1_lane, L2_eff));
+
+    const float S0 = __fmul_rn(G0_lane, V0f);
+    const float S1 = __fmul_rn(G1_lane, V1f);
+    const float gain_lane = __fadd_rn(S0, S1);
+
+    const int S_bits = __float_as_int(gain_lane);
+
+    // lane-local best per fold (lexicographic on S_bits, k via warp ballot)
     if (mxs[tree_fold] < S_bits) {
       mxs[tree_fold] = S_bits;
       vls[tree_fold] = __float2int_rz(__fmul_rn(qscale, V0f));
@@ -123,14 +172,16 @@ extern "C" __global__ void cut_cuda_kernel(
     #pragma unroll
     for (int p = 0; p < 5; ++p) {
       const int partner = __shfl_xor_sync(FULL_MASK, mxw, 1 << p, WARP_SIZE);
-      mxw = (partner > mxw) ? partner : mxw;
+      if (partner > mxw) {
+        mxw = partner;
+      }
     }
 
-    // empty fold? skip (matches CPU continue)
+    // empty fold? skip
     if (mxw == -100000000) continue;
 
     const unsigned msk = __ballot_sync(FULL_MASK, mxs[fold] == mxw);
-    if (msk == 0) continue; // paranoia
+    if (msk == 0u) continue; // paranoia
 
     const int winner_lane = 31 - __clz(msk);
     if (wi == winner_lane) {
@@ -158,7 +209,7 @@ void cut_cuda_launcher(
     torch::Tensor H,      // int64
     torch::Tensor H0,     // int64
     torch::Tensor V,      // int32
-    torch::Tensor I,      // int16 (stores uint16)
+    torch::Tensor I,      // int16/uint16 (stores uint16)
     int tree_set,
     double L2,
     double lr,
