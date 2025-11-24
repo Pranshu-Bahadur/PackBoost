@@ -90,10 +90,26 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 f"encode_cuts produced {bF} bitplanes (4*F). "
                 f"Schedule dtype is uint16; reduce F or extend to uint32."
             )
+        
+        '''
         Fsch_cpu = torch.from_numpy(
             rng.randint(0, bF, size=(rounds, lanes * nfeatsets), dtype=np.uint16)
         ).contiguous()
         self.Fsch = Fsch_cpu.to(device=device, dtype=torch.uint16).contiguous()
+        '''
+        K1 = lanes * nfeatsets
+
+        if bF < K1:
+            raise ValueError(f"Need bF >= 32*nfeatsets for sampling without replacement; got bF={bF}, K1={K1}")
+
+        Fsch_np = np.empty((rounds, K1), dtype=np.uint16)
+        for t in range(rounds):
+            # distinct within round t
+            Fsch_np[t, :] = rng.choice(bF, size=K1, replace=False).astype(np.uint16, copy=False)
+
+        Fsch_cpu = torch.from_numpy(Fsch_np).contiguous()
+        self.Fsch = Fsch_cpu.to(device=device, dtype=torch.uint16).contiguous()
+
 
         base = torch.arange(nfolds, dtype=torch.uint8, device=device)
         rep  = (nfeatsets + nfolds - 1) // nfolds
