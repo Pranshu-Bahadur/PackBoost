@@ -1221,12 +1221,12 @@ class PackBoost(BaseEstimator, RegressorMixin):
         file_size_mb = os.path.getsize(path) / (1024 * 1024)
         print(f"Saved PackBoost model to {path} ({file_size_mb:.2f} MB)")
     
-    def load(self, path, map_location=None):
+    def load(self, path, device=None):
         """Load PyTorch compressed format."""
         if not path.endswith('.pth') and os.path.exists(path + '.pth'):
             path = path + '.pth'
         
-        device = map_location or self.device
+        device = device or self.device
         state = torch.load(path, map_location=device)
         
         self.V         = state["V"]
@@ -1236,7 +1236,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.max_depth = state["max_depth"]
         self.nfolds    = state["nfolds"]
         self.nfeatsets = state["nfeatsets"]
-        self.device    = state.get("device", device)
+        self.device    = device
         self.feature_name  = state.get("feature_name",None)
         self.comment = state.get("comment","")
         self.train_N   = state.get("train_N", None)
