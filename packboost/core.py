@@ -777,8 +777,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
         word_idx = (k >> 5)
         bit_off  = (k & 31).to(torch.int64)
 
-        max_traversal_depth = min(Dm, tree_set + 1)
-        for depth in range(max_traversal_depth):
+     
+        for depth in range(depths):
             for f in range(K0):
                 if depth == 0:
                     leaf_prev = torch.zeros(N, dtype=torch.int64, device=device)
