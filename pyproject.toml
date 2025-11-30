@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "packboost"
+version = "1.0"
+dependencies = ["torch", "scikit-learn", "numpy", "pandas"]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+]
+
+[tool.setuptools.package-data]
+"packboost.cuda" = ["*.cpp", "*.cu", "*.h", "*.cuh"]
