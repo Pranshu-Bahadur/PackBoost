@@ -749,6 +749,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         K0, Dm, N = L_old.shape
         nodes = I.shape[2]
         depths = min(tree_set + 1, Dm + 1)
+        max_idx= V.shape[2]-1
 
         if use_cuda and torch.cuda.is_available():
             from packboost.cuda import kernels
