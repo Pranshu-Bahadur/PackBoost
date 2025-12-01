@@ -12,6 +12,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
     def __init__(self, device='cuda'):
         self.device = device
         self.nfeatsets = 32
+        self.stop_training = False
 
     def fit(self,
             X: np.ndarray, y: np.ndarray,
@@ -153,6 +154,12 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.tree_set = 0
 
         for t in range(rounds):
+            
+            # early stopping check
+            if self.stop_training:
+                self.stop_training = False
+                break
+
             # (a) feature sampling -> XS [nfeatsets, 32*M] uint32
             if XB.is_cuda and torch.cuda.is_available():
                 XS = self.et_sample_1b(XB, self.Fsch, t).contiguous()
