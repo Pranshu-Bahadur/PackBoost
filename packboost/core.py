@@ -3,15 +3,20 @@ import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin
 from torch import Tensor
 import torch.nn.functional as Fn
+
+import os
+
 print('Installing kernels...')
 from packboost.cuda import kernels
 print('kernels successfully Installed!')
 
 
 class PackBoost(BaseEstimator, RegressorMixin):
-    def __init__(self, device='cuda'):
+    def __init__(self, device='cuda',comment=""):
         self.device = device
         self.nfeatsets = 32
+        self.feature_name = None
+        self.comment = comment
 
     def fit(self,
             X: np.ndarray, y: np.ndarray,
@@ -20,6 +25,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             rounds: int = 10_000,
             max_depth: int = 7,
             callbacks: list = None,
+            feature_name: list = None,
             *,
             lr: float = 0.07,
             L2: float = 100_000.0,
@@ -34,6 +40,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         callbacks = [] if callbacks is None else callbacks
 
         # ---------- meta ----------
+        self.feature_name = feature_name
         self.nfeatsets = int(nfeatsets)
         self.nfolds    = int(nfolds)
         self.max_depth = int(max_depth)
@@ -742,6 +749,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         K0, Dm, N = L_old.shape
         nodes = I.shape[2]
         depths = min(tree_set + 1, Dm + 1)
+        max_idx= V.shape[2]-1
 
         if use_cuda and torch.cuda.is_available():
             from packboost.cuda import kernels
@@ -770,6 +778,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         word_idx = (k >> 5)
         bit_off  = (k & 31).to(torch.int64)
 
+     
         for depth in range(depths):
             for f in range(K0):
                 if depth == 0:
@@ -795,6 +804,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                         raise AssertionError("L_new must be uint8 or uint16")
 
                 add_idx = (2 * lo + 1 + x).to(torch.long)
+                add_idx=torch.clamp(add_idx, max=max_idx)
                 P.add_(V[tree_set, f].gather(0, add_idx))
 
         return P, L_new
@@ -1190,4 +1200,51 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 I[int(tree_set), f, n] = (F_row[feat_pos] & 0xFFFF).to(torch.uint16)
 
         return V, I
+                            
+    def save(self, path):
+        """Save with PyTorch's native ZIP compression."""
+        if not path.endswith('.pth'):
+            path = path + '.pth'
+        
+        state = {
+            "V": self.V.cpu(),
+            "I": self.I.cpu(),
+            "FST": self.FST.cpu(),
+            "tree_set": self.tree_set,
+            "max_depth": self.max_depth,
+            "nfolds": self.nfolds,
+            "nfeatsets": self.nfeatsets,
+            "device": self.device,
+            "feature_name" : self.feature_name,
+            "comment" : self.comment,
+            "train_N": getattr(self, 'train_N', None),
+        }
+        
+        torch.save(state, path, _use_new_zipfile_serialization=True)
+        file_size_mb = os.path.getsize(path) / (1024 * 1024)
+        print(f"Saved PackBoost model to {path} ({file_size_mb:.2f} MB)")
+    
+    def load(self, path, device=None):
+        """Load PyTorch compressed format."""
+        if not path.endswith('.pth') and os.path.exists(path + '.pth'):
+            path = path + '.pth'
+        
+        device = device or self.device
+        state = torch.load(path, map_location=device)
+        
+        self.V         = state["V"]
+        self.I         = state["I"]
+        self.FST       = state["FST"]
+        self.tree_set  = state["tree_set"]
+        self.max_depth = state["max_depth"]
+        self.nfolds    = state["nfolds"]
+        self.nfeatsets = state["nfeatsets"]
+        self.device    = device
+        self.feature_name  = state.get("feature_name",None)
+        self.comment = state.get("comment","")
+        self.train_N   = state.get("train_N", None)
+        
+        file_size_mb = os.path.getsize(path) / (1024 * 1024)
+        print(f"Loaded PackBoost model from {path} ({file_size_mb:.2f} MB)")
+        return self
 
