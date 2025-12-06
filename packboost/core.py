@@ -5,6 +5,7 @@ from torch import Tensor
 import torch.nn.functional as Fn
 
 import os
+import warnings
 
 print('Installing kernels...')
 from packboost.cuda import kernels
@@ -25,7 +26,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             rounds: int = 10_000,
             max_depth: int = 7,
             callbacks: list = None,
-            feature_name: list = None,
+            feature_name: list[str] | str = 'auto',
             *,
             lr: float = 0.07,
             L2: float = 100_000.0,
@@ -35,12 +36,45 @@ class PackBoost(BaseEstimator, RegressorMixin):
             qgrad_bits: int = 12,
             seed: int = 42,
             era_ids: np.ndarray | None = None):
+                
+        # Convert X polars/pandas to numpy - handles missing pandas/polars gracefully
+        X_columns=None # We don't check numpy columns name
+        if hasattr(X, 'to_numpy'): # polars or pandas
+            X_columns=X.columns
+            if hasattr(X_columns, 'tolist'): X_columns=X_columns.tolist() # pandas columns is an index
+            X = X.to_numpy()  # the simplest conversion   
+        
+        # Convert Xv polars/pandas to numpy - handles missing pandas/polars gracefully
+        if Xv is not None:
+            Xv_columns=None # We don't check numpy columns name
+            if hasattr(Xv, 'to_numpy'):  # polars or pandas
+                Xv_columns=Xv.columns
+                if hasattr(Xv_columns, 'tolist'): Xv_columns=Xv_columns.tolist() # pandas columns is an index
+                Xv = Xv.to_numpy()  # the simplest conversion   
+                if X_columns is not None:
+                    if Xv_columns!=X_columns: warnings.warn('Xv columns name don\'t match X columns name.')
+                      
+            assert Xv.shape[1]==X.shape[1], f'The number of columns in Xv ({Xv.shape[1]}) doesn\'t match X ({X.shape[1]}).'    
+
+        if type(feature_name)==list: assert len(feature_name)==X.shape[1], f'The number of columns in feature_name ({len(feature_name)}) doesn\'t match X ({X.shape[1]}).'    
+
+        if hasattr(y, 'to_numpy'): # polars or pandas
+            y=y.to_numpy() # the simplest conversion         
+        y=y.flatten() # Handles Dataset Column
+        
+        if hasattr(Yv, 'to_numpy'): # polars or pandas
+            Yv=Yv.to_numpy() # the simplest conversion 
+        Yv=Yv.flatten() # Handles Dataset Column
+    
+        assert X.shape[0]==y.shape[0],'X and y must have the same length !'
+        if Xv is not None: assert Xv.shape[0]==Yv.shape[0],'Xv and yv must have the same length !'
+                    
         assert X.dtype == np.int8 and y.dtype == np.float32
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
         callbacks = [] if callbacks is None else callbacks
 
         # ---------- meta ----------
-        self.feature_name = feature_name
+        self.feature_name = X_columns if feature_name=='auto' else feature_name
         self.nfeatsets = int(nfeatsets)
         self.nfolds    = int(nfolds)
         self.max_depth = int(max_depth)
@@ -249,11 +283,19 @@ class PackBoost(BaseEstimator, RegressorMixin):
         """
         Predict with the currently trained model.
 
-        X : np.ndarray[int8] or torch.Tensor[int8] of shape [N, F]
+        X : np.ndarray[int8] or torch.Tensor[int8] or pandas.DataFrame[int8] or polars.DataFrame[int8] of shape [N, F]
             Raw discrete features (0..4 expected per your pipeline).
         Returns:
-            np.ndarray[int32] if X is numpy, else torch.Tensor[int32] (length N).
+            np.ndarray[int32] if X is numpy or pandas or polars, else torch.Tensor[int32] (length N).
         """
+        # Convert to numpy - handles missing pandas/polars gracefully
+        if hasattr(X, 'to_numpy'):
+            if self.feature_name is not None:
+                X_columns=X.columns
+                if hasattr(X_columns, 'tolist'): X_columns=X_columns.tolist() # pandas columns is an index
+                assert self.feature_name==X_columns, "X columns name must match feature_name (columns used for fitting)"  
+            X = X.to_numpy()  # the simplest conversion   
+        
         # --- device & inputs ---
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
         if isinstance(X, np.ndarray):
@@ -266,6 +308,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
             X_t = X.to(device=device, dtype=torch.int8, copy=False)
             return_numpy = False
 
+        if self.feature_name is not None: 
+            assert len(self.feature_name)==X.shape[1], f'The number of columns in X ({X.shape[1]}) doesn\'t match feature_name ({len(self.feature_name)}).'
+        
         N = X_t.shape[0]
         # guardrails
         assert hasattr(self, "V") and hasattr(self, "I"), "Model not fitted: missing V/I"
