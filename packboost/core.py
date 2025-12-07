@@ -123,8 +123,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
         FST = FST.contiguous()
 
         # ---------- outputs ----------
-        V = torch.zeros((rounds, nfolds, 2 * nodes), dtype=torch.int32,  device=device)
-        I = torch.zeros((rounds, nfolds,     nodes), dtype=torch.uint16, device=device)
+        self.V = torch.zeros((rounds, nfolds, 2 * nodes), dtype=torch.int32,  device=device)
+        self.I = torch.zeros((rounds, nfolds,     nodes), dtype=torch.uint16, device=device)
 
         # ---------- optional validation ----------
         use_val = (Xv is not None) and (Yv is not None)
@@ -188,7 +188,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 He     = self.h_des(XS, G, LF, int(max_depth), era_ends)         # [K1, E, nodes, 2, 32]
 
                 self.cut_des(
-                    self.Fsch, FST, He, H0e, V, I,
+                    self.Fsch, FST, He, H0e, self.V, self.I,
                     tree_set=t, L2=L2, lr=lr_per_fold,
                     qgrad_bits=qgrad_bits, max_depth=D,
                     min_child_weight=min_child_weight,
@@ -202,7 +202,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 H0 = self.h0(G, LE, D).contiguous()                              # [K0, 2**D, 2]
                 self.cut(
                     self.Fsch, FST, H, H0[:, : H.size(1), :].contiguous(),       # -> [K0, nodes, 2]
-                    V, I,
+                    self.V, self.I,
                     tree_set=t, L2=L2, lr=lr_per_fold,
                     qgrad_bits=qgrad_bits, max_depth=D,
                     min_child_weight=min_child_weight,
@@ -211,12 +211,12 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 del H, H0
 
             # (f) advance + predict
-            self.advance_and_predict(P, XB, L_old, L_new, V, I, tree_set=t)
+            self.advance_and_predict(P, XB, L_old, L_new, self.V, self.I, tree_set=t)
             L_old, L_new = L_new, L_old
 
             # (g) validation (optional)
             if use_val:
-                self.advance_and_predict(Pv, XBv, Lv, Lvn, V, I, tree_set=t)
+                self.advance_and_predict(Pv, XBv, Lv, Lvn, self.V, self.I, tree_set=t)
                 Lv, Lvn = Lvn, Lv
 
             # (h) callbacks
@@ -235,8 +235,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         # ---------- stash for inference ----------
         self.FST  = FST
-        self.V    = V
-        self.I    = I
         self.X_packed_ = XB
         return self
 
