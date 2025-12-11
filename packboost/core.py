@@ -225,14 +225,14 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 self.advance_and_predict(Pv, XBv, Lv, Lvn, self.V, self.I, tree_set=t)
                 Lv, Lvn = Lvn, Lv
 
+            self.tree_set = t + 1
+
             # (h) callbacks
             for cb in callbacks:
                 try:
                     cb(self)
                 except Exception:
                     pass
-
-            self.tree_set = t + 1
 
             # free big temporaries ASAP
             del XS, LE, G, LF
