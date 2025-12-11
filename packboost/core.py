@@ -18,6 +18,49 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.feature_name = None
         self.comment = comment
 
+    @classmethod
+    def from_params(cls, V, I, device='cuda'):
+        """
+        Create a PackBoost instance from pre-trained parameters.
+        
+        Parameters
+        ----------
+        V : torch.Tensor or np.ndarray
+            The tree node values with shape (rounds, nfolds, 2*nodes)
+        I : torch.Tensor or np.ndarray
+            The tree node split indices with shape (rounds, nfolds, nodes)
+        device : str, optional
+            The device to use ('cuda' or 'cpu'), default is 'cuda'
+        
+        Returns
+        -------
+        PackBoost
+            A PackBoost instance initialized with the given parameters
+        """
+        instance = cls(device=device)
+        
+        # Convert to torch tensors if needed
+        if isinstance(V, np.ndarray):
+            V = torch.from_numpy(V)
+        if isinstance(I, np.ndarray):
+            I = torch.from_numpy(I)
+        
+        # Move to specified device
+        device_obj = torch.device(device if (device != "cuda" or torch.cuda.is_available()) else "cpu")
+        instance.V = V.to(device=device_obj, dtype=torch.int32)
+        instance.I = I.to(device=device_obj, dtype=torch.uint16)
+        
+        # Infer metadata from parameter shapes
+        if V.ndim == 3 and I.ndim == 3:
+            rounds, nfolds, double_nodes = V.shape
+            _, _, nodes = I.shape
+            instance.nfolds = nfolds
+            instance.tree_set = rounds
+            # Infer max_depth from nodes count: nodes = 2^D - 1
+            instance.max_depth = int(np.log2(nodes + 1))
+        
+        return instance
+
     def fit(self,
             X: np.ndarray, y: np.ndarray,
             Xv: np.ndarray = None, Yv: np.ndarray = None,
