@@ -51,7 +51,7 @@ __global__ void advance_and_predict_kernel(
       L_new[off_new] = (LeafT)leaf_new;
     }
 
-    size_t idx = (size_t)(2 * lo + 1 + (int)bit);
+    size_t idx = (size_t)(2 * lo + 1 - (int)bit); //updated
     if (idx >= (size_t)(2 * nodes)) {
       idx = (size_t)(2 * nodes) - 1;
     }
