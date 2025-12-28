@@ -1,5 +1,6 @@
-// v1 optimizations: Vectorized inner loop (4 bits/iteration)
-// v2 optimization: Branchless accumulation for depths 1-2
+// v1: Vectorized inner loop (4 bits/iteration)
+// v2: Branchless accumulation (depths 1-2)
+// v3: Register histograms (depths 0-5, 63 nodes total)
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -26,10 +27,10 @@ static __device__ __forceinline__ unsigned long long add_pack(unsigned long long
 }
  
 // ============================================================================
-// KERNEL: Vectorized + Branchless
+// KERNEL: Vectorized + Branchless + Register Histograms (Depths 0-5)
 // ============================================================================
 template <typename LF_T>
-__global__ void _h_sm_v2(
+__global__ void _h_sm_v3(
     const uint32_t* __restrict__ XS,
     const int16_t* __restrict__ Y,
     const LF_T* __restrict__ LF,
@@ -47,28 +48,50 @@ __global__ void _h_sm_v2(
   const int lane = threadIdx.x & 31;
   const int gwarp = warps_per_block * blockIdx.y + block_warp;
   
-  // Registers for depths 0..2
-  int64_t hf0=0, hw0=0;
-  int64_t hf10=0, hf11=0, hw10=0, hw11=0;
-  int64_t hf20=0, hf21=0, hf22=0, hf23=0;
-  int64_t hw20=0, hw21=0, hw22=0, hw23=0;
+  // ========================================================================
+  // NEW: Extended register histograms for depths 0-5 (63 nodes)
+  // ========================================================================
+  // Depth 0: 1 node
+  int64_t hf0 = 0, hw0 = 0;
   
-  // Shared histogram for depths >=3
-  int n_ge3 = (1 << max_depth) - 8;
-  if (n_ge3 < 1) n_ge3 = 1;
+  // Depth 1: 2 nodes
+  int64_t hf1[2] = {0}, hw1[2] = {0};
+  
+  // Depth 2: 4 nodes
+  int64_t hf2[4] = {0}, hw2[4] = {0};
+  
+  // Depth 3: 8 nodes
+  int64_t hf3[8] = {0}, hw3[8] = {0};
+  
+  // Depth 4: 16 nodes
+  int64_t hf4[16] = {0}, hw4[16] = {0};
+  
+  // Depth 5: 32 nodes
+  int64_t hf5[32] = {0}, hw5[32] = {0};
+  
+  // Total: 63 nodes, 126 registers
+  
+  // Shared histogram for depths >= 6 only
+  int n_ge6 = (max_depth >= 6) ? std::max((1 << max_depth) - 63, 1) : 1;
   extern __shared__ int shmem[];
   int* sh_high = shmem;
-  unsigned long long* sh_low = (unsigned long long*)(shmem + n_ge3 * 2 * 32);
+  unsigned long long* sh_low = (unsigned long long*)(shmem + n_ge6 * 2 * 32);
   
   const unsigned mask = __ballot_sync(__activemask(), true);
   
-  #pragma unroll
-  for (int i = 0; i < n_ge3; ++i) {
-    sh_high[(i * 2 + 0) * 32 + lane] = 0;
-    sh_high[(i * 2 + 1) * 32 + lane] = 0;
+  // Only initialize shared memory for depths >= 6
+  if (max_depth >= 6) {
+    #pragma unroll
+    for (int i = 0; i < n_ge6; ++i) {
+      sh_high[(i * 2 + 0) * 32 + lane] = 0;
+      sh_high[(i * 2 + 1) * 32 + lane] = 0;
+    }
   }
   __syncthreads();
   
+  // ========================================================================
+  // MAIN LOOP: Process data with register histograms
+  // ========================================================================
   for (int j = 0; j < stride; ++j) {
     const int base = 32 * (stride * gwarp + j);
     if (base < cols_32M) {
@@ -94,9 +117,7 @@ __global__ void _h_sm_v2(
       else                valid_mask = 0u;
       xfd_local &= valid_mask;
 
-      // ====================================================================
-      // VECTORIZED + BRANCHLESS INNER LOOP
-      // ====================================================================
+      // Vectorized + branchless inner loop
       #pragma unroll 8
       for (int k = 0; k < 32; k += 4) {
         // Shuffle 4 values at once
@@ -110,7 +131,7 @@ __global__ void _h_sm_v2(
         const uint32_t l2 = __shfl_sync(mask, l32, k + 2);
         const uint32_t l3 = __shfl_sync(mask, l32, k + 3);
         
-        // Extract 4 bits at once
+        // Extract 4 bits
         const int v0 = (xfd_local >> (k + 0)) & 1;
         const int v1 = (xfd_local >> (k + 1)) & 1;
         const int v2 = (xfd_local >> (k + 2)) & 1;
@@ -121,90 +142,146 @@ __global__ void _h_sm_v2(
         const int64_t add2 = static_cast<int64_t>(v2) * y2;
         const int64_t add3 = static_cast<int64_t>(v3) * y3;
         
-        // Depth 0 - accumulate all 4
+        // Depth 0
         hf0 += add0 + add1 + add2 + add3;
         hw0 += v0 + v1 + v2 + v3;
         
-        // ================================================================
-        // NEW: Depth 1 - BRANCHLESS using arithmetic
-        // ================================================================
+        // Depth 1 - branchless
         const int b0 = l0 & 1;
         const int b1 = l1 & 1;
         const int b2 = l2 & 1;
         const int b3 = l3 & 1;
         
-        hf10 += add0 * (1 - b0) + add1 * (1 - b1) + add2 * (1 - b2) + add3 * (1 - b3);
-        hw10 += v0 * (1 - b0) + v1 * (1 - b1) + v2 * (1 - b2) + v3 * (1 - b3);
-        hf11 += add0 * b0 + add1 * b1 + add2 * b2 + add3 * b3;
-        hw11 += v0 * b0 + v1 * b1 + v2 * b2 + v3 * b3;
+        hf1[0] += add0 * (1 - b0) + add1 * (1 - b1) + add2 * (1 - b2) + add3 * (1 - b3);
+        hw1[0] += v0 * (1 - b0) + v1 * (1 - b1) + v2 * (1 - b2) + v3 * (1 - b3);
+        hf1[1] += add0 * b0 + add1 * b1 + add2 * b2 + add3 * b3;
+        hw1[1] += v0 * b0 + v1 * b1 + v2 * b2 + v3 * b3;
+        
+        // Depth 2 - branchless indexing
+        const int idx2_0 = (l0 >> 1) & 3;
+        const int idx2_1 = (l1 >> 1) & 3;
+        const int idx2_2 = (l2 >> 1) & 3;
+        const int idx2_3 = (l3 >> 1) & 3;
+        
+        hf2[idx2_0] += add0; hw2[idx2_0] += v0;
+        hf2[idx2_1] += add1; hw2[idx2_1] += v1;
+        hf2[idx2_2] += add2; hw2[idx2_2] += v2;
+        hf2[idx2_3] += add3; hw2[idx2_3] += v3;
         
         // ================================================================
-        // NEW: Depth 2 - BRANCHLESS using pointer arrays
+        // NEW: Depths 3-5 in registers (no atomics!)
         // ================================================================
-        const int idx0 = (l0 >> 1) & 3;
-        const int idx1 = (l1 >> 1) & 3;
-        const int idx2 = (l2 >> 1) & 3;
-        const int idx3 = (l3 >> 1) & 3;
-        
-        int64_t* hf_arr[4] = {&hf20, &hf21, &hf22, &hf23};
-        int64_t* hw_arr[4] = {&hw20, &hw21, &hw22, &hw23};
-        
-        *hf_arr[idx0] += add0; *hw_arr[idx0] += v0;
-        *hf_arr[idx1] += add1; *hw_arr[idx1] += v1;
-        *hf_arr[idx2] += add2; *hw_arr[idx2] += v2;
-        *hf_arr[idx3] += add3; *hw_arr[idx3] += v3;
-        
-        // Depths >= 3 - still use atomics (will optimize later)
-        uint32_t lk0 = l0 >> 3;
-        uint32_t lk1 = l1 >> 3;
-        uint32_t lk2 = l2 >> 3;
-        uint32_t lk3 = l3 >> 3;
-        
-        #pragma unroll
-        for (int d = 3; d < max_depth; ++d) {
-          const unsigned to = (1u << d) - 1u;
-          const unsigned tkd0 = lk0 & to; lk0 >>= d;
-          const unsigned tkd1 = lk1 & to; lk1 >>= d;
-          const unsigned tkd2 = lk2 & to; lk2 >>= d;
-          const unsigned tkd3 = lk3 & to; lk3 >>= d;
+        if (max_depth >= 3) {
+          const int idx3_0 = (l0 >> 3) & 7;
+          const int idx3_1 = (l1 >> 3) & 7;
+          const int idx3_2 = (l2 >> 3) & 7;
+          const int idx3_3 = (l3 >> 3) & 7;
           
-          const int idx0_d = static_cast<int>(to + tkd0) - 7;
-          const int idx1_d = static_cast<int>(to + tkd1) - 7;
-          const int idx2_d = static_cast<int>(to + tkd2) - 7;
-          const int idx3_d = static_cast<int>(to + tkd3) - 7;
+          hf3[idx3_0] += add0; hw3[idx3_0] += v0;
+          hf3[idx3_1] += add1; hw3[idx3_1] += v1;
+          hf3[idx3_2] += add2; hw3[idx3_2] += v2;
+          hf3[idx3_3] += add3; hw3[idx3_3] += v3;
+        }
+        
+        if (max_depth >= 4) {
+          const int idx4_0 = (l0 >> 6) & 15;
+          const int idx4_1 = (l1 >> 6) & 15;
+          const int idx4_2 = (l2 >> 6) & 15;
+          const int idx4_3 = (l3 >> 6) & 15;
           
-          atomicAdd(&sh_high[(idx0_d * 2 + 0) * 32 + lane], v0 * y0);
-          atomicAdd(&sh_high[(idx0_d * 2 + 1) * 32 + lane], v0);
-          atomicAdd(&sh_high[(idx1_d * 2 + 0) * 32 + lane], v1 * y1);
-          atomicAdd(&sh_high[(idx1_d * 2 + 1) * 32 + lane], v1);
-          atomicAdd(&sh_high[(idx2_d * 2 + 0) * 32 + lane], v2 * y2);
-          atomicAdd(&sh_high[(idx2_d * 2 + 1) * 32 + lane], v2);
-          atomicAdd(&sh_high[(idx3_d * 2 + 0) * 32 + lane], v3 * y3);
-          atomicAdd(&sh_high[(idx3_d * 2 + 1) * 32 + lane], v3);
+          hf4[idx4_0] += add0; hw4[idx4_0] += v0;
+          hf4[idx4_1] += add1; hw4[idx4_1] += v1;
+          hf4[idx4_2] += add2; hw4[idx4_2] += v2;
+          hf4[idx4_3] += add3; hw4[idx4_3] += v3;
+        }
+        
+        if (max_depth >= 5) {
+          const int idx5_0 = (l0 >> 10) & 31;
+          const int idx5_1 = (l1 >> 10) & 31;
+          const int idx5_2 = (l2 >> 10) & 31;
+          const int idx5_3 = (l3 >> 10) & 31;
+          
+          hf5[idx5_0] += add0; hw5[idx5_0] += v0;
+          hf5[idx5_1] += add1; hw5[idx5_1] += v1;
+          hf5[idx5_2] += add2; hw5[idx5_2] += v2;
+          hf5[idx5_3] += add3; hw5[idx5_3] += v3;
+        }
+        
+        // Depths >= 6: still use shared memory atomics
+        if (max_depth >= 6) {
+          uint32_t lk0 = l0 >> 15;
+          uint32_t lk1 = l1 >> 15;
+          uint32_t lk2 = l2 >> 15;
+          uint32_t lk3 = l3 >> 15;
+          
+          #pragma unroll
+          for (int d = 6; d < max_depth; ++d) {
+            const unsigned to = (1u << d) - 1u;
+            const unsigned tkd0 = lk0 & to; lk0 >>= d;
+            const unsigned tkd1 = lk1 & to; lk1 >>= d;
+            const unsigned tkd2 = lk2 & to; lk2 >>= d;
+            const unsigned tkd3 = lk3 & to; lk3 >>= d;
+            
+            const int idx0_d = static_cast<int>(to + tkd0) - 63;
+            const int idx1_d = static_cast<int>(to + tkd1) - 63;
+            const int idx2_d = static_cast<int>(to + tkd2) - 63;
+            const int idx3_d = static_cast<int>(to + tkd3) - 63;
+            
+            atomicAdd(&sh_high[(idx0_d * 2 + 0) * 32 + lane], v0 * y0);
+            atomicAdd(&sh_high[(idx0_d * 2 + 1) * 32 + lane], v0);
+            atomicAdd(&sh_high[(idx1_d * 2 + 0) * 32 + lane], v1 * y1);
+            atomicAdd(&sh_high[(idx1_d * 2 + 1) * 32 + lane], v1);
+            atomicAdd(&sh_high[(idx2_d * 2 + 0) * 32 + lane], v2 * y2);
+            atomicAdd(&sh_high[(idx2_d * 2 + 1) * 32 + lane], v2);
+            atomicAdd(&sh_high[(idx3_d * 2 + 0) * 32 + lane], v3 * y3);
+            atomicAdd(&sh_high[(idx3_d * 2 + 1) * 32 + lane], v3);
+          }
         }
       }
-      // END VECTORIZED + BRANCHLESS INNER LOOP
-      // ====================================================================
     }
   }
   
-  // Reduction and writeback (unchanged)
-  const int low_nodes = 7;
+  // ========================================================================
+  // Write register histograms to shared memory for reduction
+  // ========================================================================
+  const int low_nodes = 63;  // Depths 0-5
+  
+  // Pack and write to shared low area
   int nd = 0;
   sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf0), static_cast<int>(hw0));
-  nd = 1;
-  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf10), static_cast<int>(hw10));
-  nd = 2;
-  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf11), static_cast<int>(hw11));
-  nd = 3;
-  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf20), static_cast<int>(hw20));
-  nd = 4;
-  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf21), static_cast<int>(hw21));
-  nd = 5;
-  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf22), static_cast<int>(hw22));
-  nd = 6;
-  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf23), static_cast<int>(hw23));
+  nd++;
   
+  for (int i = 0; i < 2; ++i, ++nd) {
+    sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf1[i]), static_cast<int>(hw1[i]));
+  }
+  
+  for (int i = 0; i < 4; ++i, ++nd) {
+    sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf2[i]), static_cast<int>(hw2[i]));
+  }
+  
+  if (max_depth >= 3) {
+    for (int i = 0; i < 8; ++i, ++nd) {
+      sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf3[i]), static_cast<int>(hw3[i]));
+    }
+  } else {
+    nd += 8;
+  }
+  
+  if (max_depth >= 4) {
+    for (int i = 0; i < 16; ++i, ++nd) {
+      sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf4[i]), static_cast<int>(hw4[i]));
+    }
+  } else {
+    nd += 16;
+  }
+  
+  if (max_depth >= 5) {
+    for (int i = 0; i < 32; ++i, ++nd) {
+      sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf5[i]), static_cast<int>(hw5[i]));
+    }
+  }
+  
+  // Butterfly reduction for low depths (0-5)
   int log_wpb = 0;
   for (int tmp = warps_per_block; tmp > 1; tmp >>= 1) ++log_wpb;
   
@@ -212,7 +289,10 @@ __global__ void _h_sm_v2(
     __syncthreads();
     const int ofs = 1 << s;
     if ((block_warp & ofs) == 0 && (block_warp + ofs) < warps_per_block) {
-      for (int ndi = 0; ndi < low_nodes; ++ndi) {
+      const int nodes_to_reduce = (max_depth >= 5) ? 63 : 
+                                   (max_depth >= 4) ? 31 :
+                                   (max_depth >= 3) ? 15 : 7;
+      for (int ndi = 0; ndi < nodes_to_reduce; ++ndi) {
         const int idx = (block_warp * low_nodes + ndi) * 32 + lane;
         const int idx_p = ((block_warp + ofs) * low_nodes + ndi) * 32 + lane;
         sh_low[idx] = add_pack(sh_low[idx], sh_low[idx_p]);
@@ -220,35 +300,40 @@ __global__ void _h_sm_v2(
     }
   }
   
+  // Write reduced low-depth values to global
   __syncthreads();
   if (block_warp == 0) {
-    const int low_node_map[7] = {0, 1, 2, 3, 4, 5, 6};
-    for (int ndi = 0; ndi < low_nodes; ++ndi) {
-      const unsigned long long pack = sh_low[(0 * low_nodes + ndi) * 32 + lane];
+    const int nodes_to_write = (max_depth >= 5) ? 63 : 
+                                (max_depth >= 4) ? 31 :
+                                (max_depth >= 3) ? 15 : 7;
+    for (int ndi = 0; ndi < nodes_to_write; ++ndi) {
+      const unsigned long long pack = sh_low[ndi * 32 + lane];
       const int64_t fsum = static_cast<int64_t>(static_cast<int32_t>(static_cast<uint32_t>(pack)));
       const int64_t csum = static_cast<int64_t>(static_cast<uint32_t>(pack >> 32));
-      const int node = low_node_map[ndi];
-      atomicAdd(Hptr(H, nodes_total, feat_set, node, 0, lane), static_cast<unsigned long long>(fsum));
-      atomicAdd(Hptr(H, nodes_total, feat_set, node, 1, lane), static_cast<unsigned long long>(csum));
+      atomicAdd(Hptr(H, nodes_total, feat_set, ndi, 0, lane), static_cast<unsigned long long>(fsum));
+      atomicAdd(Hptr(H, nodes_total, feat_set, ndi, 1, lane), static_cast<unsigned long long>(csum));
     }
   }
   __syncthreads();
   
-  const int rows_per_warp = (n_ge3 + warps_per_block - 1) / warps_per_block;
-  for (int k = 0; k < rows_per_warp; ++k) {
-    const int node = 7 + rows_per_warp * block_warp + k;
-    if (node < nodes_total) {
-      const int base = ((node - 7) * 2) * 32 + lane;
-      const int64_t fsum = static_cast<int64_t>(sh_high[base + 0]);
-      const int64_t csum = static_cast<int64_t>(sh_high[base + 32]);
-      atomicAdd(Hptr(H, nodes_total, feat_set, node, 0, lane), (unsigned long long int)fsum);
-      atomicAdd(Hptr(H, nodes_total, feat_set, node, 1, lane), (unsigned long long int)csum);
+  // Drain shared histogram (depths >= 6)
+  if (max_depth >= 6) {
+    const int rows_per_warp = (n_ge6 + warps_per_block - 1) / warps_per_block;
+    for (int k = 0; k < rows_per_warp; ++k) {
+      const int node = 63 + rows_per_warp * block_warp + k;
+      if (node < nodes_total) {
+        const int base = ((node - 63) * 2) * 32 + lane;
+        const int64_t fsum = static_cast<int64_t>(sh_high[base + 0]);
+        const int64_t csum = static_cast<int64_t>(sh_high[base + 32]);
+        atomicAdd(Hptr(H, nodes_total, feat_set, node, 0, lane), (unsigned long long int)fsum);
+        atomicAdd(Hptr(H, nodes_total, feat_set, node, 1, lane), (unsigned long long int)csum);
+      }
     }
   }
 }
 
 // ============================================================================
-// HOST WRAPPER (same as v1)
+// HOST WRAPPER
 // ============================================================================
 static inline int ceil_div_int(int a, int b){ return (a + b - 1) / b; }
 
@@ -270,7 +355,7 @@ static inline void infer_grid_stride(
 static inline int choose_warps_that_fit(size_t smem_high, size_t smem_cap) {
   int wpb = 16;
   while (wpb > 1) {
-    size_t smem_low = (size_t)wpb * 7 * 32 * sizeof(unsigned long long);
+    size_t smem_low = (size_t)wpb * 63 * 32 * sizeof(unsigned long long);
     if (smem_high + smem_low <= smem_cap) break;
     wpb >>= 1;
   }
@@ -291,8 +376,9 @@ torch::Tensor h_sm_optimized(
   auto opts = XS.options().dtype(torch::kLong).memory_format(c10::MemoryFormat::Contiguous);
   auto H = torch::zeros({XS.size(0), nodes_tot, 2, 32}, opts);
   
-  int n_ge3 = std::max((1 << max_depth) - 8, 1);
-  size_t smem_high = (size_t)n_ge3 * 2 * 32 * sizeof(int);
+  // Shared memory for depths >= 6
+  int n_ge6 = (max_depth >= 6) ? std::max((1 << max_depth) - 63, 1) : 1;
+  size_t smem_high = (size_t)n_ge6 * 2 * 32 * sizeof(int);
   
   auto* prop = at::cuda::getCurrentDeviceProperties();
   size_t smem_cap = prop->sharedMemPerBlockOptin ? (size_t)prop->sharedMemPerBlockOptin
@@ -305,7 +391,8 @@ torch::Tensor h_sm_optimized(
   dim3 grid(nfeatsets, blocks_per_feat, 1);
   dim3 block(warps_per_block * 32, 1, 1);
   
-  size_t smem_low = static_cast<size_t>(warps_per_block) * 7 * 32 * sizeof(unsigned long long);
+  // Shared memory: high (depths >= 6) + low (depths 0-5 for reduction)
+  size_t smem_low = static_cast<size_t>(warps_per_block) * 63 * 32 * sizeof(unsigned long long);
   size_t smem_bytes = smem_high + smem_low;
   
   TORCH_CHECK(smem_bytes <= smem_cap,
@@ -323,30 +410,30 @@ torch::Tensor h_sm_optimized(
   
   const auto lf_dt = LF.scalar_type();
   if (lf_dt == torch::kUInt16) {
-    cudaFuncSetAttribute(_h_sm_v2<uint16_t>,
+    cudaFuncSetAttribute(_h_sm_v3<uint16_t>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
-    _h_sm_v2<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
+    _h_sm_v3<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint16_t>(),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
       warps_per_block, stride, nodes_tot
     );
   } else if (lf_dt == torch::kUInt32) {
-    cudaFuncSetAttribute(_h_sm_v2<uint32_t>,
+    cudaFuncSetAttribute(_h_sm_v3<uint32_t>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
-    _h_sm_v2<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
+    _h_sm_v3<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint32_t>(),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
       warps_per_block, stride, nodes_tot
     );
   } else if (lf_dt == torch::kUInt64) {
-    cudaFuncSetAttribute(_h_sm_v2<uint64_t>,
+    cudaFuncSetAttribute(_h_sm_v3<uint64_t>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
-    _h_sm_v2<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
+    _h_sm_v3<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr, Y.data_ptr<int16_t>(), static_cast<uint64_t*>(LF.data_ptr()),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
