@@ -1,22 +1,22 @@
+// v1 optimizations: Vectorized inner loop (4 bits/iteration)
+// v2 optimization: Branchless accumulation for depths 1-2
+
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <cstdint>
 
-// H layout helper: [nfeatsets, nodes, 2, 32]
 static inline __device__ unsigned long long int* Hptr(int64_t* H, int nodes,
                                          int feat, int node, int chan, int lane) {
   size_t idx = (((static_cast<size_t>(feat) * nodes + node) * 2 + chan) * 32u + lane);
   return (unsigned long long int*)(H + idx);
 }
 
-// pack (sum,count) -> 64-bit (low32 = sum (signed), high32 = count (unsigned))
 __device__ __forceinline__ unsigned long long pack_sc(int sum32, int cnt32) {
     return ( (unsigned long long)(unsigned int)cnt32 << 32 ) |
              (unsigned long long)(unsigned int)sum32;
 }
 
-// add two packed values
 static __device__ __forceinline__ unsigned long long add_pack(unsigned long long a, unsigned long long b) {
     int sa = (int)(unsigned int)a;
     int ca = (int)(unsigned int)(a >> 32);
@@ -26,10 +26,10 @@ static __device__ __forceinline__ unsigned long long add_pack(unsigned long long
 }
  
 // ============================================================================
-// KERNEL WITH VECTORIZED INNER LOOP (Process 4 bits/iteration instead of 1)
+// KERNEL: Vectorized + Branchless
 // ============================================================================
 template <typename LF_T>
-__global__ void _h_sm_v1(
+__global__ void _h_sm_v2(
     const uint32_t* __restrict__ XS,
     const int16_t* __restrict__ Y,
     const LF_T* __restrict__ LF,
@@ -69,9 +69,6 @@ __global__ void _h_sm_v1(
   }
   __syncthreads();
   
-  // ========================================================================
-  // MAIN LOOP - Same as original
-  // ========================================================================
   for (int j = 0; j < stride; ++j) {
     const int base = 32 * (stride * gwarp + j);
     if (base < cols_32M) {
@@ -98,11 +95,11 @@ __global__ void _h_sm_v1(
       xfd_local &= valid_mask;
 
       // ====================================================================
-      // OPTIMIZATION: Vectorized inner loop (4 bits per iteration)
+      // VECTORIZED + BRANCHLESS INNER LOOP
       // ====================================================================
       #pragma unroll 8
       for (int k = 0; k < 32; k += 4) {
-        // Shuffle 4 values at once (reduced from 32 to 8 iterations)
+        // Shuffle 4 values at once
         const int32_t y0 = __shfl_sync(mask, y_lane, k + 0);
         const int32_t y1 = __shfl_sync(mask, y_lane, k + 1);
         const int32_t y2 = __shfl_sync(mask, y_lane, k + 2);
@@ -128,44 +125,36 @@ __global__ void _h_sm_v1(
         hf0 += add0 + add1 + add2 + add3;
         hw0 += v0 + v1 + v2 + v3;
         
-        // Depth 1 - process all 4
-        unsigned tk0 = l0 & 1u;
-        unsigned tk1 = l1 & 1u;
-        unsigned tk2 = l2 & 1u;
-        unsigned tk3 = l3 & 1u;
+        // ================================================================
+        // NEW: Depth 1 - BRANCHLESS using arithmetic
+        // ================================================================
+        const int b0 = l0 & 1;
+        const int b1 = l1 & 1;
+        const int b2 = l2 & 1;
+        const int b3 = l3 & 1;
         
-        if (tk0 == 0u) { hf10 += add0; hw10 += v0; } else { hf11 += add0; hw11 += v0; }
-        if (tk1 == 0u) { hf10 += add1; hw10 += v1; } else { hf11 += add1; hw11 += v1; }
-        if (tk2 == 0u) { hf10 += add2; hw10 += v2; } else { hf11 += add2; hw11 += v2; }
-        if (tk3 == 0u) { hf10 += add3; hw10 += v3; } else { hf11 += add3; hw11 += v3; }
+        hf10 += add0 * (1 - b0) + add1 * (1 - b1) + add2 * (1 - b2) + add3 * (1 - b3);
+        hw10 += v0 * (1 - b0) + v1 * (1 - b1) + v2 * (1 - b2) + v3 * (1 - b3);
+        hf11 += add0 * b0 + add1 * b1 + add2 * b2 + add3 * b3;
+        hw11 += v0 * b0 + v1 * b1 + v2 * b2 + v3 * b3;
         
-        // Depth 2 - process all 4
-        tk0 = (l0 >> 1) & 3u;
-        tk1 = (l1 >> 1) & 3u;
-        tk2 = (l2 >> 1) & 3u;
-        tk3 = (l3 >> 1) & 3u;
+        // ================================================================
+        // NEW: Depth 2 - BRANCHLESS using pointer arrays
+        // ================================================================
+        const int idx0 = (l0 >> 1) & 3;
+        const int idx1 = (l1 >> 1) & 3;
+        const int idx2 = (l2 >> 1) & 3;
+        const int idx3 = (l3 >> 1) & 3;
         
-        if      (tk0 == 0u) { hf20 += add0; hw20 += v0; }
-        else if (tk0 == 1u) { hf21 += add0; hw21 += v0; }
-        else if (tk0 == 2u) { hf22 += add0; hw22 += v0; }
-        else                { hf23 += add0; hw23 += v0; }
+        int64_t* hf_arr[4] = {&hf20, &hf21, &hf22, &hf23};
+        int64_t* hw_arr[4] = {&hw20, &hw21, &hw22, &hw23};
         
-        if      (tk1 == 0u) { hf20 += add1; hw20 += v1; }
-        else if (tk1 == 1u) { hf21 += add1; hw21 += v1; }
-        else if (tk1 == 2u) { hf22 += add1; hw22 += v1; }
-        else                { hf23 += add1; hw23 += v1; }
+        *hf_arr[idx0] += add0; *hw_arr[idx0] += v0;
+        *hf_arr[idx1] += add1; *hw_arr[idx1] += v1;
+        *hf_arr[idx2] += add2; *hw_arr[idx2] += v2;
+        *hf_arr[idx3] += add3; *hw_arr[idx3] += v3;
         
-        if      (tk2 == 0u) { hf20 += add2; hw20 += v2; }
-        else if (tk2 == 1u) { hf21 += add2; hw21 += v2; }
-        else if (tk2 == 2u) { hf22 += add2; hw22 += v2; }
-        else                { hf23 += add2; hw23 += v2; }
-        
-        if      (tk3 == 0u) { hf20 += add3; hw20 += v3; }
-        else if (tk3 == 1u) { hf21 += add3; hw21 += v3; }
-        else if (tk3 == 2u) { hf22 += add3; hw22 += v3; }
-        else                { hf23 += add3; hw23 += v3; }
-        
-        // Depths >= 3 - process all 4
+        // Depths >= 3 - still use atomics (will optimize later)
         uint32_t lk0 = l0 >> 3;
         uint32_t lk1 = l1 >> 3;
         uint32_t lk2 = l2 >> 3;
@@ -179,29 +168,27 @@ __global__ void _h_sm_v1(
           const unsigned tkd2 = lk2 & to; lk2 >>= d;
           const unsigned tkd3 = lk3 & to; lk3 >>= d;
           
-          const int idx0 = static_cast<int>(to + tkd0) - 7;
-          const int idx1 = static_cast<int>(to + tkd1) - 7;
-          const int idx2 = static_cast<int>(to + tkd2) - 7;
-          const int idx3 = static_cast<int>(to + tkd3) - 7;
+          const int idx0_d = static_cast<int>(to + tkd0) - 7;
+          const int idx1_d = static_cast<int>(to + tkd1) - 7;
+          const int idx2_d = static_cast<int>(to + tkd2) - 7;
+          const int idx3_d = static_cast<int>(to + tkd3) - 7;
           
-          atomicAdd(&sh_high[(idx0 * 2 + 0) * 32 + lane], v0 * y0);
-          atomicAdd(&sh_high[(idx0 * 2 + 1) * 32 + lane], v0);
-          atomicAdd(&sh_high[(idx1 * 2 + 0) * 32 + lane], v1 * y1);
-          atomicAdd(&sh_high[(idx1 * 2 + 1) * 32 + lane], v1);
-          atomicAdd(&sh_high[(idx2 * 2 + 0) * 32 + lane], v2 * y2);
-          atomicAdd(&sh_high[(idx2 * 2 + 1) * 32 + lane], v2);
-          atomicAdd(&sh_high[(idx3 * 2 + 0) * 32 + lane], v3 * y3);
-          atomicAdd(&sh_high[(idx3 * 2 + 1) * 32 + lane], v3);
+          atomicAdd(&sh_high[(idx0_d * 2 + 0) * 32 + lane], v0 * y0);
+          atomicAdd(&sh_high[(idx0_d * 2 + 1) * 32 + lane], v0);
+          atomicAdd(&sh_high[(idx1_d * 2 + 0) * 32 + lane], v1 * y1);
+          atomicAdd(&sh_high[(idx1_d * 2 + 1) * 32 + lane], v1);
+          atomicAdd(&sh_high[(idx2_d * 2 + 0) * 32 + lane], v2 * y2);
+          atomicAdd(&sh_high[(idx2_d * 2 + 1) * 32 + lane], v2);
+          atomicAdd(&sh_high[(idx3_d * 2 + 0) * 32 + lane], v3 * y3);
+          atomicAdd(&sh_high[(idx3_d * 2 + 1) * 32 + lane], v3);
         }
       }
-      // END VECTORIZED INNER LOOP
+      // END VECTORIZED + BRANCHLESS INNER LOOP
       // ====================================================================
     }
   }
   
-  // ========================================================================
-  // REST OF KERNEL - UNCHANGED (reduction & writeback)
-  // ========================================================================
+  // Reduction and writeback (unchanged)
   const int low_nodes = 7;
   int nd = 0;
   sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf0), static_cast<int>(hw0));
@@ -261,7 +248,7 @@ __global__ void _h_sm_v1(
 }
 
 // ============================================================================
-// HOST WRAPPER - Same helper functions as original
+// HOST WRAPPER (same as v1)
 // ============================================================================
 static inline int ceil_div_int(int a, int b){ return (a + b - 1) / b; }
 
@@ -336,30 +323,30 @@ torch::Tensor h_sm_optimized(
   
   const auto lf_dt = LF.scalar_type();
   if (lf_dt == torch::kUInt16) {
-    cudaFuncSetAttribute(_h_sm_v1<uint16_t>,
+    cudaFuncSetAttribute(_h_sm_v2<uint16_t>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
-    _h_sm_v1<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
+    _h_sm_v2<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint16_t>(),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
       warps_per_block, stride, nodes_tot
     );
   } else if (lf_dt == torch::kUInt32) {
-    cudaFuncSetAttribute(_h_sm_v1<uint32_t>,
+    cudaFuncSetAttribute(_h_sm_v2<uint32_t>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
-    _h_sm_v1<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
+    _h_sm_v2<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint32_t>(),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
       warps_per_block, stride, nodes_tot
     );
   } else if (lf_dt == torch::kUInt64) {
-    cudaFuncSetAttribute(_h_sm_v1<uint64_t>,
+    cudaFuncSetAttribute(_h_sm_v2<uint64_t>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
-    _h_sm_v1<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
+    _h_sm_v2<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr, Y.data_ptr<int16_t>(), static_cast<uint64_t*>(LF.data_ptr()),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
