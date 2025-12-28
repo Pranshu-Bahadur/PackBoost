@@ -62,6 +62,12 @@ torch::Tensor h_sm(
     torch::Tensor LF,
     int max_depth);
 
+torch::Tensor h_sm_optimized(
+    torch::Tensor XS,
+    torch::Tensor Y,
+    torch::Tensor LF,
+    int max_depth);
+
 void cut_cuda_launcher(
     torch::Tensor F,      // uint16 (stores uint16)
     torch::Tensor FST,    // uint8
@@ -194,5 +200,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("advance_and_predict", &advance_and_predict_launcher,
         "PackBoost advance_and_predict (CUDA)");
 
-
+    m.def("h_sm_optimized", &h_sm_optimized, "Optimized histogram kernel (CUDA)");
 }
