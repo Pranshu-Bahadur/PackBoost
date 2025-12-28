@@ -1,6 +1,8 @@
+// Vectorized + Branchless + Register Histograms (FIXED)
 // v1: Vectorized inner loop (4 bits/iteration)
 // v2: Branchless accumulation (depths 1-2)
 // v3: Register histograms (depths 0-5, 63 nodes total)
+// FIX: Corrected max_depth conditionals (depth d exists when max_depth > d)
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -49,7 +51,7 @@ __global__ void _h_sm_v3(
   const int gwarp = warps_per_block * blockIdx.y + block_warp;
   
   // ========================================================================
-  // NEW: Extended register histograms for depths 0-5 (63 nodes)
+  // Register histograms for depths 0-5 (63 nodes maximum)
   // ========================================================================
   // Depth 0: 1 node
   int64_t hf0 = 0, hw0 = 0;
@@ -60,21 +62,27 @@ __global__ void _h_sm_v3(
   // Depth 2: 4 nodes
   int64_t hf2[4] = {0}, hw2[4] = {0};
   
-  // Depth 3: 8 nodes
+  // Depth 3: 8 nodes (used when max_depth >= 4)
   int64_t hf3[8] = {0}, hw3[8] = {0};
   
-  // Depth 4: 16 nodes
+  // Depth 4: 16 nodes (used when max_depth >= 5)
   int64_t hf4[16] = {0}, hw4[16] = {0};
   
-  // Depth 5: 32 nodes
+  // Depth 5: 32 nodes (used when max_depth >= 6)
   int64_t hf5[32] = {0}, hw5[32] = {0};
   
-  // Total: 63 nodes, 126 registers
-  
   // Shared histogram for depths >= 6 only
+  // n_ge6 = number of nodes at depths >= 6
   int n_ge6 = (max_depth >= 6) ? std::max((1 << max_depth) - 63, 1) : 1;
   extern __shared__ int shmem[];
   int* sh_high = shmem;
+  
+  // Calculate how many register nodes we're actually using
+  int reg_nodes = 7;  // Always have depths 0-2
+  if (max_depth >= 4) reg_nodes += 8;   // Add depth 3
+  if (max_depth >= 5) reg_nodes += 16;  // Add depth 4
+  if (max_depth >= 6) reg_nodes += 32;  // Add depth 5
+  
   unsigned long long* sh_low = (unsigned long long*)(shmem + n_ge6 * 2 * 32);
   
   const unsigned mask = __ballot_sync(__activemask(), true);
@@ -169,9 +177,10 @@ __global__ void _h_sm_v3(
         hf2[idx2_3] += add3; hw2[idx2_3] += v3;
         
         // ================================================================
-        // NEW: Depths 3-5 in registers (no atomics!)
+        // FIXED: Depth 3-5 in registers with CORRECT conditionals
         // ================================================================
-        if (max_depth >= 3) {
+        // Depth 3 exists when max_depth > 3, i.e., max_depth >= 4
+        if (max_depth >= 4) {
           const int idx3_0 = (l0 >> 3) & 7;
           const int idx3_1 = (l1 >> 3) & 7;
           const int idx3_2 = (l2 >> 3) & 7;
@@ -183,7 +192,8 @@ __global__ void _h_sm_v3(
           hf3[idx3_3] += add3; hw3[idx3_3] += v3;
         }
         
-        if (max_depth >= 4) {
+        // Depth 4 exists when max_depth > 4, i.e., max_depth >= 5
+        if (max_depth >= 5) {
           const int idx4_0 = (l0 >> 6) & 15;
           const int idx4_1 = (l1 >> 6) & 15;
           const int idx4_2 = (l2 >> 6) & 15;
@@ -195,7 +205,8 @@ __global__ void _h_sm_v3(
           hf4[idx4_3] += add3; hw4[idx4_3] += v3;
         }
         
-        if (max_depth >= 5) {
+        // Depth 5 exists when max_depth > 5, i.e., max_depth >= 6
+        if (max_depth >= 6) {
           const int idx5_0 = (l0 >> 10) & 31;
           const int idx5_1 = (l1 >> 10) & 31;
           const int idx5_2 = (l2 >> 10) & 31;
@@ -207,8 +218,8 @@ __global__ void _h_sm_v3(
           hf5[idx5_3] += add3; hw5[idx5_3] += v3;
         }
         
-        // Depths >= 6: still use shared memory atomics
-        if (max_depth >= 6) {
+        // Depths >= 6: use shared memory atomics
+        if (max_depth >= 7) {
           uint32_t lk0 = l0 >> 15;
           uint32_t lk1 = l1 >> 15;
           uint32_t lk2 = l2 >> 15;
@@ -244,7 +255,7 @@ __global__ void _h_sm_v3(
   // ========================================================================
   // Write register histograms to shared memory for reduction
   // ========================================================================
-  const int low_nodes = 63;  // Depths 0-5
+  const int low_nodes = 63;  // Max possible (depths 0-5)
   
   // Pack and write to shared low area
   int nd = 0;
@@ -259,7 +270,7 @@ __global__ void _h_sm_v3(
     sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf2[i]), static_cast<int>(hw2[i]));
   }
   
-  if (max_depth >= 3) {
+  if (max_depth >= 4) {
     for (int i = 0; i < 8; ++i, ++nd) {
       sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf3[i]), static_cast<int>(hw3[i]));
     }
@@ -267,7 +278,7 @@ __global__ void _h_sm_v3(
     nd += 8;
   }
   
-  if (max_depth >= 4) {
+  if (max_depth >= 5) {
     for (int i = 0; i < 16; ++i, ++nd) {
       sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf4[i]), static_cast<int>(hw4[i]));
     }
@@ -275,13 +286,13 @@ __global__ void _h_sm_v3(
     nd += 16;
   }
   
-  if (max_depth >= 5) {
+  if (max_depth >= 6) {
     for (int i = 0; i < 32; ++i, ++nd) {
       sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf5[i]), static_cast<int>(hw5[i]));
     }
   }
   
-  // Butterfly reduction for low depths (0-5)
+  // Butterfly reduction for register depths
   int log_wpb = 0;
   for (int tmp = warps_per_block; tmp > 1; tmp >>= 1) ++log_wpb;
   
@@ -289,10 +300,7 @@ __global__ void _h_sm_v3(
     __syncthreads();
     const int ofs = 1 << s;
     if ((block_warp & ofs) == 0 && (block_warp + ofs) < warps_per_block) {
-      const int nodes_to_reduce = (max_depth >= 5) ? 63 : 
-                                   (max_depth >= 4) ? 31 :
-                                   (max_depth >= 3) ? 15 : 7;
-      for (int ndi = 0; ndi < nodes_to_reduce; ++ndi) {
+      for (int ndi = 0; ndi < reg_nodes; ++ndi) {
         const int idx = (block_warp * low_nodes + ndi) * 32 + lane;
         const int idx_p = ((block_warp + ofs) * low_nodes + ndi) * 32 + lane;
         sh_low[idx] = add_pack(sh_low[idx], sh_low[idx_p]);
@@ -300,13 +308,10 @@ __global__ void _h_sm_v3(
     }
   }
   
-  // Write reduced low-depth values to global
+  // Write reduced register values to global
   __syncthreads();
   if (block_warp == 0) {
-    const int nodes_to_write = (max_depth >= 5) ? 63 : 
-                                (max_depth >= 4) ? 31 :
-                                (max_depth >= 3) ? 15 : 7;
-    for (int ndi = 0; ndi < nodes_to_write; ++ndi) {
+    for (int ndi = 0; ndi < reg_nodes; ++ndi) {
       const unsigned long long pack = sh_low[ndi * 32 + lane];
       const int64_t fsum = static_cast<int64_t>(static_cast<int32_t>(static_cast<uint32_t>(pack)));
       const int64_t csum = static_cast<int64_t>(static_cast<uint32_t>(pack >> 32));
@@ -317,7 +322,7 @@ __global__ void _h_sm_v3(
   __syncthreads();
   
   // Drain shared histogram (depths >= 6)
-  if (max_depth >= 6) {
+  if (max_depth >= 7) {
     const int rows_per_warp = (n_ge6 + warps_per_block - 1) / warps_per_block;
     for (int k = 0; k < rows_per_warp; ++k) {
       const int node = 63 + rows_per_warp * block_warp + k;
