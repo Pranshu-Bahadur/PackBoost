@@ -1,8 +1,8 @@
-// Vectorized + Branchless + Register Histograms (FIXED)
+// Vectorized + Branchless + Register Histograms (Depths 0-3)
 // v1: Vectorized inner loop (4 bits/iteration)
 // v2: Branchless accumulation (depths 1-2)
-// v3: Register histograms (depths 0-5, 63 nodes total)
-// FIX: Corrected max_depth conditionals (depth d exists when max_depth > d)
+// v3_lite: Register histograms for depths 0-3 ONLY (15 nodes, 30 int64 registers)
+//          Conservative design for T4 and other register-limited GPUs
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -29,10 +29,10 @@ static __device__ __forceinline__ unsigned long long add_pack(unsigned long long
 }
  
 // ============================================================================
-// KERNEL: Vectorized + Branchless + Register Histograms (Depths 0-5)
+// KERNEL: Vectorized + Branchless + Register Histograms (Depths 0-3 ONLY)
 // ============================================================================
 template <typename LF_T>
-__global__ void _h_sm_v3(
+__global__ void _h_sm_v3_lite(
     const uint32_t* __restrict__ XS,
     const int16_t* __restrict__ Y,
     const LF_T* __restrict__ LF,
@@ -51,7 +51,7 @@ __global__ void _h_sm_v3(
   const int gwarp = warps_per_block * blockIdx.y + block_warp;
   
   // ========================================================================
-  // Register histograms for depths 0-5 (63 nodes maximum)
+  // Register histograms for depths 0-3 ONLY (15 nodes, 30 int64 registers)
   // ========================================================================
   // Depth 0: 1 node
   int64_t hf0 = 0, hw0 = 0;
@@ -62,43 +62,29 @@ __global__ void _h_sm_v3(
   // Depth 2: 4 nodes
   int64_t hf2[4] = {0}, hw2[4] = {0};
   
-  // Depth 3: 8 nodes (used when max_depth >= 4)
+  // Depth 3: 8 nodes
   int64_t hf3[8] = {0}, hw3[8] = {0};
   
-  // Depth 4: 16 nodes (used when max_depth >= 5)
-  int64_t hf4[16] = {0}, hw4[16] = {0};
+  // Total: 15 nodes, 30 int64 registers (safe for T4!)
   
-  // Depth 5: 32 nodes (used when max_depth >= 6)
-  int64_t hf5[32] = {0}, hw5[32] = {0};
-  
-  // Shared histogram for depths >= 6 only
-  // n_ge6 = number of nodes at depths >= 6
-  int n_ge6 = (max_depth >= 6) ? std::max((1 << max_depth) - 63, 1) : 1;
+  // Shared histogram for depths >= 4
+  int n_ge4 = (max_depth >= 4) ? std::max((1 << max_depth) - 15, 1) : 1;
   extern __shared__ int shmem[];
   int* sh_high = shmem;
-  
-  // Calculate how many register nodes we're actually using
-  int reg_nodes = 7;  // Always have depths 0-2
-  if (max_depth >= 4) reg_nodes += 8;   // Add depth 3
-  if (max_depth >= 5) reg_nodes += 16;  // Add depth 4
-  if (max_depth >= 6) reg_nodes += 32;  // Add depth 5
-  
-  unsigned long long* sh_low = (unsigned long long*)(shmem + n_ge6 * 2 * 32);
+  unsigned long long* sh_low = (unsigned long long*)(shmem + n_ge4 * 2 * 32);
   
   const unsigned mask = __ballot_sync(__activemask(), true);
   
-  // Only initialize shared memory for depths >= 6
-  if (max_depth >= 6) {
-    #pragma unroll
-    for (int i = 0; i < n_ge6; ++i) {
-      sh_high[(i * 2 + 0) * 32 + lane] = 0;
-      sh_high[(i * 2 + 1) * 32 + lane] = 0;
-    }
+  // Initialize shared memory for depths >= 4
+  #pragma unroll
+  for (int i = 0; i < n_ge4; ++i) {
+    sh_high[(i * 2 + 0) * 32 + lane] = 0;
+    sh_high[(i * 2 + 1) * 32 + lane] = 0;
   }
   __syncthreads();
   
   // ========================================================================
-  // MAIN LOOP: Process data with register histograms
+  // MAIN LOOP: Process data with register histograms (depths 0-3)
   // ========================================================================
   for (int j = 0; j < stride; ++j) {
     const int base = 32 * (stride * gwarp + j);
@@ -176,10 +162,7 @@ __global__ void _h_sm_v3(
         hf2[idx2_2] += add2; hw2[idx2_2] += v2;
         hf2[idx2_3] += add3; hw2[idx2_3] += v3;
         
-        // ================================================================
-        // FIXED: Depth 3-5 in registers with CORRECT conditionals
-        // ================================================================
-        // Depth 3 exists when max_depth > 3, i.e., max_depth >= 4
+        // Depth 3 - branchless indexing (registers)
         if (max_depth >= 4) {
           const int idx3_0 = (l0 >> 3) & 7;
           const int idx3_1 = (l1 >> 3) & 7;
@@ -192,51 +175,25 @@ __global__ void _h_sm_v3(
           hf3[idx3_3] += add3; hw3[idx3_3] += v3;
         }
         
-        // Depth 4 exists when max_depth > 4, i.e., max_depth >= 5
+        // Depths >= 4: use shared memory atomics
         if (max_depth >= 5) {
-          const int idx4_0 = (l0 >> 6) & 15;
-          const int idx4_1 = (l1 >> 6) & 15;
-          const int idx4_2 = (l2 >> 6) & 15;
-          const int idx4_3 = (l3 >> 6) & 15;
-          
-          hf4[idx4_0] += add0; hw4[idx4_0] += v0;
-          hf4[idx4_1] += add1; hw4[idx4_1] += v1;
-          hf4[idx4_2] += add2; hw4[idx4_2] += v2;
-          hf4[idx4_3] += add3; hw4[idx4_3] += v3;
-        }
-        
-        // Depth 5 exists when max_depth > 5, i.e., max_depth >= 6
-        if (max_depth >= 6) {
-          const int idx5_0 = (l0 >> 10) & 31;
-          const int idx5_1 = (l1 >> 10) & 31;
-          const int idx5_2 = (l2 >> 10) & 31;
-          const int idx5_3 = (l3 >> 10) & 31;
-          
-          hf5[idx5_0] += add0; hw5[idx5_0] += v0;
-          hf5[idx5_1] += add1; hw5[idx5_1] += v1;
-          hf5[idx5_2] += add2; hw5[idx5_2] += v2;
-          hf5[idx5_3] += add3; hw5[idx5_3] += v3;
-        }
-        
-        // Depths >= 6: use shared memory atomics
-        if (max_depth >= 7) {
-          uint32_t lk0 = l0 >> 15;
-          uint32_t lk1 = l1 >> 15;
-          uint32_t lk2 = l2 >> 15;
-          uint32_t lk3 = l3 >> 15;
+          uint32_t lk0 = l0 >> 6;
+          uint32_t lk1 = l1 >> 6;
+          uint32_t lk2 = l2 >> 6;
+          uint32_t lk3 = l3 >> 6;
           
           #pragma unroll
-          for (int d = 6; d < max_depth; ++d) {
+          for (int d = 4; d < max_depth; ++d) {
             const unsigned to = (1u << d) - 1u;
             const unsigned tkd0 = lk0 & to; lk0 >>= d;
             const unsigned tkd1 = lk1 & to; lk1 >>= d;
             const unsigned tkd2 = lk2 & to; lk2 >>= d;
             const unsigned tkd3 = lk3 & to; lk3 >>= d;
             
-            const int idx0_d = static_cast<int>(to + tkd0) - 63;
-            const int idx1_d = static_cast<int>(to + tkd1) - 63;
-            const int idx2_d = static_cast<int>(to + tkd2) - 63;
-            const int idx3_d = static_cast<int>(to + tkd3) - 63;
+            const int idx0_d = static_cast<int>(to + tkd0) - 15;
+            const int idx1_d = static_cast<int>(to + tkd1) - 15;
+            const int idx2_d = static_cast<int>(to + tkd2) - 15;
+            const int idx3_d = static_cast<int>(to + tkd3) - 15;
             
             atomicAdd(&sh_high[(idx0_d * 2 + 0) * 32 + lane], v0 * y0);
             atomicAdd(&sh_high[(idx0_d * 2 + 1) * 32 + lane], v0);
@@ -255,7 +212,7 @@ __global__ void _h_sm_v3(
   // ========================================================================
   // Write register histograms to shared memory for reduction
   // ========================================================================
-  const int low_nodes = 63;  // Max possible (depths 0-5)
+  const int low_nodes = 15;  // Depths 0-3
   
   // Pack and write to shared low area
   int nd = 0;
@@ -274,27 +231,13 @@ __global__ void _h_sm_v3(
     for (int i = 0; i < 8; ++i, ++nd) {
       sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf3[i]), static_cast<int>(hw3[i]));
     }
-  } else {
-    nd += 8;
   }
   
-  if (max_depth >= 5) {
-    for (int i = 0; i < 16; ++i, ++nd) {
-      sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf4[i]), static_cast<int>(hw4[i]));
-    }
-  } else {
-    nd += 16;
-  }
-  
-  if (max_depth >= 6) {
-    for (int i = 0; i < 32; ++i, ++nd) {
-      sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf5[i]), static_cast<int>(hw5[i]));
-    }
-  }
-  
-  // Butterfly reduction for register depths
+  // Butterfly reduction for register depths (0-3)
   int log_wpb = 0;
   for (int tmp = warps_per_block; tmp > 1; tmp >>= 1) ++log_wpb;
+  
+  const int reg_nodes = (max_depth >= 4) ? 15 : 7;
   
   for (int s = 0; s < log_wpb; ++s) {
     __syncthreads();
@@ -321,13 +264,13 @@ __global__ void _h_sm_v3(
   }
   __syncthreads();
   
-  // Drain shared histogram (depths >= 6)
-  if (max_depth >= 7) {
-    const int rows_per_warp = (n_ge6 + warps_per_block - 1) / warps_per_block;
+  // Drain shared histogram (depths >= 4)
+  if (max_depth >= 5) {
+    const int rows_per_warp = (n_ge4 + warps_per_block - 1) / warps_per_block;
     for (int k = 0; k < rows_per_warp; ++k) {
-      const int node = 63 + rows_per_warp * block_warp + k;
+      const int node = 15 + rows_per_warp * block_warp + k;
       if (node < nodes_total) {
-        const int base = ((node - 63) * 2) * 32 + lane;
+        const int base = ((node - 15) * 2) * 32 + lane;
         const int64_t fsum = static_cast<int64_t>(sh_high[base + 0]);
         const int64_t csum = static_cast<int64_t>(sh_high[base + 32]);
         atomicAdd(Hptr(H, nodes_total, feat_set, node, 0, lane), (unsigned long long int)fsum);
@@ -360,7 +303,7 @@ static inline void infer_grid_stride(
 static inline int choose_warps_that_fit(size_t smem_high, size_t smem_cap) {
   int wpb = 16;
   while (wpb > 1) {
-    size_t smem_low = (size_t)wpb * 63 * 32 * sizeof(unsigned long long);
+    size_t smem_low = (size_t)wpb * 15 * 32 * sizeof(unsigned long long);
     if (smem_high + smem_low <= smem_cap) break;
     wpb >>= 1;
   }
@@ -381,9 +324,9 @@ torch::Tensor h_sm_optimized(
   auto opts = XS.options().dtype(torch::kLong).memory_format(c10::MemoryFormat::Contiguous);
   auto H = torch::zeros({XS.size(0), nodes_tot, 2, 32}, opts);
   
-  // Shared memory for depths >= 6
-  int n_ge6 = (max_depth >= 6) ? std::max((1 << max_depth) - 63, 1) : 1;
-  size_t smem_high = (size_t)n_ge6 * 2 * 32 * sizeof(int);
+  // Shared memory for depths >= 4
+  int n_ge4 = (max_depth >= 4) ? std::max((1 << max_depth) - 15, 1) : 1;
+  size_t smem_high = (size_t)n_ge4 * 2 * 32 * sizeof(int);
   
   auto* prop = at::cuda::getCurrentDeviceProperties();
   size_t smem_cap = prop->sharedMemPerBlockOptin ? (size_t)prop->sharedMemPerBlockOptin
@@ -396,8 +339,8 @@ torch::Tensor h_sm_optimized(
   dim3 grid(nfeatsets, blocks_per_feat, 1);
   dim3 block(warps_per_block * 32, 1, 1);
   
-  // Shared memory: high (depths >= 6) + low (depths 0-5 for reduction)
-  size_t smem_low = static_cast<size_t>(warps_per_block) * 63 * 32 * sizeof(unsigned long long);
+  // Shared memory: high (depths >= 4) + low (depths 0-3 for reduction)
+  size_t smem_low = static_cast<size_t>(warps_per_block) * 15 * 32 * sizeof(unsigned long long);
   size_t smem_bytes = smem_high + smem_low;
   
   TORCH_CHECK(smem_bytes <= smem_cap,
@@ -415,30 +358,30 @@ torch::Tensor h_sm_optimized(
   
   const auto lf_dt = LF.scalar_type();
   if (lf_dt == torch::kUInt16) {
-    cudaFuncSetAttribute(_h_sm_v3<uint16_t>,
+    cudaFuncSetAttribute(_h_sm_v3_lite<uint16_t>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
-    _h_sm_v3<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
+    _h_sm_v3_lite<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint16_t>(),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
       warps_per_block, stride, nodes_tot
     );
   } else if (lf_dt == torch::kUInt32) {
-    cudaFuncSetAttribute(_h_sm_v3<uint32_t>,
+    cudaFuncSetAttribute(_h_sm_v3_lite<uint32_t>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
-    _h_sm_v3<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
+    _h_sm_v3_lite<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint32_t>(),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
       warps_per_block, stride, nodes_tot
     );
   } else if (lf_dt == torch::kUInt64) {
-    cudaFuncSetAttribute(_h_sm_v3<uint64_t>,
+    cudaFuncSetAttribute(_h_sm_v3_lite<uint64_t>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
-    _h_sm_v3<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
+    _h_sm_v3_lite<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr, Y.data_ptr<int16_t>(), static_cast<uint64_t*>(LF.data_ptr()),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
