@@ -1,8 +1,8 @@
-// Vectorized + Branchless + Register Histograms (Depths 0-3)
+// Vectorized + Branchless + EXPLICIT Register Histograms
 // v1: Vectorized inner loop (4 bits/iteration)
 // v2: Branchless accumulation (depths 1-2)
-// v3_lite: Register histograms for depths 0-3 ONLY (15 nodes, 30 int64 registers)
-//          Conservative design for T4 and other register-limited GPUs
+// v3_explicit: Explicit scalar registers for depths 0-3 (NO ARRAYS!)
+//              Avoids stack frame allocation (192 bytes in v3_lite)
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -29,10 +29,10 @@ static __device__ __forceinline__ unsigned long long add_pack(unsigned long long
 }
  
 // ============================================================================
-// KERNEL: Vectorized + Branchless + Register Histograms (Depths 0-3 ONLY)
+// KERNEL: Vectorized + Branchless + EXPLICIT Register Histograms (Depths 0-3)
 // ============================================================================
 template <typename LF_T>
-__global__ void _h_sm_v3_lite(
+__global__ void _h_sm_v3_explicit(
     const uint32_t* __restrict__ XS,
     const int16_t* __restrict__ Y,
     const LF_T* __restrict__ LF,
@@ -51,21 +51,32 @@ __global__ void _h_sm_v3_lite(
   const int gwarp = warps_per_block * blockIdx.y + block_warp;
   
   // ========================================================================
-  // Register histograms for depths 0-3 ONLY (15 nodes, 30 int64 registers)
+  // EXPLICIT scalar registers for depths 0-3 (30 int64 registers, 0 bytes stack!)
   // ========================================================================
-  // Depth 0: 1 node
+  // Depth 0: 1 node (2 registers)
   int64_t hf0 = 0, hw0 = 0;
   
-  // Depth 1: 2 nodes
-  int64_t hf1[2] = {0}, hw1[2] = {0};
+  // Depth 1: 2 nodes (4 registers)
+  int64_t hf1_0 = 0, hw1_0 = 0;
+  int64_t hf1_1 = 0, hw1_1 = 0;
   
-  // Depth 2: 4 nodes
-  int64_t hf2[4] = {0}, hw2[4] = {0};
+  // Depth 2: 4 nodes (8 registers)
+  int64_t hf2_0 = 0, hw2_0 = 0;
+  int64_t hf2_1 = 0, hw2_1 = 0;
+  int64_t hf2_2 = 0, hw2_2 = 0;
+  int64_t hf2_3 = 0, hw2_3 = 0;
   
-  // Depth 3: 8 nodes
-  int64_t hf3[8] = {0}, hw3[8] = {0};
+  // Depth 3: 8 nodes (16 registers)
+  int64_t hf3_0 = 0, hw3_0 = 0;
+  int64_t hf3_1 = 0, hw3_1 = 0;
+  int64_t hf3_2 = 0, hw3_2 = 0;
+  int64_t hf3_3 = 0, hw3_3 = 0;
+  int64_t hf3_4 = 0, hw3_4 = 0;
+  int64_t hf3_5 = 0, hw3_5 = 0;
+  int64_t hf3_6 = 0, hw3_6 = 0;
+  int64_t hf3_7 = 0, hw3_7 = 0;
   
-  // Total: 15 nodes, 30 int64 registers (safe for T4!)
+  // Total: 30 int64 registers (same as v3_lite but NO STACK!)
   
   // Shared histogram for depths >= 4
   int n_ge4 = (max_depth >= 4) ? std::max((1 << max_depth) - 15, 1) : 1;
@@ -84,7 +95,7 @@ __global__ void _h_sm_v3_lite(
   __syncthreads();
   
   // ========================================================================
-  // MAIN LOOP: Process data with register histograms (depths 0-3)
+  // MAIN LOOP: Process data with EXPLICIT register histograms
   // ========================================================================
   for (int j = 0; j < stride; ++j) {
     const int base = 32 * (stride * gwarp + j);
@@ -141,38 +152,147 @@ __global__ void _h_sm_v3_lite(
         hw0 += v0 + v1 + v2 + v3;
         
         // Depth 1 - branchless
-        const int b0 = l0 & 1;
-        const int b1 = l1 & 1;
-        const int b2 = l2 & 1;
-        const int b3 = l3 & 1;
+        const int b1_0 = l0 & 1;
+        const int b1_1 = l1 & 1;
+        const int b1_2 = l2 & 1;
+        const int b1_3 = l3 & 1;
         
-        hf1[0] += add0 * (1 - b0) + add1 * (1 - b1) + add2 * (1 - b2) + add3 * (1 - b3);
-        hw1[0] += v0 * (1 - b0) + v1 * (1 - b1) + v2 * (1 - b2) + v3 * (1 - b3);
-        hf1[1] += add0 * b0 + add1 * b1 + add2 * b2 + add3 * b3;
-        hw1[1] += v0 * b0 + v1 * b1 + v2 * b2 + v3 * b3;
+        hf1_0 += add0 * (1 - b1_0) + add1 * (1 - b1_1) + add2 * (1 - b1_2) + add3 * (1 - b1_3);
+        hw1_0 += v0 * (1 - b1_0) + v1 * (1 - b1_1) + v2 * (1 - b1_2) + v3 * (1 - b1_3);
+        hf1_1 += add0 * b1_0 + add1 * b1_1 + add2 * b1_2 + add3 * b1_3;
+        hw1_1 += v0 * b1_0 + v1 * b1_1 + v2 * b1_2 + v3 * b1_3;
         
-        // Depth 2 - branchless indexing
+        // Depth 2 - branchless (4 nodes)
         const int idx2_0 = (l0 >> 1) & 3;
         const int idx2_1 = (l1 >> 1) & 3;
         const int idx2_2 = (l2 >> 1) & 3;
         const int idx2_3 = (l3 >> 1) & 3;
         
-        hf2[idx2_0] += add0; hw2[idx2_0] += v0;
-        hf2[idx2_1] += add1; hw2[idx2_1] += v1;
-        hf2[idx2_2] += add2; hw2[idx2_2] += v2;
-        hf2[idx2_3] += add3; hw2[idx2_3] += v3;
+        // Branchless updates for depth 2
+        const int b2_0_0 = (idx2_0 == 0);
+        const int b2_0_1 = (idx2_0 == 1);
+        const int b2_0_2 = (idx2_0 == 2);
+        const int b2_0_3 = (idx2_0 == 3);
         
-        // Depth 3 - branchless indexing (registers)
+        hf2_0 += add0 * b2_0_0; hw2_0 += v0 * b2_0_0;
+        hf2_1 += add0 * b2_0_1; hw2_1 += v0 * b2_0_1;
+        hf2_2 += add0 * b2_0_2; hw2_2 += v0 * b2_0_2;
+        hf2_3 += add0 * b2_0_3; hw2_3 += v0 * b2_0_3;
+        
+        const int b2_1_0 = (idx2_1 == 0);
+        const int b2_1_1 = (idx2_1 == 1);
+        const int b2_1_2 = (idx2_1 == 2);
+        const int b2_1_3 = (idx2_1 == 3);
+        
+        hf2_0 += add1 * b2_1_0; hw2_0 += v1 * b2_1_0;
+        hf2_1 += add1 * b2_1_1; hw2_1 += v1 * b2_1_1;
+        hf2_2 += add1 * b2_1_2; hw2_2 += v1 * b2_1_2;
+        hf2_3 += add1 * b2_1_3; hw2_3 += v1 * b2_1_3;
+        
+        const int b2_2_0 = (idx2_2 == 0);
+        const int b2_2_1 = (idx2_2 == 1);
+        const int b2_2_2 = (idx2_2 == 2);
+        const int b2_2_3 = (idx2_2 == 3);
+        
+        hf2_0 += add2 * b2_2_0; hw2_0 += v2 * b2_2_0;
+        hf2_1 += add2 * b2_2_1; hw2_1 += v2 * b2_2_1;
+        hf2_2 += add2 * b2_2_2; hw2_2 += v2 * b2_2_2;
+        hf2_3 += add2 * b2_2_3; hw2_3 += v2 * b2_2_3;
+        
+        const int b2_3_0 = (idx2_3 == 0);
+        const int b2_3_1 = (idx2_3 == 1);
+        const int b2_3_2 = (idx2_3 == 2);
+        const int b2_3_3 = (idx2_3 == 3);
+        
+        hf2_0 += add3 * b2_3_0; hw2_0 += v3 * b2_3_0;
+        hf2_1 += add3 * b2_3_1; hw2_1 += v3 * b2_3_1;
+        hf2_2 += add3 * b2_3_2; hw2_2 += v3 * b2_3_2;
+        hf2_3 += add3 * b2_3_3; hw2_3 += v3 * b2_3_3;
+        
+        // ================================================================
+        // Depth 3 - EXPLICIT branchless (8 nodes, NO ARRAY!)
+        // ================================================================
         if (max_depth >= 4) {
           const int idx3_0 = (l0 >> 3) & 7;
           const int idx3_1 = (l1 >> 3) & 7;
           const int idx3_2 = (l2 >> 3) & 7;
           const int idx3_3 = (l3 >> 3) & 7;
           
-          hf3[idx3_0] += add0; hw3[idx3_0] += v0;
-          hf3[idx3_1] += add1; hw3[idx3_1] += v1;
-          hf3[idx3_2] += add2; hw3[idx3_2] += v2;
-          hf3[idx3_3] += add3; hw3[idx3_3] += v3;
+          // Process sample 0
+          const int b3_0_0 = (idx3_0 == 0);
+          const int b3_0_1 = (idx3_0 == 1);
+          const int b3_0_2 = (idx3_0 == 2);
+          const int b3_0_3 = (idx3_0 == 3);
+          const int b3_0_4 = (idx3_0 == 4);
+          const int b3_0_5 = (idx3_0 == 5);
+          const int b3_0_6 = (idx3_0 == 6);
+          const int b3_0_7 = (idx3_0 == 7);
+          
+          hf3_0 += add0 * b3_0_0; hw3_0 += v0 * b3_0_0;
+          hf3_1 += add0 * b3_0_1; hw3_1 += v0 * b3_0_1;
+          hf3_2 += add0 * b3_0_2; hw3_2 += v0 * b3_0_2;
+          hf3_3 += add0 * b3_0_3; hw3_3 += v0 * b3_0_3;
+          hf3_4 += add0 * b3_0_4; hw3_4 += v0 * b3_0_4;
+          hf3_5 += add0 * b3_0_5; hw3_5 += v0 * b3_0_5;
+          hf3_6 += add0 * b3_0_6; hw3_6 += v0 * b3_0_6;
+          hf3_7 += add0 * b3_0_7; hw3_7 += v0 * b3_0_7;
+          
+          // Process sample 1
+          const int b3_1_0 = (idx3_1 == 0);
+          const int b3_1_1 = (idx3_1 == 1);
+          const int b3_1_2 = (idx3_1 == 2);
+          const int b3_1_3 = (idx3_1 == 3);
+          const int b3_1_4 = (idx3_1 == 4);
+          const int b3_1_5 = (idx3_1 == 5);
+          const int b3_1_6 = (idx3_1 == 6);
+          const int b3_1_7 = (idx3_1 == 7);
+          
+          hf3_0 += add1 * b3_1_0; hw3_0 += v1 * b3_1_0;
+          hf3_1 += add1 * b3_1_1; hw3_1 += v1 * b3_1_1;
+          hf3_2 += add1 * b3_1_2; hw3_2 += v1 * b3_1_2;
+          hf3_3 += add1 * b3_1_3; hw3_3 += v1 * b3_1_3;
+          hf3_4 += add1 * b3_1_4; hw3_4 += v1 * b3_1_4;
+          hf3_5 += add1 * b3_1_5; hw3_5 += v1 * b3_1_5;
+          hf3_6 += add1 * b3_1_6; hw3_6 += v1 * b3_1_6;
+          hf3_7 += add1 * b3_1_7; hw3_7 += v1 * b3_1_7;
+          
+          // Process sample 2
+          const int b3_2_0 = (idx3_2 == 0);
+          const int b3_2_1 = (idx3_2 == 1);
+          const int b3_2_2 = (idx3_2 == 2);
+          const int b3_2_3 = (idx3_2 == 3);
+          const int b3_2_4 = (idx3_2 == 4);
+          const int b3_2_5 = (idx3_2 == 5);
+          const int b3_2_6 = (idx3_2 == 6);
+          const int b3_2_7 = (idx3_2 == 7);
+          
+          hf3_0 += add2 * b3_2_0; hw3_0 += v2 * b3_2_0;
+          hf3_1 += add2 * b3_2_1; hw3_1 += v2 * b3_2_1;
+          hf3_2 += add2 * b3_2_2; hw3_2 += v2 * b3_2_2;
+          hf3_3 += add2 * b3_2_3; hw3_3 += v2 * b3_2_3;
+          hf3_4 += add2 * b3_2_4; hw3_4 += v2 * b3_2_4;
+          hf3_5 += add2 * b3_2_5; hw3_5 += v2 * b3_2_5;
+          hf3_6 += add2 * b3_2_6; hw3_6 += v2 * b3_2_6;
+          hf3_7 += add2 * b3_2_7; hw3_7 += v2 * b3_2_7;
+          
+          // Process sample 3
+          const int b3_3_0 = (idx3_3 == 0);
+          const int b3_3_1 = (idx3_3 == 1);
+          const int b3_3_2 = (idx3_3 == 2);
+          const int b3_3_3 = (idx3_3 == 3);
+          const int b3_3_4 = (idx3_3 == 4);
+          const int b3_3_5 = (idx3_3 == 5);
+          const int b3_3_6 = (idx3_3 == 6);
+          const int b3_3_7 = (idx3_3 == 7);
+          
+          hf3_0 += add3 * b3_3_0; hw3_0 += v3 * b3_3_0;
+          hf3_1 += add3 * b3_3_1; hw3_1 += v3 * b3_3_1;
+          hf3_2 += add3 * b3_3_2; hw3_2 += v3 * b3_3_2;
+          hf3_3 += add3 * b3_3_3; hw3_3 += v3 * b3_3_3;
+          hf3_4 += add3 * b3_3_4; hw3_4 += v3 * b3_3_4;
+          hf3_5 += add3 * b3_3_5; hw3_5 += v3 * b3_3_5;
+          hf3_6 += add3 * b3_3_6; hw3_6 += v3 * b3_3_6;
+          hf3_7 += add3 * b3_3_7; hw3_7 += v3 * b3_3_7;
         }
         
         // Depths >= 4: use shared memory atomics
@@ -210,27 +330,28 @@ __global__ void _h_sm_v3_lite(
   }
   
   // ========================================================================
-  // Write register histograms to shared memory for reduction
+  // Write EXPLICIT register histograms to shared memory for reduction
   // ========================================================================
   const int low_nodes = 15;  // Depths 0-3
   
   // Pack and write to shared low area
-  int nd = 0;
-  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf0), static_cast<int>(hw0));
-  nd++;
-  
-  for (int i = 0; i < 2; ++i, ++nd) {
-    sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf1[i]), static_cast<int>(hw1[i]));
-  }
-  
-  for (int i = 0; i < 4; ++i, ++nd) {
-    sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf2[i]), static_cast<int>(hw2[i]));
-  }
+  sh_low[(block_warp * low_nodes + 0) * 32 + lane] = pack_sc(static_cast<int>(hf0), static_cast<int>(hw0));
+  sh_low[(block_warp * low_nodes + 1) * 32 + lane] = pack_sc(static_cast<int>(hf1_0), static_cast<int>(hw1_0));
+  sh_low[(block_warp * low_nodes + 2) * 32 + lane] = pack_sc(static_cast<int>(hf1_1), static_cast<int>(hw1_1));
+  sh_low[(block_warp * low_nodes + 3) * 32 + lane] = pack_sc(static_cast<int>(hf2_0), static_cast<int>(hw2_0));
+  sh_low[(block_warp * low_nodes + 4) * 32 + lane] = pack_sc(static_cast<int>(hf2_1), static_cast<int>(hw2_1));
+  sh_low[(block_warp * low_nodes + 5) * 32 + lane] = pack_sc(static_cast<int>(hf2_2), static_cast<int>(hw2_2));
+  sh_low[(block_warp * low_nodes + 6) * 32 + lane] = pack_sc(static_cast<int>(hf2_3), static_cast<int>(hw2_3));
   
   if (max_depth >= 4) {
-    for (int i = 0; i < 8; ++i, ++nd) {
-      sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf3[i]), static_cast<int>(hw3[i]));
-    }
+    sh_low[(block_warp * low_nodes + 7) * 32 + lane] = pack_sc(static_cast<int>(hf3_0), static_cast<int>(hw3_0));
+    sh_low[(block_warp * low_nodes + 8) * 32 + lane] = pack_sc(static_cast<int>(hf3_1), static_cast<int>(hw3_1));
+    sh_low[(block_warp * low_nodes + 9) * 32 + lane] = pack_sc(static_cast<int>(hf3_2), static_cast<int>(hw3_2));
+    sh_low[(block_warp * low_nodes + 10) * 32 + lane] = pack_sc(static_cast<int>(hf3_3), static_cast<int>(hw3_3));
+    sh_low[(block_warp * low_nodes + 11) * 32 + lane] = pack_sc(static_cast<int>(hf3_4), static_cast<int>(hw3_4));
+    sh_low[(block_warp * low_nodes + 12) * 32 + lane] = pack_sc(static_cast<int>(hf3_5), static_cast<int>(hw3_5));
+    sh_low[(block_warp * low_nodes + 13) * 32 + lane] = pack_sc(static_cast<int>(hf3_6), static_cast<int>(hw3_6));
+    sh_low[(block_warp * low_nodes + 14) * 32 + lane] = pack_sc(static_cast<int>(hf3_7), static_cast<int>(hw3_7));
   }
   
   // Butterfly reduction for register depths (0-3)
@@ -358,30 +479,30 @@ torch::Tensor h_sm_optimized(
   
   const auto lf_dt = LF.scalar_type();
   if (lf_dt == torch::kUInt16) {
-    cudaFuncSetAttribute(_h_sm_v3_lite<uint16_t>,
+    cudaFuncSetAttribute(_h_sm_v3_explicit<uint16_t>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
-    _h_sm_v3_lite<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
+    _h_sm_v3_explicit<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint16_t>(),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
       warps_per_block, stride, nodes_tot
     );
   } else if (lf_dt == torch::kUInt32) {
-    cudaFuncSetAttribute(_h_sm_v3_lite<uint32_t>,
+    cudaFuncSetAttribute(_h_sm_v3_explicit<uint32_t>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
-    _h_sm_v3_lite<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
+    _h_sm_v3_explicit<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint32_t>(),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
       warps_per_block, stride, nodes_tot
     );
   } else if (lf_dt == torch::kUInt64) {
-    cudaFuncSetAttribute(_h_sm_v3_lite<uint64_t>,
+    cudaFuncSetAttribute(_h_sm_v3_explicit<uint64_t>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
-    _h_sm_v3_lite<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
+    _h_sm_v3_explicit<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr, Y.data_ptr<int16_t>(), static_cast<uint64_t*>(LF.data_ptr()),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
