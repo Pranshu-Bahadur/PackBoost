@@ -209,7 +209,7 @@ static inline int choose_warps_that_fit_simple(int max_depth, size_t smem_cap) {
     return std::max(wpb, 1);
 }
 
-torch::Tensor h_sm(
+torch::Tensor h_sm_2(
     torch::Tensor XS,
     torch::Tensor Y,
     torch::Tensor LF,
