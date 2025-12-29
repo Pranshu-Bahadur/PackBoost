@@ -62,6 +62,12 @@ torch::Tensor h_sm(
     torch::Tensor LF,
     int max_depth);
 
+torch::Tensor h_sm_2(
+    torch::Tensor XS,
+    torch::Tensor Y,
+    torch::Tensor LF,
+    int max_depth);
+
 torch::Tensor h_sm_optimized(
     torch::Tensor XS,
     torch::Tensor Y,
@@ -201,4 +207,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "PackBoost advance_and_predict (CUDA)");
 
     m.def("h_sm_optimized", &h_sm_optimized, "Optimized histogram kernel (CUDA)");
+
+   m.def("h_sm_2", &h_sm_2, "PackBoost H Optimized (trying!)");
 }
