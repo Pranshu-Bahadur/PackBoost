@@ -256,19 +256,19 @@ torch::Tensor h_sm_2(
     };
 
     if (lf_dt == torch::kUInt16) {
-        set_attr(_h_sm<uint16_t>);
+        set_attr(_h_sm_2<uint16_t>);
         _h_sm_2<uint16_t><<<grid, block, smem_bytes, stream>>>(
             XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint16_t>(),
             H.data_ptr<int64_t>(), nfeatsets, cols_32M, N, max_depth,
             warps_per_block, stride, nodes_tot);
     } else if (lf_dt == torch::kUInt32) {
-        set_attr(_h_sm<uint32_t>);
+        set_attr(_h_sm_2<uint32_t>);
         _h_sm_2<uint32_t><<<grid, block, smem_bytes, stream>>>(
             XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint32_t>(),
             H.data_ptr<int64_t>(), nfeatsets, cols_32M, N, max_depth,
             warps_per_block, stride, nodes_tot);
     } else if (lf_dt == torch::kUInt64) {
-        set_attr(_h_sm<uint64_t>);
+        set_attr(_h_sm_2<uint64_t>);
         _h_sm_2<uint64_t><<<grid, block, smem_bytes, stream>>>(
             XS_ptr, Y.data_ptr<int16_t>(), reinterpret_cast<const uint64_t*>(LF.data_ptr()),
             H.data_ptr<int64_t>(), nfeatsets, cols_32M, N, max_depth,
