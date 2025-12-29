@@ -67,8 +67,8 @@ __global__ void _h_sm_2(
   #pragma unroll
   for (int i = 0; i < n_ge3_safe; ++i) {
     const int base_idx = ((block_warp * n_ge3_safe + i) * 2 + 0) * 32 + lane;
-    sh_high[base_idx + 0] = 0; // sum
-    sh_high[base_idx + 32] = 0; // count (chan=1 is +32)
+    sh_high[base_idx + 0] = 0; // sum (chan=0)
+    sh_high[base_idx + 32] = 0; // count (chan=1)
   }
   __syncthreads();
 
@@ -101,7 +101,7 @@ __global__ void _h_sm_2(
       else                valid_mask = 0u;
       xfd_local &= valid_mask;
 
-      const unsigned mask = __activemask(); // or __ballot_sync(__activemask(), true)
+      const unsigned mask = __activemask();
 
       for (int k = 0; k < 32; ++k) {
         // consume one bit per iter (per-lane)
@@ -188,26 +188,22 @@ __global__ void _h_sm_2(
 
   __syncthreads();
 
-  // Drain shared histogram (d >= 3) — now safe: per-warp partition
+  // Drain shared histogram (d >= 3) — each warp owns a contiguous block
   const int rows_per_warp = (n_ge3_safe + warps_per_block - 1) / warps_per_block;
   for (int k = 0; k < rows_per_warp; ++k) {
-    const int node = 7 + rows_per_warp * block_warp + k;
+    const int node = 7 + block_warp * rows_per_warp + k;
     if (node < nodes_total) {
-      // Map node back to warp-local idx
-      const int global_idx = node - 7;
-      const int owner_warp = global_idx / rows_per_warp;
-      const int local_idx = global_idx % rows_per_warp;
-
-      // But simpler: each warp owns contiguous block
-      const int base_node = 7 + block_warp * rows_per_warp;
-      const int node_local = node - base_node; // should == k
-
-      if (node_local == k && node_local < n_ge3_safe) {
-        const int flat_idx = ((block_warp * n_ge3_safe + node_local) * 2) * 32 + lane;
-        const int64_t fsum = static_cast<int64_t>(sh_high[flat_idx + 0]);
-        const int64_t csum = static_cast<int64_t>(sh_high[flat_idx + 32]);
-        atomicAdd(Hptr(H, nodes_total, feat_set, node, 0, lane), (unsigned long long int)fsum);
-        atomicAdd(Hptr(H, nodes_total, feat_set, node, 1, lane), (unsigned long long int)csum);
+      const int local_idx = node - 7;
+      // Only this warp owns nodes [7 + block_warp*rows_per_warp, ...)
+      if (local_idx >= block_warp * rows_per_warp && local_idx < (block_warp + 1) * rows_per_warp) {
+        const int idx_in_warp = local_idx - block_warp * rows_per_warp; // == k
+        if (idx_in_warp < n_ge3_safe) {
+          const int flat_idx = ((block_warp * n_ge3_safe + idx_in_warp) * 2) * 32 + lane;
+          const int64_t fsum = static_cast<int64_t>(sh_high[flat_idx + 0]);
+          const int64_t csum = static_cast<int64_t>(sh_high[flat_idx + 32]);
+          atomicAdd(Hptr(H, nodes_total, feat_set, node, 0, lane), (unsigned long long int)fsum);
+          atomicAdd(Hptr(H, nodes_total, feat_set, node, 1, lane), (unsigned long long int)csum);
+        }
       }
     }
   }
@@ -240,15 +236,16 @@ static inline void infer_grid_stride(
   stride_out = stride;
 }
 
-static inline int choose_warps_that_fit(size_t smem_high, size_t smem_low, size_t smem_cap) {
+static inline int choose_warps_that_fit(int max_depth, size_t smem_cap) {
+  const int n_ge3 = std::max((1 << max_depth) - 8, 1);
   int wpb = 16;
   while (wpb > 1) {
-    size_t needed = smem_high + smem_low;
-    if (needed <= smem_cap) break;
+    size_t smem_high = static_cast<size_t>(wpb) * n_ge3 * 2 * 32 * sizeof(int);
+    size_t smem_low = static_cast<size_t>(wpb) * 7 * 32 * sizeof(unsigned long long);
+    size_t offset_low = (smem_high + 7ULL) & ~7ULL;
+    size_t total = offset_low + smem_low;
+    if (total <= smem_cap) break;
     wpb >>= 1;
-    // Recompute with new wpb
-    smem_high = static_cast<size_t>(wpb) * std::max((1 << 7) - 8, 1) * 2 * 32 * sizeof(int); // worst-case max_depth=8
-    smem_low = static_cast<size_t>(wpb) * 7 * 32 * sizeof(unsigned long long);
   }
   return (wpb < 1) ? 1 : wpb;
 }
@@ -259,17 +256,20 @@ torch::Tensor h_sm_2(
     torch::Tensor LF,
     int max_depth)
 {
+  TORCH_CHECK(max_depth >= 1 && max_depth <= 8, "max_depth must be between 1 and 8");
   const int nfeatsets = static_cast<int>(XS.size(0));
   const int cols_32M = static_cast<int>(XS.size(1));
   const int N = static_cast<int>(Y.size(0));
   const int nodes_tot = (1 << max_depth) - 1;
 
   auto opts = XS.options().dtype(torch::kLong).memory_format(c10::MemoryFormat::Contiguous);
-  auto H = torch::zeros({XS.size(0), nodes_tot, 2, 32}, opts);
+  auto H = torch::zeros({nfeatsets, nodes_tot, 2, 32}, opts);
 
-  TORCH_CHECK(Y.scalar_type() == torch::kInt16, "Y must be int16");
-  TORCH_CHECK(XS.scalar_type() == torch::kUInt32 || XS.scalar_type() == torch::kInt32,
-              "XS must be uint32/int32");
+  TORCH_CHECK(Y.scalar_type() == torch::kInt16, "Y must be int16 (got ", Y.scalar_type(), ")");
+  TORCH_CHECK(
+    XS.scalar_type() == torch::kUInt32 || XS.scalar_type() == torch::kInt32,
+    "XS must be uint32/int32 (got ", XS.scalar_type(), ")"
+  );
 
   const uint32_t* XS_ptr = reinterpret_cast<const uint32_t*>(XS.data_ptr());
 
@@ -277,15 +277,12 @@ torch::Tensor h_sm_2(
   size_t smem_cap = prop->sharedMemPerBlockOptin ? (size_t)prop->sharedMemPerBlockOptin
                                                  : (size_t)prop->sharedMemPerBlock;
 
-  // Compute shared memory sizes (worst-case for max_depth=8)
   const int n_ge3 = std::max((1 << max_depth) - 8, 1);
-  size_t smem_high = static_cast<size_t>(16) * n_ge3 * 2 * 32 * sizeof(int); // try wpb=16
-  size_t smem_low = static_cast<size_t>(16) * 7 * 32 * sizeof(unsigned long long);
-  int warps_per_block = choose_warps_that_fit(smem_high, smem_low, smem_cap);
+  int warps_per_block = choose_warps_that_fit(max_depth, smem_cap);
 
-  // Recompute exact sizes
-  smem_high = static_cast<size_t>(warps_per_block) * n_ge3 * 2 * 32 * sizeof(int);
-  smem_low = static_cast<size_t>(warps_per_block) * 7 * 32 * sizeof(unsigned long long);
+  // Recompute exact shared memory size
+  size_t smem_high = static_cast<size_t>(warps_per_block) * n_ge3 * 2 * 32 * sizeof(int);
+  size_t smem_low = static_cast<size_t>(warps_per_block) * 7 * 32 * sizeof(unsigned long long);
   size_t offset_low = (smem_high + 7ULL) & ~7ULL;
   size_t smem_bytes = offset_low + smem_low;
 
@@ -301,29 +298,47 @@ torch::Tensor h_sm_2(
   auto stream = at::cuda::getCurrentCUDAStream();
   const auto lf_dt = LF.scalar_type();
 
-  auto launch = [&](auto kernel_func) {
-    cudaFuncSetAttribute(kernel_func,
+  if (lf_dt == torch::kUInt16) {
+    cudaFuncSetAttribute(_h_sm_2<uint16_t>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
-    kernel_func<<<grid, block, smem_bytes, stream.stream()>>>(
+    _h_sm_2<uint16_t><<<grid, block, smem_bytes, stream>>>(
       XS_ptr,
       Y.data_ptr<int16_t>(),
-      LF.data_ptr<typename std::remove_pointer<decltype(LF.data_ptr())>::type>(),
+      LF.data_ptr<uint16_t>(),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
       warps_per_block, stride, nodes_tot
     );
-  };
-
-  if (lf_dt == torch::kUInt16) {
-    launch(_h_sm_2<uint16_t>);
   } else if (lf_dt == torch::kUInt32) {
-    launch(_h_sm_2<uint32_t>);
+    cudaFuncSetAttribute(_h_sm_2<uint32_t>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem_bytes));
+    _h_sm_2<uint32_t><<<grid, block, smem_bytes, stream>>>(
+      XS_ptr,
+      Y.data_ptr<int16_t>(),
+      LF.data_ptr<uint32_t>(),
+      H.data_ptr<int64_t>(),
+      nfeatsets, cols_32M, N, max_depth,
+      warps_per_block, stride, nodes_tot
+    );
   } else if (lf_dt == torch::kUInt64) {
-    launch(_h_sm_2<uint64_t>);
+    cudaFuncSetAttribute(_h_sm_2<uint64_t>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem_bytes));
+    _h_sm_2<uint64_t><<<grid, block, smem_bytes, stream>>>(
+      XS_ptr,
+      Y.data_ptr<int16_t>(),
+      LF.data_ptr<uint64_t>(),
+      H.data_ptr<int64_t>(),
+      nfeatsets, cols_32M, N, max_depth,
+      warps_per_block, stride, nodes_tot
+    );
   } else {
-    TORCH_CHECK(false, "LF must be one of: uint16, uint32, uint64");
+    TORCH_CHECK(false, "LF must be one of: uint16, uint32, uint64 (got ", lf_dt, ")");
   }
+
+  C10_CUDA_KERNEL_LAUNCH_CHECK(); // Optional: check for kernel launch errors
 
   return H;
 }
