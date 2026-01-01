@@ -52,9 +52,9 @@ __global__ void advance_and_predict_kernel(
     }
 
     size_t idx = (size_t)(2 * lo + 1 - (int)bit); //updated
-    if (idx >= (size_t)(2 * nodes)) {
-      idx = (size_t)(2 * nodes) - 1;
-    }
+  //  if (idx >= (size_t)(2 * nodes)) {
+  //     idx = (size_t)(2 * nodes) - 1;
+  //    }
     const int add = V[Vbase + idx];
     atomicAdd(&P[k], add);
   }
