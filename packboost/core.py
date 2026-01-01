@@ -64,7 +64,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         
         if hasattr(Yv, 'to_numpy'): # polars or pandas
             Yv=Yv.to_numpy() # the simplest conversion 
-        Yv=Yv.flatten() # Handles Dataset Column
+        if hasattr(Yv, 'flatten'): Yv=Yv.flatten() # Handles Dataset Column
     
         assert X.shape[0]==y.shape[0],'X and y must have the same length !'
         if Xv is not None: assert Xv.shape[0]==Yv.shape[0],'Xv and yv must have the same length !'
