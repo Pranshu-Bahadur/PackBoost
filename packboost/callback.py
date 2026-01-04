@@ -42,11 +42,11 @@ class EarlyStoppingCallback:
     
     def __init__(
         self,
-        patience: int = 100,
+        patience: int = 5,
         keep_best: bool = True,
         metric_fn: Optional[Callable[[np.ndarray, np.ndarray], float]] = None,
         mode: Literal["min", "max"] = "max",
-        eval_every: int = 1,
+        eval_every: int = 100,
         verbose: bool = True,
        
     ) -> None:
