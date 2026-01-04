@@ -5,8 +5,6 @@ from sklearn.metrics import mean_squared_error
 from typing import Optional, Callable, Dict, Any, Literal
 
 
-Q30 = 1 << 30
-
 class EarlyStoppingCallback:
     """
     Callback for early stopping during model training based on validation metrics.
