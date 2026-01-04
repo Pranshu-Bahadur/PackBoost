@@ -4,6 +4,23 @@ import torch
 from sklearn.metrics import mean_squared_error
 from typing import Optional, Callable, Dict, Any, Literal
 
+Q30 = 1 << 30
+
+def corr_metric(a, b):
+    # Helper to calc correlation on Q30 preds vs float targets
+    if a is None or b is None: return 0.0
+    # Decode Q30
+    if torch.is_tensor(a): a = a.detach().cpu().float().numpy()
+    a = a.ravel() / Q30
+
+    # Targets
+    if torch.is_tensor(b): b = b.detach().cpu().float().numpy()
+    b = b.ravel()
+
+    # Trim
+    n = min(len(a), len(b))
+    if n == 0: return 0.0
+    return np.corrcoef(a[:n], b[:n])[0, 1]
 
 class EarlyStoppingCallback:
     """
@@ -28,7 +45,7 @@ class EarlyStoppingCallback:
         patience: int = 100,
         keep_best: bool = True,
         metric_fn: Optional[Callable[[np.ndarray, np.ndarray], float]] = None,
-        mode: Literal["min", "max"] = "min",
+        mode: Literal["min", "max"] = "max",
         eval_every: int = 1,
         verbose: bool = True,
        
@@ -43,9 +60,9 @@ class EarlyStoppingCallback:
         self.inv_scale = 1.0 / float(1 << 30)
 
         if metric_fn is None:
-            # Default metric: MSE (lower is better)
+            # Default metric: Correlation (higher is better)
             def metric_fn_numpy(y_true, y_pred):
-                return mean_squared_error(y_true, y_pred)
+                return corr_metric(y_true, y_pred)
             self.metric_fn = metric_fn_numpy
         else:
             self.metric_fn = metric_fn
@@ -165,3 +182,38 @@ class EarlyStoppingCallback:
     
         if self.verbose:
             print(f"✓ Restored best model from round {self.best_tree_set}")
+
+
+class LoggingCallback:
+    def __init__(self, frequency=500):
+        self.frequency = frequency
+        self.t0 = time.time()
+        self.t = self.t0
+
+    def _corr(self, a, b):
+        return corr_metric(a, b)
+
+    def __call__(self, booster):
+        r = getattr(booster, "tree_set", 0) + 1
+        if r % self.frequency != 0 and r != 1: return
+
+        # Train Corr
+        P = getattr(booster, "P_", None)
+        Y = getattr(booster, "Y", None) or getattr(booster, "dY", None)
+        # Handle slice
+        N_tr = getattr(booster, "train_N", None)
+        if N_tr and P is not None: P = P[:N_tr]
+        if N_tr and Y is not None: Y = Y[:N_tr]
+        tr_corr = self._corr(P, Y)
+
+        # Val Corr
+        Pv = getattr(booster, "Pv_", None)
+        Yv = getattr(booster, "Yv", None)
+        # Handle slice
+        N_val = getattr(booster, "val_N", None)
+        if N_val and Pv is not None: Pv = Pv[:N_val]
+        val_corr = self._corr(Pv, Yv)
+
+        dt = time.time() - self.t
+        print(f"Round {r}: Train {tr_corr:.5f} | Val {val_corr:.5f} | {dt:.2f}s")
+        self.t = time.time()
