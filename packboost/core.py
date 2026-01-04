@@ -8,6 +8,7 @@ import os
 print('Installing kernels...')
 from packboost.cuda import kernels
 print('kernels successfully Installed!')
+from packboost.callback import EarlyStoppingCallback
 
 
 class PackBoost(BaseEstimator, RegressorMixin):
@@ -281,6 +282,13 @@ class PackBoost(BaseEstimator, RegressorMixin):
             del XS, LE, G, LF
             if device.type == "cuda" and (t % 256 == 255):
                 torch.cuda.empty_cache()
+
+        
+        # ---------- restore best model if early stopping was used ----------
+        for cb in callbacks:
+            if isinstance(cb, EarlyStoppingCallback) and cb.keep_best:
+                cb.restore_best(self)
+                break
 
         # ---------- stash for inference ----------
         self.FST  = FST
