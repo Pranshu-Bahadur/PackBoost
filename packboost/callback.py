@@ -97,7 +97,7 @@ class EarlyStoppingCallback:
         
         Args:
             model: The model being trained. Expected to have attributes:
-                   - Yv_i32: Validation labels in Q30 fixed-point format.
+                   - Yv: Validation labels.
                    - Pv_: Validation predictions in Q30 fixed-point format.
                    - tree_set: Current training round number.
                    - V, I: Model parameters to save when keep_best=True.
@@ -113,15 +113,21 @@ class EarlyStoppingCallback:
                 return
 
             # Require validation labels/preds
-            if not (hasattr(model, "Yv_i32") and hasattr(model, "Pv_")):
+            if not (hasattr(model, "Yv") and hasattr(model, "Pv_")):
                 return
 
-            # Convert to float and back from Q30
-            Yv_f = model.Yv_i32.to(torch.float32).cpu().numpy() * self.inv_scale
-            Pv_f = model.Pv_.to(torch.float32).cpu().numpy() * self.inv_scale
+            # Get validation labels and predictions
+            Yv = model.Yv
+            Pv = model.Pv_
+            
+            # Handle slice if needed
+            N_val = getattr(model, "val_N", None)
+            if N_val is not None:
+                if Pv is not None: Pv = Pv[:N_val]
+                if Yv is not None: Yv = Yv[:N_val]
 
-            # Compute score
-            current_score = self.metric_fn(Yv_f, Pv_f)
+            # Compute score (corr_metric handles Q30 decoding internally)
+            current_score = self.metric_fn(Pv, Yv)
             if isinstance(current_score, torch.Tensor):
                 current_score = float(current_score.item())
 
