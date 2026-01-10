@@ -173,17 +173,28 @@ __global__ void _h_sm(
   for (int tmp = warps_per_block; tmp > 1; tmp >>= 1) ++log_wpb;
   
   // Butterfly reduction for low depths
-  for (int s = 0; s < log_wpb; ++s) {
-    __syncthreads();
-    const int ofs = 1 << s;
-    if ((block_warp & ofs) == 0 && (block_warp + ofs) < warps_per_block) {
-      for (int ndi = 0; ndi < low_nodes; ++ndi) {
-        const int idx = (block_warp * low_nodes + ndi) * 32 + lane;
-        const int idx_p = ((block_warp + ofs) * low_nodes + ndi) * 32 + lane;
-        sh_low[idx] = add_pack(sh_low[idx], sh_low[idx_p]);
-      }
+  //for (int s = 0; s < log_wpb; ++s) {
+   // __syncthreads();
+   // const int ofs = 1 << s;
+   // if ((block_warp & ofs) == 0 && (block_warp + ofs) < warps_per_block) {
+   //   for (int ndi = 0; ndi < low_nodes; ++ndi) {
+   //     const int idx = (block_warp * low_nodes + ndi) * 32 + lane;
+  //      const int idx_p = ((block_warp + ofs) * low_nodes + ndi) * 32 + lane;
+ //       sh_low[idx] = add_pack(sh_low[idx], sh_low[idx_p]);
+ //     }
+ //   }
+ // }
+
+// Only let warp 0 perform the entire reduction sequentially
+if (block_warp == 0) {
+    for (int src_warp = 1; src_warp < warps_per_block; ++src_warp) {
+        for (int ndi = 0; ndi < low_nodes; ++ndi) {
+            const int idx_dst = (0 * low_nodes + ndi) * 32 + lane;
+            const int idx_src = (src_warp * low_nodes + ndi) * 32 + lane;
+            sh_low[idx_dst] = add_pack(sh_low[idx_dst], sh_low[idx_src]);
+        }
     }
-  }
+}
   
   // Write reduced low-depth values to global (from warp 0 only, unpacked)
   __syncthreads();
