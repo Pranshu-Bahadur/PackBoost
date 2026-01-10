@@ -2,7 +2,7 @@
 // Fully optimized histogram kernel for maximum performance
 // Key optimizations:
 // 1. Coalesced global memory layout: [nfeatsets, nodes, 32, 2] intermediate
-// 2. Padding to eliminate shared memory bank conflicts
+// 2. Dynamic padding: Stride 33 (fast) if mem allows, Stride 32 (compact) fallback
 // 3. Reduced register pressure via periodic flushing
 // 4. Warp-level atomic coalescing
 
@@ -11,14 +11,13 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <vector>
+#include <algorithm>
 
 // ============================================================================
 // COALESCED MEMORY LAYOUT HELPERS
 // ============================================================================
 
 // NEW LAYOUT: H[nfeatsets, nodes, 32, 2] - lanes are consecutive
-// This ensures all 32 lanes in a warp hit consecutive addresses (coalesced)
-// We use this layout for the kernel, then transpose at the end if needed.
 static inline __device__ int64_t* Hptr_coalesced(
     int64_t* H, int nodes,
     int feat, int node, int lane, int chan) 
@@ -47,19 +46,20 @@ __device__ __forceinline__ unsigned long long add_pack(unsigned long long a, uns
 // ============================================================================
 
 template <typename LF_T>
-__global__ void __launch_bounds__(256, 4)  // Optimize for 4 blocks/SM
+__global__ void __launch_bounds__(256, 4)
 _h_sm(
     const uint32_t* __restrict__ XS,  // [nfeatsets, cols_32M]
     const int16_t* __restrict__ Y,    // [N]
     const LF_T* __restrict__ LF,      // [nfeatsets, N]
-    int64_t* __restrict__ H,          // [nfeatsets, nodes, 32, 2] - NEW LAYOUT
+    int64_t* __restrict__ H,          // [nfeatsets, nodes, 32, 2]
     int nfeatsets,
     int cols_32M,
     int N,
     int max_depth,
     int warps_per_block,
     int stride,
-    int nodes_total)
+    int nodes_total,
+    int sh_high_stride)               // Passed dynamically (32 or 33)
 {
     const int feat_set = blockIdx.x;
     const int block_warp = threadIdx.x >> 5;
@@ -68,25 +68,29 @@ _h_sm(
     
     if (feat_set >= nfeatsets) return;
     
-    // REDUCED REGISTER PRESSURE: Use int32 accumulators (56 bytes/thread vs 112)
+    // REDUCED REGISTER PRESSURE: Use int32 accumulators
     int hf0 = 0, hw0 = 0;
     int hf10 = 0, hf11 = 0, hw10 = 0, hw11 = 0;
     int hf20 = 0, hf21 = 0, hf22 = 0, hf23 = 0;
     int hw20 = 0, hw21 = 0, hw22 = 0, hw23 = 0;
     
-    // BANK-CONFLICT-FREE SHARED MEMORY
+    // SHARED MEMORY
     int n_ge3 = (1 << max_depth) - 8;
     if (n_ge3 < 1) n_ge3 = 1;
     
     extern __shared__ int shmem[];
     
-    // Layout: [n_ge3, 2, 33] - 33 stride prevents 8-way bank conflicts
+    // Layout: [n_ge3, 2, sh_high_stride]
     int* sh_high = shmem;
-    const int sh_high_stride = 33;
     
     // Low-depth packed storage: [warps_per_block, 7, 32]
-    // Placed after high-depth memory
-    unsigned long long* sh_low = (unsigned long long*)(shmem + n_ge3 * 2 * sh_high_stride);
+    // Placed after high-depth memory (aligned to 8 bytes)
+    // We compute the offset carefully
+    size_t high_elems = (size_t)n_ge3 * 2 * sh_high_stride;
+    // Ensure alignment for unsigned long long
+    if (high_elems % 2 != 0) high_elems++; 
+    
+    unsigned long long* sh_low = (unsigned long long*)(shmem + high_elems);
     
     const unsigned mask = __ballot_sync(__activemask(), true);
     
@@ -97,7 +101,6 @@ _h_sm(
     }
     __syncthreads();
     
-    // Flush interval to preventing int32 overflow (~32k samples max)
     const int FLUSH_INTERVAL = 512;
     int tile_count = 0;
     
@@ -129,12 +132,11 @@ _h_sm(
             xfd_local &= valid_mask;
         }
         
-        // Process 32 samples in this tile
+        // Process 32 samples
         for (int k = 0; k < 32; ++k) {
             const int v = (int)(xfd_local & 1u);
             xfd_local >>= 1;
             
-            // Broadcast k-th sample's label and leaf
             const int32_t yk = __shfl_sync(mask, y_lane, k);
             uint32_t lk = __shfl_sync(mask, l32, k);
             
@@ -157,7 +159,7 @@ _h_sm(
                 case 3u: hf23 += vy; hw23 += v; break;
             }
             
-            // Depths >= 3: Accumulate to padded shared memory (NO ATOMICS)
+            // Depths >= 3
             if (max_depth > 3) {
                 #pragma unroll
                 for (int d = 3; d < 8; ++d) {
@@ -166,7 +168,6 @@ _h_sm(
                     const unsigned tkd = lk & to; lk >>= d;
                     const int node_idx = (int)(to + tkd) - 7;
                     
-                    // Direct write to lane-private column
                     sh_high[(node_idx * 2 + 0) * sh_high_stride + lane] += vy;
                     sh_high[(node_idx * 2 + 1) * sh_high_stride + lane] += v;
                 }
@@ -179,7 +180,6 @@ _h_sm(
         if (tile_count >= FLUSH_INTERVAL) {
             __syncthreads();
             
-            // 1. Flush low-depth registers to shared
             const int warp_offset = block_warp * 7 * 32;
             sh_low[warp_offset + 0 * 32 + lane] = pack_sc(hf0, hw0);
             sh_low[warp_offset + 1 * 32 + lane] = pack_sc(hf10, hw10);
@@ -191,9 +191,7 @@ _h_sm(
             
             __syncthreads();
             
-            // 2. Warp 0 reduces and writes to global (Coalesced Atomics)
             if (block_warp == 0) {
-                // Low depths
                 for (int node = 0; node < 7; ++node) {
                     unsigned long long acc = 0ull;
                     for (int w = 0; w < warps_per_block; ++w) {
@@ -206,7 +204,6 @@ _h_sm(
                     atomicAdd((unsigned long long*)Hptr_coalesced(H, nodes_total, feat_set, node, lane, 1), (unsigned long long)csum);
                 }
                 
-                // High depths
                 for (int node = 7; node < nodes_total; ++node) {
                     int sum_acc = 0, cnt_acc = 0;
                     for (int w = 0; w < warps_per_block; ++w) {
@@ -220,7 +217,6 @@ _h_sm(
                     }
                 }
                 
-                // Reset shared
                 for (int i = 0; i < n_ge3; ++i) {
                     sh_high[(i * 2 + 0) * sh_high_stride + lane] = 0;
                     sh_high[(i * 2 + 1) * sh_high_stride + lane] = 0;
@@ -229,7 +225,6 @@ _h_sm(
             
             __syncthreads();
             
-            // Reset registers
             hf0 = hw0 = 0; hf10 = hf11 = hw10 = hw11 = 0;
             hf20 = hf21 = hf22 = hf23 = 0; hw20 = hw21 = hw22 = hw23 = 0;
             tile_count = 0;
@@ -284,35 +279,6 @@ _h_sm(
 
 static inline int ceil_div_int(int a, int b) { return (a + b - 1) / b; }
 
-static inline int choose_warps_optimized(int max_depth, size_t smem_cap) {
-    int n_ge3 = std::max((1 << max_depth) - 8, 1);
-    
-    // Prefer higher warp count for occupancy if memory allows
-    for (int wpb : {8, 4, 2, 1}) {
-        size_t smem_high = (size_t)n_ge3 * 2 * 33 * sizeof(int);  // 33 for padding
-        size_t smem_low = (size_t)wpb * 7 * 32 * sizeof(unsigned long long);
-        if (smem_high + smem_low <= smem_cap) return wpb;
-    }
-    return 1;
-}
-
-static inline void infer_grid_optimized(
-    int nfeatsets, int cols_32M, int warps_per_block,
-    int& blocks_per_feat_out, int& stride_out)
-{
-    // Target ~24 blocks per SM for high occupancy
-    auto* prop = at::cuda::getCurrentDeviceProperties();
-    const int SM = prop->multiProcessorCount;
-    const int target_blocks = SM * 24;
-    
-    int blocks_per_feat = std::max(1, target_blocks / (nfeatsets * warps_per_block));
-    const int total_warps = blocks_per_feat * warps_per_block * nfeatsets;
-    int stride = std::max(1, ceil_div_int(cols_32M, total_warps * 32));
-    
-    blocks_per_feat_out = blocks_per_feat;
-    stride_out = stride;
-}
-
 torch::Tensor h_sm(
     torch::Tensor XS,
     torch::Tensor Y,
@@ -324,50 +290,77 @@ torch::Tensor h_sm(
     const int N = (int)Y.size(0);
     const int nodes_tot = (1 << max_depth) - 1;
     
-    // Use OPTIMIZED layout [nfeatsets, nodes, 32, 2] for the kernel
     auto opts = XS.options().dtype(torch::kLong).memory_format(c10::MemoryFormat::Contiguous);
     auto H_opt = torch::zeros({(long long)nfeatsets, (long long)nodes_tot, 32LL, 2LL}, opts);
     
     auto* prop = at::cuda::getCurrentDeviceProperties();
     size_t smem_cap = prop->sharedMemPerBlockOptin ? (size_t)prop->sharedMemPerBlockOptin : (size_t)prop->sharedMemPerBlock;
     
-    const int warps_per_block = choose_warps_optimized(max_depth, smem_cap);
+    int n_ge3 = std::max((1 << max_depth) - 8, 1);
     
-    int blocks_per_feat = 0, stride = 0;
-    infer_grid_optimized(nfeatsets, cols_32M, warps_per_block, blocks_per_feat, stride);
+    // Dynamic Stride Selection:
+    // Try Stride 33 (Fast) first. If it overflows mem, fallback to Stride 32 (Compact).
+    int sh_high_stride = 33;
+    int warps_per_block = 1;
+    
+    // Find best warp count and stride
+    // Priority: Maximize warps (occupancy) > Use Stride 33 (no conflicts)
+    
+    bool fit = false;
+    for (int stride_opt : {33, 32}) {
+        for (int wpb : {8, 4, 2, 1}) {
+            size_t smem_high = (size_t)n_ge3 * 2 * stride_opt * sizeof(int);
+            if (smem_high % 8 != 0) smem_high += 4; // Align
+            
+            size_t smem_low = (size_t)wpb * 7 * 32 * sizeof(unsigned long long);
+            
+            if (smem_high + smem_low <= smem_cap) {
+                sh_high_stride = stride_opt;
+                warps_per_block = wpb;
+                fit = true;
+                break;
+            }
+        }
+        if (fit) break;
+    }
+    
+    // Re-calculate final bytes
+    size_t smem_high = (size_t)n_ge3 * 2 * sh_high_stride * sizeof(int);
+    if (smem_high % 8 != 0) smem_high += 4;
+    size_t smem_low = (size_t)warps_per_block * 7 * 32 * sizeof(unsigned long long);
+    size_t smem_bytes = smem_high + smem_low;
+
+    TORCH_CHECK(smem_bytes <= smem_cap, "Required shared memory (", smem_bytes, ") exceeds limit (", smem_cap, ")");
+
+    // Grid sizing
+    const int SM = prop->multiProcessorCount;
+    const int target_blocks = SM * 24;
+    int blocks_per_feat = std::max(1, target_blocks / (nfeatsets * warps_per_block));
+    const int total_warps = blocks_per_feat * warps_per_block * nfeatsets;
+    int stride = std::max(1, ceil_div_int(cols_32M, total_warps * 32));
     
     dim3 grid(nfeatsets, blocks_per_feat, 1);
     dim3 block(warps_per_block * 32, 1, 1);
-    
-    int n_ge3 = std::max((1 << max_depth) - 8, 1);
-    size_t smem_high = (size_t)n_ge3 * 2 * 33 * sizeof(int);
-    size_t smem_low = (size_t)warps_per_block * 7 * 32 * sizeof(unsigned long long);
-    size_t smem_bytes = smem_high + smem_low;
-    
-    TORCH_CHECK(smem_bytes <= smem_cap, "Required shared memory (", smem_bytes, ") exceeds limit (", smem_cap, ")");
     
     auto stream = at::cuda::getCurrentCUDAStream();
     
     TORCH_CHECK(Y.scalar_type() == torch::kInt16, "Y must be int16");
     TORCH_CHECK(XS.scalar_type() == torch::kUInt32 || XS.scalar_type() == torch::kInt32, "XS must be uint32/int32");
-    
     const uint32_t* XS_ptr = reinterpret_cast<const uint32_t*>(XS.data_ptr());
     
     const auto lf_dt = LF.scalar_type();
     
-    // Dispatch
     #define LAUNCH_H(TYPE) \
         cudaFuncSetAttribute(_h_sm<TYPE>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes); \
         _h_sm<TYPE><<<grid, block, smem_bytes, stream.stream()>>>( \
             XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<TYPE>(), \
             H_opt.data_ptr<int64_t>(), nfeatsets, cols_32M, N, max_depth, \
-            warps_per_block, stride, nodes_tot);
+            warps_per_block, stride, nodes_tot, sh_high_stride);
 
     if (lf_dt == torch::kUInt16) { LAUNCH_H(uint16_t) }
     else if (lf_dt == torch::kUInt32) { LAUNCH_H(uint32_t) }
     else if (lf_dt == torch::kUInt64) { LAUNCH_H(uint64_t) }
     else { TORCH_CHECK(false, "LF must be uint16/32/64"); }
     
-    // Transpose back to original layout [nfeatsets, nodes, 2, 32] for downstream compatibility
     return H_opt.permute({0, 1, 3, 2}).contiguous();
 }
