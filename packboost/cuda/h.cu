@@ -1,16 +1,16 @@
-// packboost/cuda/h_optimized.cu
+// packboost/cuda/h.cu
 // Fully optimized histogram kernel for maximum performance
 // Key optimizations:
-// 1. Coalesced memory layout: H[nfeatsets, nodes, 32, 2] instead of [nfeatsets, nodes, 2, 32]
-// 2. Reduced register pressure: int32 accumulators with periodic flushing
-// 3. Eliminated bank conflicts: padded shared memory layout
-// 4. Warp-level atomic coalescing for global writes
-// 5. Optimized occupancy with dynamic shared memory tuning
+// 1. Coalesced global memory layout: [nfeatsets, nodes, 32, 2] intermediate
+// 2. Padding to eliminate shared memory bank conflicts
+// 3. Reduced register pressure via periodic flushing
+// 4. Warp-level atomic coalescing
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <vector>
 
 // ============================================================================
 // COALESCED MEMORY LAYOUT HELPERS
@@ -18,6 +18,7 @@
 
 // NEW LAYOUT: H[nfeatsets, nodes, 32, 2] - lanes are consecutive
 // This ensures all 32 lanes in a warp hit consecutive addresses (coalesced)
+// We use this layout for the kernel, then transpose at the end if needed.
 static inline __device__ int64_t* Hptr_coalesced(
     int64_t* H, int nodes,
     int feat, int node, int lane, int chan) 
@@ -42,12 +43,12 @@ __device__ __forceinline__ unsigned long long add_pack(unsigned long long a, uns
 }
 
 // ============================================================================
-// OPTIMIZED KERNEL WITH REDUCED REGISTER PRESSURE
+// OPTIMIZED KERNEL
 // ============================================================================
 
 template <typename LF_T>
 __global__ void __launch_bounds__(256, 4)  // Optimize for 4 blocks/SM
-_h_sm_optimized(
+_h_sm(
     const uint32_t* __restrict__ XS,  // [nfeatsets, cols_32M]
     const int16_t* __restrict__ Y,    // [N]
     const LF_T* __restrict__ LF,      // [nfeatsets, N]
@@ -67,50 +68,37 @@ _h_sm_optimized(
     
     if (feat_set >= nfeatsets) return;
     
-    // ========================================================================
-    // REDUCED REGISTER PRESSURE: Use int32 accumulators, flush periodically
-    // ========================================================================
-    
-    // Low-depth accumulators (depths 0-2: 7 nodes)
-    // OLD: 14 int64_t = 112 bytes/thread
-    // NEW: 14 int32_t = 56 bytes/thread (50% reduction)
+    // REDUCED REGISTER PRESSURE: Use int32 accumulators (56 bytes/thread vs 112)
     int hf0 = 0, hw0 = 0;
     int hf10 = 0, hf11 = 0, hw10 = 0, hw11 = 0;
     int hf20 = 0, hf21 = 0, hf22 = 0, hf23 = 0;
     int hw20 = 0, hw21 = 0, hw22 = 0, hw23 = 0;
     
-    // ========================================================================
-    // BANK-CONFLICT-FREE SHARED MEMORY LAYOUT
-    // ========================================================================
-    
+    // BANK-CONFLICT-FREE SHARED MEMORY
     int n_ge3 = (1 << max_depth) - 8;
     if (n_ge3 < 1) n_ge3 = 1;
     
     extern __shared__ int shmem[];
     
-    // High-depth histogram: [n_ge3, 2, 33] with padding to avoid bank conflicts
-    // OLD: [n_ge3, 2, 32] - caused 8-way conflicts on stride-64 access
-    // NEW: [n_ge3, 2, 33] - padding eliminates conflicts
+    // Layout: [n_ge3, 2, 33] - 33 stride prevents 8-way bank conflicts
     int* sh_high = shmem;
-    const int sh_high_stride = 33;  // Padded stride
+    const int sh_high_stride = 33;
     
     // Low-depth packed storage: [warps_per_block, 7, 32]
+    // Placed after high-depth memory
     unsigned long long* sh_low = (unsigned long long*)(shmem + n_ge3 * 2 * sh_high_stride);
     
     const unsigned mask = __ballot_sync(__activemask(), true);
     
-    // Zero shared memory for high depths
+    // Zero shared memory
     for (int i = 0; i < n_ge3; ++i) {
-        sh_high[(i * 2 + 0) * sh_high_stride + lane] = 0;  // sum
-        sh_high[(i * 2 + 1) * sh_high_stride + lane] = 0;  // count
+        sh_high[(i * 2 + 0) * sh_high_stride + lane] = 0;
+        sh_high[(i * 2 + 1) * sh_high_stride + lane] = 0;
     }
     __syncthreads();
     
-    // ========================================================================
-    // MAIN ACCUMULATION LOOP WITH PERIODIC FLUSHING
-    // ========================================================================
-    
-    const int FLUSH_INTERVAL = 512;  // Flush every 512 iterations to prevent overflow
+    // Flush interval to preventing int32 overflow (~32k samples max)
+    const int FLUSH_INTERVAL = 512;
     int tile_count = 0;
     
     for (int j = 0; j < stride; ++j) {
@@ -136,9 +124,10 @@ _h_sm_optimized(
         
         // Mask tail bits
         const int rem = N - base;
-        uint32_t valid_mask = (rem >= 32) ? 0xFFFFFFFFu : 
-                              (rem > 0) ? ((1u << rem) - 1u) : 0u;
-        xfd_local &= valid_mask;
+        if (rem < 32) {
+            uint32_t valid_mask = (rem > 0) ? ((1u << rem) - 1u) : 0u;
+            xfd_local &= valid_mask;
+        }
         
         // Process 32 samples in this tile
         for (int k = 0; k < 32; ++k) {
@@ -149,24 +138,18 @@ _h_sm_optimized(
             const int32_t yk = __shfl_sync(mask, y_lane, k);
             uint32_t lk = __shfl_sync(mask, l32, k);
             
-            const int vy = v * yk;  // Precompute v*yk once
+            const int vy = v * yk;
             
-            // Depth 0 (root)
-            hf0 += vy;
-            hw0 += v;
+            // Depth 0
+            hf0 += vy; hw0 += v;
             
-            // Depth 1 (2 nodes)
-            const unsigned tk1 = lk & 1u;
-            lk >>= 1;
-            if (tk1 == 0u) {
-                hf10 += vy; hw10 += v;
-            } else {
-                hf11 += vy; hw11 += v;
-            }
+            // Depth 1
+            const unsigned tk1 = lk & 1u; lk >>= 1;
+            if (tk1 == 0u) { hf10 += vy; hw10 += v; }
+            else           { hf11 += vy; hw11 += v; }
             
-            // Depth 2 (4 nodes)
-            const unsigned tk2 = lk & 3u;
-            lk >>= 2;
+            // Depth 2
+            const unsigned tk2 = lk & 3u; lk >>= 2;
             switch (tk2) {
                 case 0u: hf20 += vy; hw20 += v; break;
                 case 1u: hf21 += vy; hw21 += v; break;
@@ -174,18 +157,16 @@ _h_sm_optimized(
                 case 3u: hf23 += vy; hw23 += v; break;
             }
             
-            // Depths >= 3: accumulate to shared memory
-            // NO ATOMICS NEEDED - each lane writes to its own column
+            // Depths >= 3: Accumulate to padded shared memory (NO ATOMICS)
             if (max_depth > 3) {
                 #pragma unroll
-                for (int d = 3; d < 8; ++d) {  // Unroll up to depth 7
+                for (int d = 3; d < 8; ++d) {
                     if (d >= max_depth) break;
                     const unsigned to = (1u << d) - 1u;
-                    const unsigned tkd = lk & to;
-                    lk >>= d;
+                    const unsigned tkd = lk & to; lk >>= d;
                     const int node_idx = (int)(to + tkd) - 7;
                     
-                    // Direct write - no atomic needed (lane-private column)
+                    // Direct write to lane-private column
                     sh_high[(node_idx * 2 + 0) * sh_high_stride + lane] += vy;
                     sh_high[(node_idx * 2 + 1) * sh_high_stride + lane] += v;
                 }
@@ -194,12 +175,11 @@ _h_sm_optimized(
         
         tile_count++;
         
-        // Periodic flush to prevent int32 overflow
-        // For 16-bit Y values: max accumulation = 32K samples before overflow risk
+        // Periodic flush
         if (tile_count >= FLUSH_INTERVAL) {
-            __syncthreads();  // Ensure all writes to shared complete
+            __syncthreads();
             
-            // Flush low-depth registers to shared
+            // 1. Flush low-depth registers to shared
             const int warp_offset = block_warp * 7 * 32;
             sh_low[warp_offset + 0 * 32 + lane] = pack_sc(hf0, hw0);
             sh_low[warp_offset + 1 * 32 + lane] = pack_sc(hf10, hw10);
@@ -211,43 +191,36 @@ _h_sm_optimized(
             
             __syncthreads();
             
-            // Warp 0 reduces and writes to global
+            // 2. Warp 0 reduces and writes to global (Coalesced Atomics)
             if (block_warp == 0) {
+                // Low depths
                 for (int node = 0; node < 7; ++node) {
                     unsigned long long acc = 0ull;
                     for (int w = 0; w < warps_per_block; ++w) {
                         acc = add_pack(acc, sh_low[w * 7 * 32 + node * 32 + lane]);
                     }
+                    int64_t fsum = (int64_t)(int)(uint32_t)acc;
+                    int64_t csum = (int64_t)(uint32_t)(acc >> 32);
                     
-                    const int64_t fsum = (int64_t)(int)(unsigned int)acc;
-                    const int64_t csum = (int64_t)(unsigned int)(acc >> 32);
-                    
-                    // COALESCED ATOMIC: All 32 lanes write consecutive addresses
-                    atomicAdd((unsigned long long*)Hptr_coalesced(H, nodes_total, feat_set, node, lane, 0), 
-                              (unsigned long long)fsum);
-                    atomicAdd((unsigned long long*)Hptr_coalesced(H, nodes_total, feat_set, node, lane, 1), 
-                              (unsigned long long)csum);
+                    atomicAdd((unsigned long long*)Hptr_coalesced(H, nodes_total, feat_set, node, lane, 0), (unsigned long long)fsum);
+                    atomicAdd((unsigned long long*)Hptr_coalesced(H, nodes_total, feat_set, node, lane, 1), (unsigned long long)csum);
                 }
                 
-                // Also flush high-depth shared memory
+                // High depths
                 for (int node = 7; node < nodes_total; ++node) {
                     int sum_acc = 0, cnt_acc = 0;
                     for (int w = 0; w < warps_per_block; ++w) {
-                        // Each warp owns a subset of nodes
-                        const int node_idx = node - 7;
+                        int node_idx = node - 7;
                         sum_acc += sh_high[(node_idx * 2 + 0) * sh_high_stride + lane];
                         cnt_acc += sh_high[(node_idx * 2 + 1) * sh_high_stride + lane];
                     }
-                    
                     if (sum_acc | cnt_acc) {
-                        atomicAdd((unsigned long long*)Hptr_coalesced(H, nodes_total, feat_set, node, lane, 0),
-                                  (unsigned long long)(int64_t)sum_acc);
-                        atomicAdd((unsigned long long*)Hptr_coalesced(H, nodes_total, feat_set, node, lane, 1),
-                                  (unsigned long long)(int64_t)cnt_acc);
+                        atomicAdd((unsigned long long*)Hptr_coalesced(H, nodes_total, feat_set, node, lane, 0), (unsigned long long)(int64_t)sum_acc);
+                        atomicAdd((unsigned long long*)Hptr_coalesced(H, nodes_total, feat_set, node, lane, 1), (unsigned long long)(int64_t)cnt_acc);
                     }
                 }
                 
-                // Zero shared for next batch
+                // Reset shared
                 for (int i = 0; i < n_ge3; ++i) {
                     sh_high[(i * 2 + 0) * sh_high_stride + lane] = 0;
                     sh_high[(i * 2 + 1) * sh_high_stride + lane] = 0;
@@ -256,20 +229,14 @@ _h_sm_optimized(
             
             __syncthreads();
             
-            // Reset accumulators
-            hf0 = hw0 = 0;
-            hf10 = hf11 = hw10 = hw11 = 0;
-            hf20 = hf21 = hf22 = hf23 = 0;
-            hw20 = hw21 = hw22 = hw23 = 0;
+            // Reset registers
+            hf0 = hw0 = 0; hf10 = hf11 = hw10 = hw11 = 0;
+            hf20 = hf21 = hf22 = hf23 = 0; hw20 = hw21 = hw22 = hw23 = 0;
             tile_count = 0;
         }
     }
     
-    // ========================================================================
-    // FINAL REDUCTION AND COALESCED GLOBAL WRITE
-    // ========================================================================
-    
-    // Write remaining low-depth values to shared
+    // Final Flush
     const int warp_offset = block_warp * 7 * 32;
     sh_low[warp_offset + 0 * 32 + lane] = pack_sc(hf0, hw0);
     sh_low[warp_offset + 1 * 32 + lane] = pack_sc(hf10, hw10);
@@ -281,53 +248,38 @@ _h_sm_optimized(
     
     __syncthreads();
     
-    // Warp 0 performs final reduction and write
     if (block_warp == 0) {
-        // Low-depth nodes (0-6)
         for (int node = 0; node < 7; ++node) {
             unsigned long long acc = 0ull;
-            
-            // Butterfly reduction across warps
             for (int w = 0; w < warps_per_block; ++w) {
                 acc = add_pack(acc, sh_low[w * 7 * 32 + node * 32 + lane]);
             }
-            
-            const int64_t fsum = (int64_t)(int)(unsigned int)acc;
-            const int64_t csum = (int64_t)(unsigned int)(acc >> 32);
-            
-            // COALESCED WRITE: consecutive lanes → consecutive addresses
+            int64_t fsum = (int64_t)(int)(uint32_t)acc;
+            int64_t csum = (int64_t)(uint32_t)(acc >> 32);
             if (fsum | csum) {
-                atomicAdd((unsigned long long*)Hptr_coalesced(H, nodes_total, feat_set, node, lane, 0),
-                          (unsigned long long)fsum);
-                atomicAdd((unsigned long long*)Hptr_coalesced(H, nodes_total, feat_set, node, lane, 1),
-                          (unsigned long long)csum);
+                atomicAdd((unsigned long long*)Hptr_coalesced(H, nodes_total, feat_set, node, lane, 0), (unsigned long long)fsum);
+                atomicAdd((unsigned long long*)Hptr_coalesced(H, nodes_total, feat_set, node, lane, 1), (unsigned long long)csum);
             }
         }
         
-        // High-depth nodes (7+)
         const int rows_per_lane = (n_ge3 + 31) / 32;
         for (int r = 0; r < rows_per_lane; ++r) {
-            const int node_idx = r * 32 + lane;
-            if (node_idx >= n_ge3) break;
-            
-            const int node = 7 + node_idx;
-            if (node >= nodes_total) break;
-            
-            const int64_t fsum = (int64_t)sh_high[(node_idx * 2 + 0) * sh_high_stride + lane];
-            const int64_t csum = (int64_t)sh_high[(node_idx * 2 + 1) * sh_high_stride + lane];
-            
-            if (fsum | csum) {
-                atomicAdd((unsigned long long*)Hptr_coalesced(H, nodes_total, feat_set, node, lane, 0),
-                          (unsigned long long)fsum);
-                atomicAdd((unsigned long long*)Hptr_coalesced(H, nodes_total, feat_set, node, lane, 1),
-                          (unsigned long long)csum);
+            int node_idx = r * 32 + lane;
+            if (node_idx < n_ge3) {
+                int node = 7 + node_idx;
+                int64_t fsum = (int64_t)sh_high[(node_idx * 2 + 0) * sh_high_stride + lane];
+                int64_t csum = (int64_t)sh_high[(node_idx * 2 + 1) * sh_high_stride + lane];
+                if (fsum | csum) {
+                    atomicAdd((unsigned long long*)Hptr_coalesced(H, nodes_total, feat_set, node, lane, 0), (unsigned long long)fsum);
+                    atomicAdd((unsigned long long*)Hptr_coalesced(H, nodes_total, feat_set, node, lane, 1), (unsigned long long)csum);
+                }
             }
         }
     }
 }
 
 // ============================================================================
-// HOST LAUNCHER WITH OPTIMIZED OCCUPANCY
+// HOST LAUNCHER
 // ============================================================================
 
 static inline int ceil_div_int(int a, int b) { return (a + b - 1) / b; }
@@ -335,15 +287,11 @@ static inline int ceil_div_int(int a, int b) { return (a + b - 1) / b; }
 static inline int choose_warps_optimized(int max_depth, size_t smem_cap) {
     int n_ge3 = std::max((1 << max_depth) - 8, 1);
     
-    // Try different warp counts and pick the one with best occupancy
-    for (int wpb : {8, 4, 2, 1}) {  // Favor 8 for better occupancy
+    // Prefer higher warp count for occupancy if memory allows
+    for (int wpb : {8, 4, 2, 1}) {
         size_t smem_high = (size_t)n_ge3 * 2 * 33 * sizeof(int);  // 33 for padding
         size_t smem_low = (size_t)wpb * 7 * 32 * sizeof(unsigned long long);
-        size_t total = smem_high + smem_low;
-        
-        if (total <= smem_cap) {
-            return wpb;
-        }
+        if (smem_high + smem_low <= smem_cap) return wpb;
     }
     return 1;
 }
@@ -352,10 +300,10 @@ static inline void infer_grid_optimized(
     int nfeatsets, int cols_32M, int warps_per_block,
     int& blocks_per_feat_out, int& stride_out)
 {
-    // Target high occupancy: aim for 16-32 blocks per SM
+    // Target ~24 blocks per SM for high occupancy
     auto* prop = at::cuda::getCurrentDeviceProperties();
     const int SM = prop->multiProcessorCount;
-    const int target_blocks = SM * 24;  // 24 blocks/SM target
+    const int target_blocks = SM * 24;
     
     int blocks_per_feat = std::max(1, target_blocks / (nfeatsets * warps_per_block));
     const int total_warps = blocks_per_feat * warps_per_block * nfeatsets;
@@ -365,7 +313,7 @@ static inline void infer_grid_optimized(
     stride_out = stride;
 }
 
-torch::Tensor h_sm_optimized(
+torch::Tensor h_sm(
     torch::Tensor XS,
     torch::Tensor Y,
     torch::Tensor LF,
@@ -376,14 +324,12 @@ torch::Tensor h_sm_optimized(
     const int N = (int)Y.size(0);
     const int nodes_tot = (1 << max_depth) - 1;
     
-    // NEW LAYOUT: [nfeatsets, nodes, 32, 2] for coalescing
+    // Use OPTIMIZED layout [nfeatsets, nodes, 32, 2] for the kernel
     auto opts = XS.options().dtype(torch::kLong).memory_format(c10::MemoryFormat::Contiguous);
-    auto H = torch::zeros({(long long)nfeatsets, (long long)nodes_tot, 32LL, 2LL}, opts);
+    auto H_opt = torch::zeros({(long long)nfeatsets, (long long)nodes_tot, 32LL, 2LL}, opts);
     
-    // Optimized shared memory allocation
     auto* prop = at::cuda::getCurrentDeviceProperties();
-    size_t smem_cap = prop->sharedMemPerBlockOptin ? (size_t)prop->sharedMemPerBlockOptin
-                                                   : (size_t)prop->sharedMemPerBlock;
+    size_t smem_cap = prop->sharedMemPerBlockOptin ? (size_t)prop->sharedMemPerBlockOptin : (size_t)prop->sharedMemPerBlock;
     
     const int warps_per_block = choose_warps_optimized(max_depth, smem_cap);
     
@@ -393,55 +339,35 @@ torch::Tensor h_sm_optimized(
     dim3 grid(nfeatsets, blocks_per_feat, 1);
     dim3 block(warps_per_block * 32, 1, 1);
     
-    // Calculate shared memory with padding
     int n_ge3 = std::max((1 << max_depth) - 8, 1);
-    size_t smem_high = (size_t)n_ge3 * 2 * 33 * sizeof(int);  // Padded to 33
+    size_t smem_high = (size_t)n_ge3 * 2 * 33 * sizeof(int);
     size_t smem_low = (size_t)warps_per_block * 7 * 32 * sizeof(unsigned long long);
     size_t smem_bytes = smem_high + smem_low;
     
-    TORCH_CHECK(smem_bytes <= smem_cap,
-                "Required shared memory (", smem_bytes, 
-                ") exceeds device limit (", smem_cap, ")");
+    TORCH_CHECK(smem_bytes <= smem_cap, "Required shared memory (", smem_bytes, ") exceeds limit (", smem_cap, ")");
     
     auto stream = at::cuda::getCurrentCUDAStream();
     
     TORCH_CHECK(Y.scalar_type() == torch::kInt16, "Y must be int16");
-    TORCH_CHECK(XS.scalar_type() == torch::kUInt32 || XS.scalar_type() == torch::kInt32,
-                "XS must be uint32/int32");
+    TORCH_CHECK(XS.scalar_type() == torch::kUInt32 || XS.scalar_type() == torch::kInt32, "XS must be uint32/int32");
     
     const uint32_t* XS_ptr = reinterpret_cast<const uint32_t*>(XS.data_ptr());
     
-    // Dispatch by LF dtype
     const auto lf_dt = LF.scalar_type();
-    if (lf_dt == torch::kUInt16) {
-        cudaFuncSetAttribute(_h_sm_optimized<uint16_t>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int)smem_bytes);
-        _h_sm_optimized<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
-            XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint16_t>(),
-            H.data_ptr<int64_t>(), nfeatsets, cols_32M, N, max_depth,
-            warps_per_block, stride, nodes_tot);
-    } else if (lf_dt == torch::kUInt32) {
-        cudaFuncSetAttribute(_h_sm_optimized<uint32_t>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int)smem_bytes);
-        _h_sm_optimized<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
-            XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint32_t>(),
-            H.data_ptr<int64_t>(), nfeatsets, cols_32M, N, max_depth,
-            warps_per_block, stride, nodes_tot);
-    } else if (lf_dt == torch::kUInt64) {
-        cudaFuncSetAttribute(_h_sm_optimized<uint64_t>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int)smem_bytes);
-        _h_sm_optimized<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
-            XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint64_t>(),
-            H.data_ptr<int64_t>(), nfeatsets, cols_32M, N, max_depth,
-            warps_per_block, stride, nodes_tot);
-    } else {
-        TORCH_CHECK(false, "LF must be uint16/uint32/uint64");
-    }
     
-    // Transpose output back to original layout [nfeatsets, nodes, 2, 32] if needed
-    // Or update downstream code to expect [nfeatsets, nodes, 32, 2]
-    return H.permute({0, 1, 3, 2}).contiguous();  // [nfeatsets, nodes, 32, 2] -> [nfeatsets, nodes, 2, 32]
+    // Dispatch
+    #define LAUNCH_H(TYPE) \
+        cudaFuncSetAttribute(_h_sm<TYPE>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes); \
+        _h_sm<TYPE><<<grid, block, smem_bytes, stream.stream()>>>( \
+            XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<TYPE>(), \
+            H_opt.data_ptr<int64_t>(), nfeatsets, cols_32M, N, max_depth, \
+            warps_per_block, stride, nodes_tot);
+
+    if (lf_dt == torch::kUInt16) { LAUNCH_H(uint16_t) }
+    else if (lf_dt == torch::kUInt32) { LAUNCH_H(uint32_t) }
+    else if (lf_dt == torch::kUInt64) { LAUNCH_H(uint64_t) }
+    else { TORCH_CHECK(false, "LF must be uint16/32/64"); }
+    
+    // Transpose back to original layout [nfeatsets, nodes, 2, 32] for downstream compatibility
+    return H_opt.permute({0, 1, 3, 2}).contiguous();
 }
