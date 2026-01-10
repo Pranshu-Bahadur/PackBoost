@@ -5,6 +5,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <iostream>
 
 static inline __device__ unsigned long long int* Hptr(int64_t* H, int nodes,
                                          int feat, int node, int chan, int lane) {
@@ -25,7 +26,6 @@ static __device__ __forceinline__ unsigned long long add_pack(unsigned long long
     return pack_sc(sa + sb, ca + cb);
 }
 
-// ONLY CHANGE: Add stride parameter for bank conflict avoidance
 template <typename LF_T>
 __global__ void _h_sm(
     const uint32_t* __restrict__ XS,
@@ -39,7 +39,7 @@ __global__ void _h_sm(
     int warps_per_block,
     int stride,
     int nodes_total,
-    int sh_stride)  // NEW: padded stride for shared memory
+    int sh_stride)
 {
   const int feat_set = blockIdx.x;
   const int block_warp = threadIdx.x >> 5;
@@ -60,7 +60,6 @@ __global__ void _h_sm(
   
   const unsigned mask = __ballot_sync(__activemask(), true);
   
-  // ONLY CHANGE: Use sh_stride instead of 32
   #pragma unroll
   for (int i = 0; i < n_ge3; ++i) {
     sh_high[(i * 2 + 0) * sh_stride + lane] = 0;
@@ -114,7 +113,6 @@ __global__ void _h_sm(
           else if (tk == 2u) { hf22 += add; hw22 += v; }
           else               { hf23 += add; hw23 += v; }
 
-          // ONLY CHANGE: Use sh_stride
           #pragma unroll
           for (int d = 3; d < max_depth; ++d) {
             const unsigned to  = (1u << d) - 1u;
@@ -172,7 +170,6 @@ __global__ void _h_sm(
   }
   __syncthreads();
   
-  // ONLY CHANGE: Use sh_stride
   const int rows_per_warp = (n_ge3 + warps_per_block - 1) / warps_per_block;
   for (int k = 0; k < rows_per_warp; ++k) {
     const int node = 7 + rows_per_warp * block_warp + k;
@@ -252,6 +249,14 @@ torch::Tensor h_sm(
   size_t smem_high = static_cast<size_t>(n_ge3) * 2 * sh_stride * sizeof(int);
   size_t smem_low = static_cast<size_t>(warps_per_block) * 7 * 32 * sizeof(unsigned long long);
   size_t smem_bytes = smem_high + smem_low;
+  
+  // ADDED: Print debug info
+  std::cout << "[h_sm] depth=" << max_depth 
+            << " sh_stride=" << sh_stride 
+            << " warps=" << warps_per_block
+            << " smem=" << smem_bytes << "/" << smem_cap 
+            << " (bank_conflicts=" << (sh_stride == 32 ? "YES" : "NO") << ")"
+            << std::endl;
   
   TORCH_CHECK(smem_bytes <= smem_cap,
               "Required dynamic shared memory (", smem_bytes,
