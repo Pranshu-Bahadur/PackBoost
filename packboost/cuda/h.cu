@@ -57,7 +57,7 @@ __global__ void _h_sm(
   int32_t hw20=0, hw21=0, hw22=0, hw23=0;
 
   // Shared histogram for depths >=3
-  // If max_depth=7 (128 nodes), n_ge3 = 120 nodes.
+  // If max_depth=7 (127 nodes), n_ge3 = 120 nodes (indices 7..126).
   int n_ge3 = (1 << max_depth) - 8;
   if (n_ge3 < 1) n_ge3 = 1;
   
@@ -263,7 +263,10 @@ torch::Tensor h_sm(
   const int nfeatsets = static_cast<int>(XS.size(0));
   const int cols_32M = static_cast<int>(XS.size(1)); 
   const int N = static_cast<int>(LF.size(1));
-  const int nodes_total = (1 << (max_depth + 1));
+  
+  // FIX 6: Correct nodes calculation to match CPU reference
+  // nodes_total = 2^max_depth - 1. (e.g., depth 3 has 7 nodes)
+  const int nodes_total = (1 << max_depth) - 1;
   
   auto opts = torch::TensorOptions().dtype(torch::kLong).device(XS.device());
   auto H = torch::zeros({nfeatsets, nodes_total, 2, 32}, opts);
