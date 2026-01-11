@@ -10,11 +10,13 @@ static inline __device__ unsigned long long int* Hptr(int64_t* H, int nodes,
   size_t idx = (((static_cast<size_t>(feat) * nodes + node) * 2 + chan) * 32u + lane);
   return (unsigned long long int*)(H + idx);
 }
+
 // pack (sum,count) -> 64-bit (low32 = sum (signed), high32 = count (unsigned))
 __device__ __forceinline__ unsigned long long pack_sc(int sum32, int cnt32) {
     return ( (unsigned long long)(unsigned int)cnt32 << 32 ) |
              (unsigned long long)(unsigned int)sum32;
-  }
+}
+
 // add two packed values
 static __device__ __forceinline__ unsigned long long add_pack(unsigned long long a, unsigned long long b) {
     int sa = (int)(unsigned int)a;
@@ -22,36 +24,35 @@ static __device__ __forceinline__ unsigned long long add_pack(unsigned long long
     int sb = (int)(unsigned int)b;
     int cb = (int)(unsigned int)(b >> 32);
     return pack_sc(sa + sb, ca + cb);
-  }
+}
  
-// ---------------- Kernel (templated on LF dtype) ----------------
 template <typename LF_T>
 __global__ void _h_sm(
     const uint32_t* __restrict__ XS, // [nfeatsets, N]
     const int16_t* __restrict__ Y, // [N]
-    const LF_T* __restrict__ LF, // [nfeatsets, N] (u16/u32/u64)
-    int64_t* __restrict__ H, // [nfeatsets, nodes, 2, 32] (int64)
+    const LF_T* __restrict__ LF, // [nfeatsets, N]
+    int64_t* __restrict__ H, // [nfeatsets, nodes, 2, 32]
     int nfeatsets,
-    int cols_32M, // XS.shape[1] == N
-    int N, // Y.shape[0]
+    int cols_32M, 
+    int N, 
     int max_depth,
     int warps_per_block,
-    int stride, // tiles per warp along columns
-    int nodes_total // (1<<max_depth)-1
+    int stride, 
+    int nodes_total
 ){
   const int feat_set = blockIdx.x;
-  const int block_warp = threadIdx.x >> 5; // 0..(warps_per_block-1)
-  const int lane = threadIdx.x & 31; // 0..31
+  const int block_warp = threadIdx.x >> 5; 
+  const int lane = threadIdx.x & 31; 
   const int gwarp = warps_per_block * blockIdx.y + block_warp;
 
-  // Registers for depths 0..2 ONLY (nodes 0..6)
-  // Backing off depth 3 to save registers and improve occupancy on T4
-  int64_t hf0=0, hw0=0;
-  int64_t hf10=0, hf11=0, hw10=0, hw11=0;
-  int64_t hf20=0, hf21=0, hf22=0, hf23=0;
-  int64_t hw20=0, hw21=0, hw22=0, hw23=0;
+  // FIX 4: Use int32 accumulators to reduce register pressure.
+  // The shared memory reduction (pack_sc) is 32-bit anyway, so 64-bit here was wasteful.
+  int32_t hf0=0, hw0=0;
+  int32_t hf10=0, hf11=0, hw10=0, hw11=0;
+  int32_t hf20=0, hf21=0, hf22=0, hf23=0;
+  int32_t hw20=0, hw21=0, hw22=0, hw23=0;
 
-  // Shared histogram for depths >=3 : shape [(2^D - 8), 2, 32] int32
+  // Shared histogram for depths >=3
   int n_ge3 = (1 << max_depth) - 8;
   if (n_ge3 < 1) n_ge3 = 1;
   
@@ -59,7 +60,7 @@ __global__ void _h_sm(
   int* sh_high = shmem;
   unsigned long long* sh_low = (unsigned long long*)(shmem + n_ge3 * 2 * 32);
 
-  // FIX 1: Efficient block-wide zeroing (Keep this!)
+  // FIX 1: Efficient block-wide zeroing
   const int sh_high_elems = n_ge3 * 2 * 32;
   for (int i = threadIdx.x; i < sh_high_elems; i += blockDim.x) {
     sh_high[i] = 0;
@@ -97,12 +98,12 @@ __global__ void _h_sm(
           uint32_t      lk = __shfl_sync(mask, l32,    k);
 
           // d = 0
-          hf0 += static_cast<int64_t>(v) * (int64_t)yk;
+          hf0 += v * yk;
           hw0 += v;
 
           // d = 1
           unsigned tk = lk & 1u; lk >>= 1;
-          const int64_t add = static_cast<int64_t>(v) * (int64_t)yk;
+          const int32_t add = v * yk;
           if (tk == 0u) { hf10 += add; hw10 += v; }
           else          { hf11 += add; hw11 += v; }
 
@@ -113,8 +114,7 @@ __global__ void _h_sm(
           else if (tk == 2u) { hf22 += add; hw22 += v; }
           else               { hf23 += add; hw23 += v; }
 
-          // d >= 3 (depth 3 is back to shared memory)
-          // FIX 2: Predicated atomics (Keep this!)
+          // d >= 3 (predicated)
           #pragma unroll
           for (int d = 3; d < max_depth; ++d) {
             const unsigned to  = (1u << d) - 1u;
@@ -133,19 +133,19 @@ __global__ void _h_sm(
   // Write low-depth registers to shared (nodes 0..6)
   const int low_nodes = 7;
   int nd = 0;
-  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf0), static_cast<int>(hw0));
+  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(hf0, hw0);
   nd = 1;
-  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf10), static_cast<int>(hw10));
+  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(hf10, hw10);
   nd = 2;
-  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf11), static_cast<int>(hw11));
+  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(hf11, hw11);
   nd = 3;
-  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf20), static_cast<int>(hw20));
+  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(hf20, hw20);
   nd = 4;
-  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf21), static_cast<int>(hw21));
+  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(hf21, hw21);
   nd = 5;
-  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf22), static_cast<int>(hw22));
+  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(hf22, hw22);
   nd = 6;
-  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf23), static_cast<int>(hw23));
+  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(hf23, hw23);
 
   int log_wpb = 0;
   for (int tmp = warps_per_block; tmp > 1; tmp >>= 1) ++log_wpb;
@@ -177,10 +177,9 @@ __global__ void _h_sm(
   }
   __syncthreads();
   
-  // Drain shared histogram (d >= 3)
   const int rows_per_warp = (n_ge3 + warps_per_block - 1) / warps_per_block;
   for (int k = 0; k < rows_per_warp; ++k) {
-    const int node = 7 + rows_per_warp * block_warp + k; // Start at node 7
+    const int node = 7 + rows_per_warp * block_warp + k; 
     if (node < nodes_total) {
       const int base = ((node - 7) * 2) * 32 + lane;
       const int64_t fsum = static_cast<int64_t>(sh_high[base + 0]);
@@ -194,7 +193,6 @@ __global__ void _h_sm(
 // ---------------- Host launcher ----------------
 static inline int ceil_div_int(int a, int b){ return (a + b - 1) / b; }
 
-// Murky A100 heuristic for warps-per-block
 static inline int infer_hist_warps_per_block(int max_depth){
   const int residual = 15 - 2 - 6 - max_depth; 
   TORCH_CHECK(residual >= 0, "residual_sm_a100 < 0; max_depth too large for this variant");
@@ -222,7 +220,7 @@ static inline void infer_grid_stride(
 static inline int choose_warps_that_fit(size_t smem_high, size_t smem_cap) {
   int wpb = 16;                        
   while (wpb > 1) {
-    size_t smem_low = (size_t)wpb * 7 * 32 * sizeof(unsigned long long); // Back to 7 nodes
+    size_t smem_low = (size_t)wpb * 7 * 32 * sizeof(unsigned long long); 
     if (smem_high + smem_low <= smem_cap) break;
     wpb >>= 1;                          
   }
@@ -243,7 +241,6 @@ torch::Tensor h_sm(
   auto opts = XS.options().dtype(torch::kLong).memory_format(c10::MemoryFormat::Contiguous);
   auto H = torch::zeros({XS.size(0), nodes_tot, 2, 32}, opts);
   
-  // Reverted to start at node 7 (depth 3)
   int n_ge3 = std::max((1 << max_depth) - 8, 1);
   size_t smem_high = (size_t)n_ge3 * 2 * 32 * sizeof(int);
   
@@ -259,9 +256,7 @@ torch::Tensor h_sm(
   size_t smem_low = static_cast<size_t>(warps_per_block) * 7 * 32 * sizeof(unsigned long long);
   size_t smem_bytes = smem_high + smem_low;
   
-  TORCH_CHECK(smem_bytes <= smem_cap,
-              "Required dynamic shared memory (", smem_bytes,
-              ") exceeds device limit (", smem_cap, ")");
+  TORCH_CHECK(smem_bytes <= smem_cap, "Required dynamic shared memory exceeds limit");
   auto stream = at::cuda::getCurrentCUDAStream();
 
   TORCH_CHECK(Y.scalar_type() == torch::kInt16, "Y must be int16");
