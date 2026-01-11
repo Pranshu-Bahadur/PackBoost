@@ -1,5 +1,5 @@
 // packboost/cuda/h.cu
-// AGGRESSIVE OPTIMIZATION: Thread-local accumulation + vectorized ops
+// FIX: Proper template instantiation and dispatch
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -36,8 +36,6 @@ static __device__ __forceinline__ unsigned long long add_pack(unsigned long long
     return pack_sc(sa + sb, ca + cb);
 }
 
-// OPTIMIZATION 1: Thread-local accumulation for ALL high-depth nodes
-// Uses more registers but eliminates atomic contention
 template <typename LF_T, int MAX_LOCAL_NODES>
 __global__ void __launch_bounds__(512, 2) _h_sm_optimized(
     const uint32_t* __restrict__ XS,
@@ -58,7 +56,6 @@ __global__ void __launch_bounds__(512, 2) _h_sm_optimized(
   const int lane = threadIdx.x & 31;
   const int gwarp = warps_per_block * blockIdx.y + block_warp;
   
-  // Low-depth accumulators
   int64_t hf0=0, hw0=0;
   int64_t hf10=0, hf11=0, hw10=0, hw11=0;
   int64_t hf20=0, hf21=0, hf22=0, hf23=0;
@@ -67,8 +64,6 @@ __global__ void __launch_bounds__(512, 2) _h_sm_optimized(
   int n_ge3 = (1 << max_depth) - 8;
   if (n_ge3 < 1) n_ge3 = 1;
   
-  // OPTIMIZATION 1: Thread-local arrays for high-depth nodes
-  // Only use if nodes fit in register budget
   int local_sum[MAX_LOCAL_NODES];
   int local_cnt[MAX_LOCAL_NODES];
   
@@ -84,7 +79,6 @@ __global__ void __launch_bounds__(512, 2) _h_sm_optimized(
   
   const unsigned mask = __ballot_sync(__activemask(), true);
   
-  // Initialize shared memory for nodes beyond local buffer
   #pragma unroll 4
   for (int i = 0; i < n_ge3; ++i) {
     sh_high[(i * 2 + 0) * sh_stride + lane] = 0;
@@ -92,99 +86,83 @@ __global__ void __launch_bounds__(512, 2) _h_sm_optimized(
   }
   __syncthreads();
   
-  // OPTIMIZATION 2: Process multiple samples per iteration
-  const int UNROLL_FACTOR = 2;
-  
-  for (int j = 0; j < stride; j += UNROLL_FACTOR) {
+  for (int j = 0; j < stride; ++j) {
+    const int base = 32 * (stride * gwarp + j);
+    if (base >= cols_32M) break;
+    
+    const int jj_lane = base + lane;
+    int32_t y_lane = 0;
+    uint32_t l32 = 0;
+    
+    if (jj_lane < N) {
+      y_lane = Y[jj_lane];
+      LF_T lval = LF[static_cast<size_t>(feat_set) * static_cast<size_t>(N) + jj_lane];
+      l32 = static_cast<uint32_t>(lval);
+    }
+
+    uint32_t xfd_local = 0u;
+    if (jj_lane < cols_32M) {
+      xfd_local = XS[static_cast<size_t>(feat_set) * static_cast<size_t>(cols_32M) + jj_lane];
+    }
+
+    const int rem = N - base;
+    if (rem < 32) {
+      if (rem > 0) xfd_local &= (1u << rem) - 1u;
+      else xfd_local = 0u;
+    }
+
     #pragma unroll
-    for (int u = 0; u < UNROLL_FACTOR; ++u) {
-      const int jj = j + u;
-      if (jj >= stride) break;
-      
-      const int base = 32 * (stride * gwarp + jj);
-      if (base >= cols_32M) break;
-      
-      const int jj_lane = base + lane;
-      
-      // OPTIMIZATION 3: Prefetch data
-      int32_t y_lane = 0;
-      uint32_t l32 = 0;
-      if (jj_lane < N) {
-        y_lane = Y[jj_lane];
-        LF_T lval = LF[static_cast<size_t>(feat_set) * static_cast<size_t>(N) + jj_lane];
-        l32 = static_cast<uint32_t>(lval);
-      }
+    for (int k = 0; k < 32; ++k) {
+      const int v = static_cast<int>(xfd_local & 1u);
+      xfd_local >>= 1;
 
-      uint32_t xfd_local = 0u;
-      if (jj_lane < cols_32M) {
-        xfd_local = XS[static_cast<size_t>(feat_set) * static_cast<size_t>(cols_32M) + jj_lane];
-      }
+      const int32_t yk = __shfl_sync(mask, y_lane, k);
+      uint32_t lk = __shfl_sync(mask, l32, k);
 
-      const int rem = N - base;
-      if (rem < 32) {
-        if (rem > 0) xfd_local &= (1u << rem) - 1u;
-        else xfd_local = 0u;
-      }
+      const int vyk = v * yk;
+      const int64_t vy = static_cast<int64_t>(vyk);
 
-      // OPTIMIZATION 4: Unroll inner loop and reduce branching
-      #pragma unroll
-      for (int k = 0; k < 32; ++k) {
-        const int v = static_cast<int>(xfd_local & 1u);
-        xfd_local >>= 1;
+      hf0 += vy; 
+      hw0 += v;
 
-        const int32_t yk = __shfl_sync(mask, y_lane, k);
-        uint32_t lk = __shfl_sync(mask, l32, k);
+      const unsigned t1 = lk & 1u; 
+      lk >>= 1;
+      hf10 += (1 - t1) * vy;
+      hf11 += t1 * vy;
+      hw10 += (1 - t1) * v;
+      hw11 += t1 * v;
 
-        const int vyk = v * yk;
-        const int64_t vy = static_cast<int64_t>(vyk);
+      const unsigned t2 = lk & 3u; 
+      lk >>= 2;
+      hf20 += (t2 == 0) * vy;
+      hf21 += (t2 == 1) * vy;
+      hf22 += (t2 == 2) * vy;
+      hf23 += (t2 == 3) * vy;
+      hw20 += (t2 == 0) * v;
+      hw21 += (t2 == 1) * v;
+      hw22 += (t2 == 2) * v;
+      hw23 += (t2 == 3) * v;
 
-        // Depth 0
-        hf0 += vy; 
-        hw0 += v;
-
-        // Depth 1 - branchless with arithmetic
-        const unsigned t1 = lk & 1u; 
-        lk >>= 1;
-        hf10 += (1 - t1) * vy;
-        hf11 += t1 * vy;
-        hw10 += (1 - t1) * v;
-        hw11 += t1 * v;
-
-        // Depth 2 - use lookup pattern
-        const unsigned t2 = lk & 3u; 
-        lk >>= 2;
-        hf20 += (t2 == 0) * vy;
-        hf21 += (t2 == 1) * vy;
-        hf22 += (t2 == 2) * vy;
-        hf23 += (t2 == 3) * vy;
-        hw20 += (t2 == 0) * v;
-        hw21 += (t2 == 1) * v;
-        hw22 += (t2 == 2) * v;
-        hw23 += (t2 == 3) * v;
-
-        // Depth 3+: Use local buffers for small node counts
-        if (max_depth > 3) {
-          #pragma unroll
-          for (int d = 3; d < 8 && d < max_depth; ++d) {
-            const unsigned to  = (1u << d) - 1u;
-            const unsigned tkd = lk & to; 
-            lk >>= d;
-            const int node_idx = static_cast<int>(to + tkd) - 7;
-            
-            if (node_idx < MAX_LOCAL_NODES) {
-              local_sum[node_idx] += vyk;
-              local_cnt[node_idx] += v;
-            } else {
-              atomicAdd(&sh_high[(node_idx * 2 + 0) * sh_stride + lane], vyk);
-              atomicAdd(&sh_high[(node_idx * 2 + 1) * sh_stride + lane], v);
-            }
+      if (max_depth > 3) {
+        #pragma unroll
+        for (int d = 3; d < 8 && d < max_depth; ++d) {
+          const unsigned to  = (1u << d) - 1u;
+          const unsigned tkd = lk & to; 
+          lk >>= d;
+          const int node_idx = static_cast<int>(to + tkd) - 7;
+          
+          if (node_idx < MAX_LOCAL_NODES) {
+            local_sum[node_idx] += vyk;
+            local_cnt[node_idx] += v;
+          } else {
+            atomicAdd(&sh_high[(node_idx * 2 + 0) * sh_stride + lane], vyk);
+            atomicAdd(&sh_high[(node_idx * 2 + 1) * sh_stride + lane], v);
           }
         }
       }
     }
   }
   
-  // Flush local buffers to shared memory
   #pragma unroll
   for (int i = 0; i < MAX_LOCAL_NODES && i < n_ge3; ++i) {
     if (local_sum[i] | local_cnt[i]) {
@@ -193,7 +171,6 @@ __global__ void __launch_bounds__(512, 2) _h_sm_optimized(
     }
   }
   
-  // Pack low-depth results
   const int low_nodes = 7;
   sh_low[(block_warp * low_nodes + 0) * 32 + lane] = pack_sc(static_cast<int>(hf0), static_cast<int>(hw0));
   sh_low[(block_warp * low_nodes + 1) * 32 + lane] = pack_sc(static_cast<int>(hf10), static_cast<int>(hw10));
@@ -203,7 +180,6 @@ __global__ void __launch_bounds__(512, 2) _h_sm_optimized(
   sh_low[(block_warp * low_nodes + 5) * 32 + lane] = pack_sc(static_cast<int>(hf22), static_cast<int>(hw22));
   sh_low[(block_warp * low_nodes + 6) * 32 + lane] = pack_sc(static_cast<int>(hf23), static_cast<int>(hw23));
   
-  // Butterfly reduction
   int log_wpb = 0;
   for (int tmp = warps_per_block; tmp > 1; tmp >>= 1) ++log_wpb;
   
@@ -222,7 +198,6 @@ __global__ void __launch_bounds__(512, 2) _h_sm_optimized(
   
   __syncthreads();
   
-  // Warp 0 drains low-depth
   if (block_warp == 0) {
     #pragma unroll
     for (int ndi = 0; ndi < low_nodes; ++ndi) {
@@ -238,7 +213,6 @@ __global__ void __launch_bounds__(512, 2) _h_sm_optimized(
   
   __syncthreads();
   
-  // All warps drain high-depth
   const int rows_per_warp = (n_ge3 + warps_per_block - 1) / warps_per_block;
   for (int k = 0; k < rows_per_warp; ++k) {
     const int node = 7 + rows_per_warp * block_warp + k;
@@ -288,6 +262,18 @@ static inline void infer_grid_stride(
   stride_out = stride;
 }
 
+// Helper macro to launch kernel with proper template parameters
+#define LAUNCH_KERNEL(LF_TYPE, LOCAL_SIZE) \
+  do { \
+    CUDA_CHECK(cudaFuncSetAttribute(_h_sm_optimized<LF_TYPE, LOCAL_SIZE>, \
+      cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes))); \
+    cudaFuncSetCacheConfig(_h_sm_optimized<LF_TYPE, LOCAL_SIZE>, cudaFuncCachePreferShared); \
+    _h_sm_optimized<LF_TYPE, LOCAL_SIZE><<<grid, block, smem_bytes, stream.stream()>>>( \
+      XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<LF_TYPE>(), H.data_ptr<int64_t>(), \
+      nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot, sh_stride); \
+    CUDA_CHECK(cudaGetLastError()); \
+  } while(0)
+
 torch::Tensor h_sm(
     torch::Tensor XS,
     torch::Tensor Y,
@@ -334,64 +320,43 @@ torch::Tensor h_sm(
   
   const auto lf_dt = LF.scalar_type();
   
-  cudaFuncSetCacheConfig(_h_sm_optimized<uint16_t, 64>, cudaFuncCachePreferShared);
-  cudaFuncSetCacheConfig(_h_sm_optimized<uint32_t, 64>, cudaFuncCachePreferShared);
-  cudaFuncSetCacheConfig(_h_sm_optimized<uint64_t, 64>, cudaFuncCachePreferShared);
-  
-  // Choose local buffer size based on depth
-  const int local_nodes = (max_depth <= 6) ? 56 : ((max_depth == 7) ? 120 : 64);
-  
-  if (lf_dt == torch::kUInt16) {
-    CUDA_CHECK(cudaFuncSetAttribute(_h_sm_optimized<uint16_t, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
-    if (max_depth <= 6) {
-      _h_sm_optimized<uint16_t, 56><<<grid, block, smem_bytes, stream.stream()>>>(
-        XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint16_t>(), H.data_ptr<int64_t>(),
-        nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot, sh_stride);
-    } else if (max_depth == 7) {
-      _h_sm_optimized<uint16_t, 120><<<grid, block, smem_bytes, stream.stream()>>>(
-        XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint16_t>(), H.data_ptr<int64_t>(),
-        nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot, sh_stride);
+  // Dispatch based on depth and LF type
+  if (max_depth <= 6) {
+    // D<=6: 56 high-depth nodes
+    if (lf_dt == torch::kUInt16) {
+      LAUNCH_KERNEL(uint16_t, 56);
+    } else if (lf_dt == torch::kUInt32) {
+      LAUNCH_KERNEL(uint32_t, 56);
+    } else if (lf_dt == torch::kUInt64) {
+      LAUNCH_KERNEL(uint64_t, 56);
     } else {
-      _h_sm_optimized<uint16_t, 64><<<grid, block, smem_bytes, stream.stream()>>>(
-        XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint16_t>(), H.data_ptr<int64_t>(),
-        nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot, sh_stride);
+      TORCH_CHECK(false, "LF must be uint16/32/64");
     }
-    CUDA_CHECK(cudaGetLastError());
-  } else if (lf_dt == torch::kUInt32) {
-    CUDA_CHECK(cudaFuncSetAttribute(_h_sm_optimized<uint32_t, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
-    if (max_depth <= 6) {
-      _h_sm_optimized<uint32_t, 56><<<grid, block, smem_bytes, stream.stream()>>>(
-        XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint32_t>(), H.data_ptr<int64_t>(),
-        nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot, sh_stride);
-    } else if (max_depth == 7) {
-      _h_sm_optimized<uint32_t, 120><<<grid, block, smem_bytes, stream.stream()>>>(
-        XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint32_t>(), H.data_ptr<int64_t>(),
-        nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot, sh_stride);
+  } else if (max_depth == 7) {
+    // D=7: 120 high-depth nodes
+    if (lf_dt == torch::kUInt16) {
+      LAUNCH_KERNEL(uint16_t, 120);
+    } else if (lf_dt == torch::kUInt32) {
+      LAUNCH_KERNEL(uint32_t, 120);
+    } else if (lf_dt == torch::kUInt64) {
+      LAUNCH_KERNEL(uint64_t, 120);
     } else {
-      _h_sm_optimized<uint32_t, 64><<<grid, block, smem_bytes, stream.stream()>>>(
-        XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint32_t>(), H.data_ptr<int64_t>(),
-        nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot, sh_stride);
+      TORCH_CHECK(false, "LF must be uint16/32/64");
     }
-    CUDA_CHECK(cudaGetLastError());
-  } else if (lf_dt == torch::kUInt64) {
-    CUDA_CHECK(cudaFuncSetAttribute(_h_sm_optimized<uint64_t, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
-    if (max_depth <= 6) {
-      _h_sm_optimized<uint64_t, 56><<<grid, block, smem_bytes, stream.stream()>>>(
-        XS_ptr, Y.data_ptr<int16_t>(), static_cast<uint64_t*>(LF.data_ptr()), H.data_ptr<int64_t>(),
-        nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot, sh_stride);
-    } else if (max_depth == 7) {
-      _h_sm_optimized<uint64_t, 120><<<grid, block, smem_bytes, stream.stream()>>>(
-        XS_ptr, Y.data_ptr<int16_t>(), static_cast<uint64_t*>(LF.data_ptr()), H.data_ptr<int64_t>(),
-        nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot, sh_stride);
-    } else {
-      _h_sm_optimized<uint64_t, 64><<<grid, block, smem_bytes, stream.stream()>>>(
-        XS_ptr, Y.data_ptr<int16_t>(), static_cast<uint64_t*>(LF.data_ptr()), H.data_ptr<int64_t>(),
-        nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot, sh_stride);
-    }
-    CUDA_CHECK(cudaGetLastError());
   } else {
-    TORCH_CHECK(false, "LF must be uint16/32/64");
+    // D=8: 248 nodes, use smaller buffer
+    if (lf_dt == torch::kUInt16) {
+      LAUNCH_KERNEL(uint16_t, 64);
+    } else if (lf_dt == torch::kUInt32) {
+      LAUNCH_KERNEL(uint32_t, 64);
+    } else if (lf_dt == torch::kUInt64) {
+      LAUNCH_KERNEL(uint64_t, 64);
+    } else {
+      TORCH_CHECK(false, "LF must be uint16/32/64");
+    }
   }
   
   return H;
 }
+
+#undef LAUNCH_KERNEL
