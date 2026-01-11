@@ -62,7 +62,6 @@ __global__ void _h_sm(
   unsigned long long* sh_low = (unsigned long long*)(shmem + n_ge4 * 2 * 32);
 
   // FIX 1: Efficient block-wide zeroing of high-depth shared memory
-  // Replaces the redundant per-warp loop
   const int sh_high_elems = n_ge4 * 2 * 32;
   for (int i = threadIdx.x; i < sh_high_elems; i += blockDim.x) {
     sh_high[i] = 0;
@@ -157,7 +156,6 @@ __global__ void _h_sm(
   }
 
   // Write low-depth registers to shared (packed, per warp, per node, per lane)
-  // FIX 3: low_nodes increased to 15 (depths 0..3)
   const int low_nodes = 15;
   int nd = 0;
   sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf0), static_cast<int>(hw0));
@@ -210,12 +208,15 @@ __global__ void _h_sm(
   __syncthreads();
   if (block_warp == 0) {
     for (int ndi = 0; ndi < low_nodes; ++ndi) {
-      const unsigned long long pack = sh_low[(0 * low_nodes + ndi) * 32 + lane];
-      const int64_t fsum = static_cast<int64_t>(static_cast<int32_t>(static_cast<uint32_t>(pack)));
-      const int64_t csum = static_cast<int64_t>(static_cast<uint32_t>(pack >> 32));
       const int node = ndi; // 0..14
-      atomicAdd(Hptr(H, nodes_total, feat_set, node, 0, lane), static_cast<unsigned long long>(fsum));
-      atomicAdd(Hptr(H, nodes_total, feat_set, node, 1, lane), static_cast<unsigned long long>(csum));
+      // CHECK ADDED: Prevent out-of-bounds writes for small max_depth
+      if (node < nodes_total) {
+        const unsigned long long pack = sh_low[(0 * low_nodes + ndi) * 32 + lane];
+        const int64_t fsum = static_cast<int64_t>(static_cast<int32_t>(static_cast<uint32_t>(pack)));
+        const int64_t csum = static_cast<int64_t>(static_cast<uint32_t>(pack >> 32));
+        atomicAdd(Hptr(H, nodes_total, feat_set, node, 0, lane), static_cast<unsigned long long>(fsum));
+        atomicAdd(Hptr(H, nodes_total, feat_set, node, 1, lane), static_cast<unsigned long long>(csum));
+      }
     }
   }
   __syncthreads();
