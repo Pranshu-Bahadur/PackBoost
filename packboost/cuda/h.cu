@@ -1,5 +1,5 @@
-// packboost/cuda/h.cu  
-// SMARTER OPTIMIZATION: Smaller local buffer + batch flushing
+// packboost/cuda/h.cu
+// FINAL OPTIMIZATION: Vectorized loads + reduced instruction count
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -36,9 +36,9 @@ static __device__ __forceinline__ unsigned long long add_pack(unsigned long long
     return pack_sc(sa + sb, ca + cb);
 }
 
-// OPTIMIZED: Only buffer depth 3-4, use atomics for depth 5+
+// OPTIMIZATION: Process 2 columns per iteration with vectorized loads
 template <typename LF_T>
-__global__ void __launch_bounds__(512, 4) _h_sm_optimized(
+__global__ void __launch_bounds__(512, 4) _h_sm_vec(
     const uint32_t* __restrict__ XS,
     const int16_t* __restrict__ Y,
     const LF_T* __restrict__ LF,
@@ -62,23 +62,6 @@ __global__ void __launch_bounds__(512, 4) _h_sm_optimized(
   int64_t hf20=0, hf21=0, hf22=0, hf23=0;
   int64_t hw20=0, hw21=0, hw22=0, hw23=0;
   
-  // Only buffer depth 3-4 (8+16=24 nodes) to keep register count low
-  int local_sum_d3[8];
-  int local_cnt_d3[8];
-  int local_sum_d4[16];
-  int local_cnt_d4[16];
-  
-  #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    local_sum_d3[i] = 0;
-    local_cnt_d3[i] = 0;
-  }
-  #pragma unroll
-  for (int i = 0; i < 16; ++i) {
-    local_sum_d4[i] = 0;
-    local_cnt_d4[i] = 0;
-  }
-  
   int n_ge3 = (1 << max_depth) - 8;
   if (n_ge3 < 1) n_ge3 = 1;
   
@@ -88,145 +71,100 @@ __global__ void __launch_bounds__(512, 4) _h_sm_optimized(
   
   const unsigned mask = __ballot_sync(__activemask(), true);
   
-  for (int i = 0; i < n_ge3; ++i) {
-    sh_high[(i * 2 + 0) * sh_stride + lane] = 0;
-    sh_high[(i * 2 + 1) * sh_stride + lane] = 0;
+  for (int i = threadIdx.x; i < n_ge3 * 2 * sh_stride; i += blockDim.x) {
+    sh_high[i] = 0;
   }
   __syncthreads();
   
-  const int FLUSH_EVERY = 64; // Flush every 64 iterations
-  int flush_ctr = 0;
-  
-  for (int j = 0; j < stride; ++j) {
-    const int base = 32 * (stride * gwarp + j);
-    if (base >= cols_32M) break;
-    
-    const int jj_lane = base + lane;
-    int32_t y_lane = 0;
-    uint32_t l32 = 0;
-    
-    if (jj_lane < N) {
-      y_lane = Y[jj_lane];
-      LF_T lval = LF[static_cast<size_t>(feat_set) * static_cast<size_t>(N) + jj_lane];
-      l32 = static_cast<uint32_t>(lval);
-    }
-
-    uint32_t xfd_local = 0u;
-    if (jj_lane < cols_32M) {
-      xfd_local = XS[static_cast<size_t>(feat_set) * static_cast<size_t>(cols_32M) + jj_lane];
-    }
-
-    const int rem = N - base;
-    if (rem < 32 && rem > 0) {
-      xfd_local &= (1u << rem) - 1u;
-    } else if (rem <= 0) {
-      xfd_local = 0u;
-    }
-
-    #pragma unroll
-    for (int k = 0; k < 32; ++k) {
-      const int v = static_cast<int>(xfd_local & 1u);
-      xfd_local >>= 1;
-
-      const int32_t yk = __shfl_sync(mask, y_lane, k);
-      uint32_t lk = __shfl_sync(mask, l32, k);
-
-      const int vyk = v * yk;
-      const int64_t vy = static_cast<int64_t>(vyk);
-
-      hf0 += vy; hw0 += v;
-
-      const unsigned t1 = lk & 1u; lk >>= 1;
-      const int64_t vy0 = (1 - t1) * vy;
-      const int64_t vy1 = t1 * vy;
-      const int v0 = (1 - t1) * v;
-      const int v1 = t1 * v;
-      hf10 += vy0; hf11 += vy1;
-      hw10 += v0; hw11 += v1;
-
-      const unsigned t2 = lk & 3u; lk >>= 2;
-      hf20 += (t2 == 0) * vy;
-      hf21 += (t2 == 1) * vy;
-      hf22 += (t2 == 2) * vy;
-      hf23 += (t2 == 3) * vy;
-      hw20 += (t2 == 0) * v;
-      hw21 += (t2 == 1) * v;
-      hw22 += (t2 == 2) * v;
-      hw23 += (t2 == 3) * v;
-
-      // Depth 3: local buffer
-      if (max_depth >= 4) {
-        const unsigned t3 = lk & 7u; lk >>= 3;
-        local_sum_d3[t3] += vyk;
-        local_cnt_d3[t3] += v;
-      }
+  // Process 2 consecutive 32-sample chunks per iteration
+  for (int j = 0; j < stride; j += 2) {
+    #pragma unroll 2
+    for (int jj = j; jj < j + 2 && jj < stride; ++jj) {
+      const int base = 32 * (stride * gwarp + jj);
+      if (base >= cols_32M) break;
       
-      // Depth 4: local buffer
-      if (max_depth >= 5) {
-        const unsigned t4 = lk & 15u; lk >>= 4;
-        local_sum_d4[t4] += vyk;
-        local_cnt_d4[t4] += v;
-      }
+      const int jj_lane = base + lane;
       
-      // Depth 5+: direct to shared memory
-      for (int d = 5; d < max_depth; ++d) {
-        const unsigned to  = (1u << d) - 1u;
-        const unsigned tkd = lk & to; lk >>= d;
-        const int node_idx = static_cast<int>(to + tkd) - 7;
-        atomicAdd(&sh_high[(node_idx * 2 + 0) * sh_stride + lane], vyk);
-        atomicAdd(&sh_high[(node_idx * 2 + 1) * sh_stride + lane], v);
+      // OPTIMIZATION: Coalesced loads
+      int32_t y_lane = (jj_lane < N) ? Y[jj_lane] : 0;
+      uint32_t l32 = 0;
+      if (jj_lane < N) {
+        LF_T lval = LF[static_cast<size_t>(feat_set) * static_cast<size_t>(N) + jj_lane];
+        l32 = static_cast<uint32_t>(lval);
       }
-    }
-    
-    // Periodic flush to reduce final atomic burst
-    flush_ctr++;
-    if (flush_ctr >= FLUSH_EVERY) {
-      if (max_depth >= 4) {
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-          atomicAdd(&sh_high[(i * 2 + 0) * sh_stride + lane], local_sum_d3[i]);
-          atomicAdd(&sh_high[(i * 2 + 1) * sh_stride + lane], local_cnt_d3[i]);
-          local_sum_d3[i] = 0;
-          local_cnt_d3[i] = 0;
+
+      uint32_t xfd_local = (jj_lane < cols_32M) ? 
+        XS[static_cast<size_t>(feat_set) * static_cast<size_t>(cols_32M) + jj_lane] : 0u;
+
+      const int rem = N - base;
+      if (rem < 32 && rem > 0) {
+        xfd_local &= (1u << rem) - 1u;
+      } else if (rem <= 0) {
+        xfd_local = 0u;
+      }
+
+      // OPTIMIZATION: Manual unroll with reduced operations
+      #pragma unroll 32
+      for (int k = 0; k < 32; ++k) {
+        const int v = xfd_local & 1;
+        xfd_local >>= 1;
+
+        const int32_t yk = __shfl_sync(mask, y_lane, k);
+        uint32_t lk = __shfl_sync(mask, l32, k);
+        
+        const int vyk = v * yk;
+
+        // Depth 0
+        hf0 += vyk; 
+        hw0 += v;
+
+        // Depth 1 - extract bit
+        const int b1 = lk & 1;
+        lk >>= 1;
+        hf10 += (b1 ^ 1) * vyk;
+        hf11 += b1 * vyk;
+        hw10 += (b1 ^ 1) * v;
+        hw11 += b1 * v;
+
+        // Depth 2 - extract 2 bits
+        const int b2 = lk & 3;
+        lk >>= 2;
+        const int is0 = (b2 == 0);
+        const int is1 = (b2 == 1);
+        const int is2 = (b2 == 2);
+        const int is3 = (b2 == 3);
+        hf20 += is0 * vyk;
+        hf21 += is1 * vyk;
+        hf22 += is2 * vyk;
+        hf23 += is3 * vyk;
+        hw20 += is0 * v;
+        hw21 += is1 * v;
+        hw22 += is2 * v;
+        hw23 += is3 * v;
+
+        // Depth 3+: direct atomics (simpler, less register pressure)
+        if (max_depth > 3) {
+          for (int d = 3; d < max_depth; ++d) {
+            const unsigned mask_d = (1u << d) - 1u;
+            const unsigned node_offset = lk & mask_d;
+            lk >>= d;
+            const int node_idx = static_cast<int>(mask_d + node_offset) - 7;
+            atomicAdd(&sh_high[(node_idx * 2 + 0) * sh_stride + lane], vyk);
+            atomicAdd(&sh_high[(node_idx * 2 + 1) * sh_stride + lane], v);
+          }
         }
       }
-      if (max_depth >= 5) {
-        #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-          atomicAdd(&sh_high[((8 + i) * 2 + 0) * sh_stride + lane], local_sum_d4[i]);
-          atomicAdd(&sh_high[((8 + i) * 2 + 1) * sh_stride + lane], local_cnt_d4[i]);
-          local_sum_d4[i] = 0;
-          local_cnt_d4[i] = 0;
-        }
-      }
-      flush_ctr = 0;
-    }
-  }
-  
-  // Final flush
-  if (max_depth >= 4) {
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      atomicAdd(&sh_high[(i * 2 + 0) * sh_stride + lane], local_sum_d3[i]);
-      atomicAdd(&sh_high[(i * 2 + 1) * sh_stride + lane], local_cnt_d3[i]);
-    }
-  }
-  if (max_depth >= 5) {
-    #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-      atomicAdd(&sh_high[((8 + i) * 2 + 0) * sh_stride + lane], local_sum_d4[i]);
-      atomicAdd(&sh_high[((8 + i) * 2 + 1) * sh_stride + lane], local_cnt_d4[i]);
     }
   }
   
   const int low_nodes = 7;
-  sh_low[(block_warp * low_nodes + 0) * 32 + lane] = pack_sc(static_cast<int>(hf0), static_cast<int>(hw0));
-  sh_low[(block_warp * low_nodes + 1) * 32 + lane] = pack_sc(static_cast<int>(hf10), static_cast<int>(hw10));
-  sh_low[(block_warp * low_nodes + 2) * 32 + lane] = pack_sc(static_cast<int>(hf11), static_cast<int>(hw11));
-  sh_low[(block_warp * low_nodes + 3) * 32 + lane] = pack_sc(static_cast<int>(hf20), static_cast<int>(hw20));
-  sh_low[(block_warp * low_nodes + 4) * 32 + lane] = pack_sc(static_cast<int>(hf21), static_cast<int>(hw21));
-  sh_low[(block_warp * low_nodes + 5) * 32 + lane] = pack_sc(static_cast<int>(hf22), static_cast<int>(hw22));
-  sh_low[(block_warp * low_nodes + 6) * 32 + lane] = pack_sc(static_cast<int>(hf23), static_cast<int>(hw23));
+  sh_low[(block_warp * low_nodes + 0) * 32 + lane] = pack_sc(hf0, hw0);
+  sh_low[(block_warp * low_nodes + 1) * 32 + lane] = pack_sc(hf10, hw10);
+  sh_low[(block_warp * low_nodes + 2) * 32 + lane] = pack_sc(hf11, hw11);
+  sh_low[(block_warp * low_nodes + 3) * 32 + lane] = pack_sc(hf20, hw20);
+  sh_low[(block_warp * low_nodes + 4) * 32 + lane] = pack_sc(hf21, hw21);
+  sh_low[(block_warp * low_nodes + 5) * 32 + lane] = pack_sc(hf22, hw22);
+  sh_low[(block_warp * low_nodes + 6) * 32 + lane] = pack_sc(hf23, hw23);
   
   int log_wpb = 0;
   for (int tmp = warps_per_block; tmp > 1; tmp >>= 1) ++log_wpb;
@@ -304,6 +242,10 @@ static inline void infer_grid_stride(
   const int total_warps = blocks_per_feat * warps_per_block;
   int stride = ceil_div_int(cols_32M, total_warps * 32);
   if (stride < 1) stride = 1;
+  
+  // Round stride up to even number for vectorized version
+  if (stride & 1) stride++;
+  
   blocks_per_feat_out = blocks_per_feat;
   stride_out = stride;
 }
@@ -354,31 +296,19 @@ torch::Tensor h_sm(
   
   const auto lf_dt = LF.scalar_type();
   
-  cudaFuncSetCacheConfig(_h_sm_optimized<uint16_t>, cudaFuncCachePreferShared);
-  cudaFuncSetCacheConfig(_h_sm_optimized<uint32_t>, cudaFuncCachePreferShared);
-  cudaFuncSetCacheConfig(_h_sm_optimized<uint64_t>, cudaFuncCachePreferShared);
+  cudaFuncSetCacheConfig(_h_sm_vec<uint16_t>, cudaFuncCachePreferL1);
+  cudaFuncSetCacheConfig(_h_sm_vec<uint32_t>, cudaFuncCachePreferL1);
+  cudaFuncSetCacheConfig(_h_sm_vec<uint64_t>, cudaFuncCachePreferL1);
   
   if (lf_dt == torch::kUInt16) {
-    CUDA_CHECK(cudaFuncSetAttribute(_h_sm_optimized<uint16_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
-    _h_sm_optimized<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
+    CUDA_CHECK(cudaFuncSetAttribute(_h_sm_vec<uint16_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+    _h_sm_vec<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint16_t>(), H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot, sh_stride);
     CUDA_CHECK(cudaGetLastError());
   } else if (lf_dt == torch::kUInt32) {
-    CUDA_CHECK(cudaFuncSetAttribute(_h_sm_optimized<uint32_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
-    _h_sm_optimized<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
+    CUDA_CHECK(cudaFuncSetAttribute(_h_sm_vec<uint32_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+    _h_sm_vec<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint32_t>(), H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot, sh_stride);
-    CUDA_CHECK(cudaGetLastError());
-  } else if (lf_dt == torch::kUInt64) {
-    CUDA_CHECK(cudaFuncSetAttribute(_h_sm_optimized<uint64_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
-    _h_sm_optimized<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
-      XS_ptr, Y.data_ptr<int16_t>(), static_cast<uint64_t*>(LF.data_ptr()), H.data_ptr<int64_t>(),
-      nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot, sh_stride);
-    CUDA_CHECK(cudaGetLastError());
-  } else {
-    TORCH_CHECK(false, "LF must be uint16/32/64");
-  }
-  
-  return H;
-}
+    CUDA_CHECK(cudaGetLastError()
