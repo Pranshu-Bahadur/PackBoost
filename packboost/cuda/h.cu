@@ -1,5 +1,5 @@
 // packboost/cuda/h.cu
-// OPTIMIZED: Main loop improvements for 2-3× speedup
+// CORRECTED: Smaller local buffers + proper initialization
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -26,7 +26,7 @@ static __device__ __forceinline__ unsigned long long add_pack(unsigned long long
     return pack_sc(sa + sb, ca + cb);
 }
 
-// OPTIMIZATION 1: Reduce shared memory atomics by using thread-local arrays
+// OPTIMIZED: Reduced local buffer size to 8 (only depth 3 nodes)
 template <typename LF_T>
 __global__ void _h_sm(
     const uint32_t* __restrict__ XS,
@@ -53,21 +53,12 @@ __global__ void _h_sm(
   int64_t hf20=0, hf21=0, hf22=0, hf23=0;
   int64_t hw20=0, hw21=0, hw22=0, hw23=0;
   
-  // OPTIMIZATION 1: Thread-local buffers for high-depth nodes (reduce atomics)
-  // Each thread accumulates locally, then flushes periodically
   int n_ge3 = (1 << max_depth) - 8;
   if (n_ge3 < 1) n_ge3 = 1;
   
-  // Allocate local buffers for frequently accessed nodes
-  const int LOCAL_BUF_SIZE = 32;  // Buffer first 32 high-depth nodes locally
-  int local_sum[LOCAL_BUF_SIZE];
-  int local_cnt[LOCAL_BUF_SIZE];
-  
-  #pragma unroll
-  for (int i = 0; i < LOCAL_BUF_SIZE; ++i) {
-    local_sum[i] = 0;
-    local_cnt[i] = 0;
-  }
+  // OPTIMIZATION: Only buffer depth-3 nodes (8 nodes) to reduce register pressure
+  int local_sum_d3[8] = {0,0,0,0,0,0,0,0};
+  int local_cnt_d3[8] = {0,0,0,0,0,0,0,0};
   
   extern __shared__ int shmem[];
   int* sh_high = shmem;
@@ -82,17 +73,14 @@ __global__ void _h_sm(
   }
   __syncthreads();
   
-  const int FLUSH_INTERVAL = 64;  // Flush local buffers every 64 iterations
+  const int FLUSH_INTERVAL = 128;
   int flush_counter = 0;
   
-  // OPTIMIZATION 2: Better loop structure with prefetching
   for (int j = 0; j < stride; ++j) {
     const int base = 32 * (stride * gwarp + j);
     if (base >= cols_32M) break;
     
     const int jj_lane = base + lane;
-    
-    // OPTIMIZATION 3: Prefetch next iteration's data
     int32_t y_lane = 0;
     uint32_t l32 = 0;
     
@@ -107,7 +95,6 @@ __global__ void _h_sm(
       xfd_local = XS[static_cast<size_t>(feat_set) * static_cast<size_t>(cols_32M) + jj_lane];
     }
 
-    // Mask for validity
     const int rem = N - base;
     if (rem < 32 && rem > 0) {
       xfd_local &= (1u << rem) - 1u;
@@ -115,7 +102,6 @@ __global__ void _h_sm(
       xfd_local = 0u;
     }
 
-    // OPTIMIZATION 4: Process all 32 bits with reduced branching
     #pragma unroll 32
     for (int k = 0; k < 32; ++k) {
       const int v = static_cast<int>(xfd_local & 1u);
@@ -126,21 +112,16 @@ __global__ void _h_sm(
 
       const int64_t vy = static_cast<int64_t>(v) * (int64_t)yk;
 
-      // Depth 0
-      hf0 += vy; 
-      hw0 += v;
+      // Depth 0-2 (registers)
+      hf0 += vy; hw0 += v;
 
-      // Depth 1
-      const unsigned t1 = lk & 1u; 
-      lk >>= 1;
+      const unsigned t1 = lk & 1u; lk >>= 1;
       hf10 += (t1 == 0u) ? vy : 0;
       hf11 += (t1 != 0u) ? vy : 0;
       hw10 += (t1 == 0u) ? v : 0;
       hw11 += (t1 != 0u) ? v : 0;
 
-      // Depth 2
-      const unsigned t2 = lk & 3u; 
-      lk >>= 2;
+      const unsigned t2 = lk & 3u; lk >>= 2;
       hf20 += (t2 == 0u) ? vy : 0;
       hf21 += (t2 == 1u) ? vy : 0;
       hf22 += (t2 == 2u) ? vy : 0;
@@ -150,50 +131,54 @@ __global__ void _h_sm(
       hw22 += (t2 == 2u) ? v : 0;
       hw23 += (t2 == 3u) ? v : 0;
 
-      // OPTIMIZATION 5: Buffer high-depth accumulations locally
+      // Depth 3+ (local buffers for d=3, shared for d>3)
       if (max_depth > 3) {
+        // Depth 3: buffer locally
+        if (max_depth >= 3) {
+          const unsigned t3 = lk & 7u; lk >>= 3;
+          local_sum_d3[t3] += v * yk;
+          local_cnt_d3[t3] += v;
+        }
+        
+        // Depth 4+: use shared memory atomics
         #pragma unroll
-        for (int d = 3; d < 8 && d < max_depth; ++d) {
+        for (int d = 4; d < 8 && d < max_depth; ++d) {
           const unsigned to  = (1u << d) - 1u;
-          const unsigned tkd = lk & to; 
-          lk >>= d;
+          const unsigned tkd = lk & to; lk >>= d;
           const int node_idx = static_cast<int>(to + tkd) - 7;
           
-          // Use local buffer for first 32 nodes
-          if (node_idx < LOCAL_BUF_SIZE) {
-            local_sum[node_idx] += v * yk;
-            local_cnt[node_idx] += v;
-          } else {
-            // Fallback to shared memory atomics for higher nodes
-            atomicAdd(&sh_high[(node_idx * 2 + 0) * sh_stride + lane], v * yk);
-            atomicAdd(&sh_high[(node_idx * 2 + 1) * sh_stride + lane], v);
-          }
+          atomicAdd(&sh_high[(node_idx * 2 + 0) * sh_stride + lane], v * yk);
+          atomicAdd(&sh_high[(node_idx * 2 + 1) * sh_stride + lane], v);
         }
       }
     }
     
-    // Periodic flush of local buffers to shared memory
+    // Periodic flush
     flush_counter++;
     if (flush_counter >= FLUSH_INTERVAL) {
-      #pragma unroll
-      for (int i = 0; i < LOCAL_BUF_SIZE && i < n_ge3; ++i) {
-        if (local_sum[i] | local_cnt[i]) {
-          atomicAdd(&sh_high[(i * 2 + 0) * sh_stride + lane], local_sum[i]);
-          atomicAdd(&sh_high[(i * 2 + 1) * sh_stride + lane], local_cnt[i]);
-          local_sum[i] = 0;
-          local_cnt[i] = 0;
+      if (max_depth > 3) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          if (local_sum_d3[i] | local_cnt_d3[i]) {
+            atomicAdd(&sh_high[(i * 2 + 0) * sh_stride + lane], local_sum_d3[i]);
+            atomicAdd(&sh_high[(i * 2 + 1) * sh_stride + lane], local_cnt_d3[i]);
+            local_sum_d3[i] = 0;
+            local_cnt_d3[i] = 0;
+          }
         }
       }
       flush_counter = 0;
     }
   }
   
-  // Final flush of local buffers
-  #pragma unroll
-  for (int i = 0; i < LOCAL_BUF_SIZE && i < n_ge3; ++i) {
-    if (local_sum[i] | local_cnt[i]) {
-      atomicAdd(&sh_high[(i * 2 + 0) * sh_stride + lane], local_sum[i]);
-      atomicAdd(&sh_high[(i * 2 + 1) * sh_stride + lane], local_cnt[i]);
+  // Final flush
+  if (max_depth > 3) {
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      if (local_sum_d3[i] | local_cnt_d3[i]) {
+        atomicAdd(&sh_high[(i * 2 + 0) * sh_stride + lane], local_sum_d3[i]);
+        atomicAdd(&sh_high[(i * 2 + 1) * sh_stride + lane], local_cnt_d3[i]);
+      }
     }
   }
   
@@ -207,7 +192,7 @@ __global__ void _h_sm(
   sh_low[(block_warp * low_nodes + 5) * 32 + lane] = pack_sc(static_cast<int>(hf22), static_cast<int>(hw22));
   sh_low[(block_warp * low_nodes + 6) * 32 + lane] = pack_sc(static_cast<int>(hf23), static_cast<int>(hw23));
   
-  // Butterfly reduction for low-depth nodes
+  // Butterfly reduction
   int log_wpb = 0;
   for (int tmp = warps_per_block; tmp > 1; tmp >>= 1) ++log_wpb;
   
@@ -226,9 +211,8 @@ __global__ void _h_sm(
   
   __syncthreads();
   
-  // Warp 0 drains to global memory
+  // Warp 0 drains low-depth
   if (block_warp == 0) {
-    // Low-depth nodes
     #pragma unroll
     for (int ndi = 0; ndi < low_nodes; ++ndi) {
       const unsigned long long pack = sh_low[ndi * 32 + lane];
@@ -243,7 +227,7 @@ __global__ void _h_sm(
   
   __syncthreads();
   
-  // All warps drain high-depth nodes
+  // All warps drain high-depth
   const int rows_per_warp = (n_ge3 + warps_per_block - 1) / warps_per_block;
   for (int k = 0; k < rows_per_warp; ++k) {
     const int node = 7 + rows_per_warp * block_warp + k;
