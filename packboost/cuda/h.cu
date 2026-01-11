@@ -1,5 +1,5 @@
 // packboost/cuda/h.cu
-// MINIMAL OPTIMIZATION: Only add bank conflict fix, keep everything else identical
+// MINIMAL OPTIMIZATION with profiling to identify bottlenecks
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -188,7 +188,6 @@ static inline int ceil_div_int(int a, int b){ return (a + b - 1) / b; }
 static inline int choose_warps_and_stride(int max_depth, size_t smem_cap, int& stride_out) {
   int n_ge3 = std::max((1 << max_depth) - 8, 1);
   
-  // Try stride 33 (fast), fallback to 32 (compact)
   for (int s : {33, 32}) {
     for (int wpb : {16, 8, 4, 2, 1}) {
       size_t smem_high = (size_t)n_ge3 * 2 * s * sizeof(int);
@@ -233,8 +232,10 @@ torch::Tensor h_sm(
   auto H = torch::zeros({XS.size(0), nodes_tot, 2, 32}, opts);
   
   auto* prop = at::cuda::getCurrentDeviceProperties();
-  size_t smem_cap = prop->sharedMemPerBlockOptin ? (size_t)prop->sharedMemPerBlockOptin
-                                                 : (size_t)prop->sharedMemPerBlock;
+  
+  size_t smem_cap_default = (size_t)prop->sharedMemPerBlock;
+  size_t smem_cap_optin = (size_t)prop->sharedMemPerBlockOptin;
+  size_t smem_cap = (smem_cap_optin > smem_cap_default) ? smem_cap_optin : smem_cap_default;
   
   int sh_stride = 32;
   const int warps_per_block = choose_warps_and_stride(max_depth, smem_cap, sh_stride);
@@ -250,25 +251,25 @@ torch::Tensor h_sm(
   size_t smem_low = static_cast<size_t>(warps_per_block) * 7 * 32 * sizeof(unsigned long long);
   size_t smem_bytes = smem_high + smem_low;
   
-  // ADDED: Print debug info
-  std::cout << "[h_sm] depth=" << max_depth 
-            << " sh_stride=" << sh_stride 
-            << " warps=" << warps_per_block
-            << " smem=" << smem_bytes << "/" << smem_cap 
-            << " (bank_conflicts=" << (sh_stride == 32 ? "YES" : "NO") << ")"
-            << std::endl;
-  
-  TORCH_CHECK(smem_bytes <= smem_cap,
-              "Required dynamic shared memory (", smem_bytes,
-              ") exceeds device limit (", smem_cap, ")");
-  
   auto stream = at::cuda::getCurrentCUDAStream();
+  
+  // Create events for timing
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+  
+  cudaEventRecord(start, stream.stream());
   
   TORCH_CHECK(Y.scalar_type() == torch::kInt16, "Y must be int16");
   TORCH_CHECK(XS.scalar_type() == torch::kUInt32 || XS.scalar_type() == torch::kInt32, "XS must be uint32/int32");
   const uint32_t* XS_ptr = reinterpret_cast<const uint32_t*>(XS.data_ptr());
   
   const auto lf_dt = LF.scalar_type();
+  
+  cudaFuncSetCacheConfig(_h_sm<uint16_t>, cudaFuncCachePreferShared);
+  cudaFuncSetCacheConfig(_h_sm<uint32_t>, cudaFuncCachePreferShared);
+  cudaFuncSetCacheConfig(_h_sm<uint64_t>, cudaFuncCachePreferShared);
+  
   if (lf_dt == torch::kUInt16) {
     cudaFuncSetAttribute(_h_sm<uint16_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
     _h_sm<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
@@ -287,5 +288,29 @@ torch::Tensor h_sm(
   } else {
     TORCH_CHECK(false, "LF must be uint16/32/64");
   }
+  
+  cudaEventRecord(stop, stream.stream());
+  cudaEventSynchronize(stop);
+  
+  float milliseconds = 0;
+  cudaEventElapsedTime(&milliseconds, start, stop);
+  
+  // Calculate throughput
+  size_t total_ops = (size_t)nfeatsets * N * max_depth;
+  double gops = (total_ops / 1e9) / (milliseconds / 1000.0);
+  
+  std::cout << "[h_sm] depth=" << max_depth 
+            << " N=" << N
+            << " nfeatsets=" << nfeatsets
+            << " stride=" << sh_stride 
+            << " warps=" << warps_per_block
+            << " time=" << milliseconds << "ms"
+            << " throughput=" << gops << " Gop/s"
+            << " bank_conflicts=" << (sh_stride == 32 ? "YES" : "NO")
+            << std::endl;
+  
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+  
   return H;
 }
