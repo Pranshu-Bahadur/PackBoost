@@ -11,6 +11,32 @@ from packboost.cuda import kernels
 print('kernels successfully Installed!')
 
 
+def _to_torch_tensor(arr, device, dtype):
+    """
+    Convert various array types (NumPy, cuDF, CuPy) to PyTorch tensor.
+    Optimized to keep GPU arrays on GPU without CPU transfer.
+    """
+    # Check if it's a cuDF Series or DataFrame column
+    if hasattr(arr, '__cuda_array_interface__'):
+        # CuPy or cuDF array - can be converted directly to PyTorch on GPU
+        import cupy as cp
+        if hasattr(arr, 'values'):  # cuDF Series/DataFrame
+            cupy_arr = cp.asarray(arr.values)
+        else:
+            cupy_arr = cp.asarray(arr)
+        # Convert CuPy to PyTorch via DLPack (zero-copy on GPU)
+        return torch.as_tensor(cupy_arr, device=device).to(dtype)
+    elif isinstance(arr, np.ndarray):
+        # Regular NumPy array
+        return torch.from_numpy(arr).to(device=device, dtype=dtype)
+    elif torch.is_tensor(arr):
+        # Already a tensor
+        return arr.to(device=device, dtype=dtype)
+    else:
+        # Fallback: try converting to numpy first
+        return torch.from_numpy(np.asarray(arr)).to(device=device, dtype=dtype)
+
+
 class PackBoost(BaseEstimator, RegressorMixin):
     def __init__(self, device='cuda',comment=""):
         self.device = device
@@ -35,7 +61,11 @@ class PackBoost(BaseEstimator, RegressorMixin):
             qgrad_bits: int = 12,
             seed: int = 42,
             era_ids: np.ndarray | None = None):
-        assert X.dtype == np.int8 and y.dtype == np.float32
+        # Check dtypes - support both NumPy and cuDF arrays
+        X_dtype = X.dtype if hasattr(X, 'dtype') else np.int8
+        y_dtype = y.dtype if hasattr(y, 'dtype') else np.float32
+        assert str(X_dtype) == 'int8', f"X must be int8, got {X_dtype}"
+        assert str(y_dtype) == 'float32', f"y must be float32, got {y_dtype}"
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
         callbacks = [] if callbacks is None else callbacks
 
@@ -68,7 +98,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         era_ends = torch.from_numpy(ends_np).to(device=device, dtype=torch.int32).contiguous()
 
         # ---------- encode_cuts(X) ----------
-        X_t = torch.from_numpy(X).to(device=device, dtype=torch.int8)
+        X_t = _to_torch_tensor(X, device=device, dtype=torch.int8)
         XB  = self.encode_cuts(X_t).contiguous()              # [4F, M] uint32
         bF, M = XB.shape
         Np = 32 * M
@@ -77,8 +107,10 @@ class PackBoost(BaseEstimator, RegressorMixin):
             torch.cuda.empty_cache()
 
         # labels/preds (length N, unpadded)
-        yq30  = (y * (1 << 30)).astype(np.int64)
-        Y_i32 = torch.from_numpy(yq30[:N].astype(np.int32)).to(device=device)
+        # Handle cuDF/CuPy arrays or NumPy arrays
+        y_tensor = _to_torch_tensor(y, device=device, dtype=torch.float32)
+        yq30  = (y_tensor * (1 << 30)).to(torch.int64)
+        Y_i32 = yq30[:N].to(torch.int32)
         P     = torch.zeros(N, dtype=torch.int32, device=device)
 
         self.Y_i32 = Y_i32
@@ -135,17 +167,18 @@ class PackBoost(BaseEstimator, RegressorMixin):
         # ---------- optional validation ----------
         use_val = (Xv is not None) and (Yv is not None)
         if use_val:
-            assert Xv.dtype == np.int8 and Yv.dtype == np.float32
+            # Support both NumPy and cuDF arrays
             Nv = int(Xv.shape[0]); self.val_N = Nv
-            Xv_t = torch.from_numpy(Xv).to(device=device, dtype=torch.int8)
+            Xv_t = _to_torch_tensor(Xv, device=device, dtype=torch.int8)
             XBv  = self.encode_cuts(Xv_t).contiguous()
             Pv   = torch.zeros(Nv, dtype=torch.int32, device=device)
-            yvq30  = (Yv * (1 << 30)).astype(np.int64)
-            Yv_i32 = torch.from_numpy(yvq30[:Nv].astype(np.int32)).to(device=device)
+            Yv_tensor = _to_torch_tensor(Yv, device=device, dtype=torch.float32)
+            yvq30  = (Yv_tensor * (1 << 30)).to(torch.int64)
+            Yv_i32 = yvq30[:Nv].to(torch.int32)
 
             self.Pv_    = Pv
             self.Yv_i32 = Yv_i32
-            self.Yv     = torch.from_numpy(Yv).to(device=device)
+            self.Yv     = Yv_tensor
 
             Lv  = torch.zeros((nfolds, Dm, Nv), dtype=leaf_dtype, device=device)
             Lvn = torch.zeros_like(Lv)
@@ -249,22 +282,25 @@ class PackBoost(BaseEstimator, RegressorMixin):
         """
         Predict with the currently trained model.
 
-        X : np.ndarray[int8] or torch.Tensor[int8] of shape [N, F]
+        X : np.ndarray[int8] or torch.Tensor[int8] or cuDF array of shape [N, F]
             Raw discrete features (0..4 expected per your pipeline).
         Returns:
-            np.ndarray[int32] if X is numpy, else torch.Tensor[int32] (length N).
+            np.ndarray[int32] if X is numpy/cuDF, else torch.Tensor[int32] (length N).
         """
         # --- device & inputs ---
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
-        if isinstance(X, np.ndarray):
-            assert X.dtype == np.int8, "X must be int8"
-            X_t = torch.from_numpy(X).to(device=device, dtype=torch.int8)
-            return_numpy = True
-        else:
-            # torch path
-            assert torch.is_tensor(X) and X.dtype == torch.int8, "X must be torch.int8"
+
+        # Check if it's a torch tensor
+        if torch.is_tensor(X):
+            assert X.dtype == torch.int8, "X must be torch.int8"
             X_t = X.to(device=device, dtype=torch.int8, copy=False)
             return_numpy = False
+        else:
+            # NumPy or cuDF array
+            X_dtype = X.dtype if hasattr(X, 'dtype') else np.int8
+            assert str(X_dtype) == 'int8', f"X must be int8, got {X_dtype}"
+            X_t = _to_torch_tensor(X, device=device, dtype=torch.int8)
+            return_numpy = True
 
         N = X_t.shape[0]
         # guardrails
