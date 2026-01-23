@@ -127,8 +127,9 @@ torch::Tensor encode_cuts_binding(torch::Tensor X) {
     check_two_dim(X, "X");
     check_cuda_tensor(X, torch::kInt8, "X");
 
-    auto X_contig = X.contiguous();
-    return encode_cuts(X_contig);
+    //  auto X_contig = X.contiguous();
+    // The C++ kernel now handles strides, so we don't need to force contiguity.
+    return encode_cuts(X);
 }
 
 torch::Tensor et_sample_1b_binding(torch::Tensor X,
