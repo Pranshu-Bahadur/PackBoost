@@ -3,20 +3,64 @@ import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin
 from torch import Tensor
 import torch.nn.functional as Fn
-
 import os
 
 print('Installing kernels...')
 from packboost.cuda import kernels
 print('kernels successfully Installed!')
+from packboost.callback import EarlyStoppingCallback
 
 
 class PackBoost(BaseEstimator, RegressorMixin):
     def __init__(self, device='cuda',comment=""):
         self.device = device
         self.nfeatsets = 32
+        self.stop_training = False
         self.feature_name = None
         self.comment = comment
+
+    @classmethod
+    def from_params(cls, V, I, device='cuda'):
+        """
+        Create a PackBoost instance from pre-trained parameters.
+        
+        Parameters
+        ----------
+        V : torch.Tensor or np.ndarray
+            The tree node values with shape (rounds, nfolds, 2*nodes)
+        I : torch.Tensor or np.ndarray
+            The tree node split indices with shape (rounds, nfolds, nodes)
+        device : str, optional
+            The device to use ('cuda' or 'cpu'), default is 'cuda'
+        
+        Returns
+        -------
+        PackBoost
+            A PackBoost instance initialized with the given parameters
+        """
+        instance = cls(device=device)
+        
+        # Convert to torch tensors if needed
+        if isinstance(V, np.ndarray):
+            V = torch.from_numpy(V)
+        if isinstance(I, np.ndarray):
+            I = torch.from_numpy(I)
+        
+        # Move to specified device
+        device_obj = torch.device(device if (device != "cuda" or torch.cuda.is_available()) else "cpu")
+        instance.V = V.to(device=device_obj, dtype=torch.int32)
+        instance.I = I.to(device=device_obj, dtype=torch.uint16)
+        
+        # Infer metadata from parameter shapes
+        if V.ndim == 3 and I.ndim == 3:
+            rounds, nfolds, double_nodes = V.shape
+            _, _, nodes = I.shape
+            instance.nfolds = nfolds
+            instance.tree_set = rounds
+            # Infer max_depth from nodes count: nodes = 2^D - 1
+            instance.max_depth = int(np.log2(nodes + 1))
+        
+        return instance
 
     def fit(self,
             X: np.ndarray, y: np.ndarray,
@@ -129,8 +173,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
         FST = FST.contiguous()
 
         # ---------- outputs ----------
-        V = torch.zeros((rounds, nfolds, 2 * nodes), dtype=torch.int32,  device=device)
-        I = torch.zeros((rounds, nfolds,     nodes), dtype=torch.uint16, device=device)
+        self.V = torch.zeros((rounds, nfolds, 2 * nodes), dtype=torch.int32,  device=device)
+        self.I = torch.zeros((rounds, nfolds,     nodes), dtype=torch.uint16, device=device)
 
         # ---------- optional validation ----------
         use_val = (Xv is not None) and (Yv is not None)
@@ -160,6 +204,12 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.tree_set = 0
 
         for t in range(rounds):
+            
+            # early stopping check
+            if self.stop_training:
+                self.stop_training = False
+                break
+
             # (a) feature sampling -> XS [nfeatsets, 32*M] uint32
             if XB.is_cuda and torch.cuda.is_available():
                 XS = self.et_sample_1b(XB, self.Fsch, t).contiguous()
@@ -188,7 +238,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 He     = self.h_des(XS, G, LF, int(max_depth), era_ends)         # [K1, E, nodes, 2, 32]
 
                 self.cut_des(
-                    self.Fsch, FST, He, H0e, V, I,
+                    self.Fsch, FST, He, H0e, self.V, self.I,
                     tree_set=t, L2=L2, lr=lr_per_fold,
                     qgrad_bits=qgrad_bits, max_depth=D,
                     min_child_weight=min_child_weight,
@@ -202,7 +252,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 H0 = self.h0(G, LE, D).contiguous()                              # [K0, 2**D, 2]
                 self.cut(
                     self.Fsch, FST, H, H0[:, : H.size(1), :].contiguous(),       # -> [K0, nodes, 2]
-                    V, I,
+                    self.V, self.I,
                     tree_set=t, L2=L2, lr=lr_per_fold,
                     qgrad_bits=qgrad_bits, max_depth=D,
                     min_child_weight=min_child_weight,
@@ -211,13 +261,15 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 del H, H0
 
             # (f) advance + predict
-            self.advance_and_predict(P, XB, L_old, L_new, V, I, tree_set=t)
+            self.advance_and_predict(P, XB, L_old, L_new, self.V, self.I, tree_set=t)
             L_old, L_new = L_new, L_old
 
             # (g) validation (optional)
             if use_val:
-                self.advance_and_predict(Pv, XBv, Lv, Lvn, V, I, tree_set=t)
+                self.advance_and_predict(Pv, XBv, Lv, Lvn, self.V, self.I, tree_set=t)
                 Lv, Lvn = Lvn, Lv
+
+            self.tree_set = t + 1
 
             # (h) callbacks
             for cb in callbacks:
@@ -226,17 +278,20 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 except Exception:
                     pass
 
-            self.tree_set = t + 1
-
             # free big temporaries ASAP
             del XS, LE, G, LF
             if device.type == "cuda" and (t % 256 == 255):
                 torch.cuda.empty_cache()
 
+        
+        # ---------- restore best model if early stopping was used ----------
+        for cb in callbacks:
+            if isinstance(cb, EarlyStoppingCallback) and cb.keep_best:
+                cb.restore_best(self)
+                break
+
         # ---------- stash for inference ----------
         self.FST  = FST
-        self.V    = V
-        self.I    = I
         self.X_packed_ = XB
         return self
 
