@@ -96,13 +96,13 @@ torch::Tensor encode_cuts_cpu(const torch::Tensor& X) {
     return XB;
 }
 
-// Main host API with memory check and fallback
+// Main host API with memory check, CPU fallback, and smart GPU placement
 torch::Tensor encode_cuts(torch::Tensor X /* [N,F] int8 */) {
-    // Check if input is on CUDA
     const bool input_on_cuda = X.is_cuda();
+    torch::Device target_device = X.device();  // Remember target device
     
     if (!input_on_cuda) {
-        // Input is on CPU, use CPU path
+        // Input is on CPU, use CPU path and return on CPU
         return encode_cuts_cpu(X);
     }
 
@@ -111,7 +111,7 @@ torch::Tensor encode_cuts(torch::Tensor X /* [N,F] int8 */) {
     const int64_t F = X.size(1);
     const int64_t M = (N + 31) >> 5;
     
-    // Calculate required memory:
+    // Calculate required memory for GPU path:
     // 1. Make X contiguous (if needed): N * F * sizeof(int8_t)
     // 2. Transpose to dX [F, N]: F * N * sizeof(int8_t)
     // 3. Output dXB [4*F, M]: 4 * F * M * sizeof(uint32_t)
@@ -121,7 +121,7 @@ torch::Tensor encode_cuts(torch::Tensor X /* [N,F] int8 */) {
     
     size_t total_required = dX_bytes + dXB_bytes;
     if (!X.is_contiguous()) {
-        total_required += X_bytes;  // Need space for contiguous copy
+        total_required += X_bytes;
     }
     
     // Add 20% safety margin for CUDA allocator overhead
@@ -133,18 +133,37 @@ torch::Tensor encode_cuts(torch::Tensor X /* [N,F] int8 */) {
     cudaError_t err = cudaMemGetInfo(&free_bytes, &total_bytes);
     
     if (err != cudaSuccess || free_bytes < required_with_margin) {
-        // Not enough GPU memory - fall back to CPU
+        // Not enough GPU memory for full GPU path - compute on CPU
         TORCH_WARN("Insufficient GPU memory for encode_cuts (need ~",
                    required_with_margin / (1024*1024), " MB, have ",
-                   free_bytes / (1024*1024), " MB). Falling back to CPU.");
+                   free_bytes / (1024*1024), " MB). Computing on CPU...");
         
-        // Move to CPU, process, and return result on CPU
+        // Move to CPU and compute
         auto X_cpu = X.cpu();
-        return encode_cuts_cpu(X_cpu);
+        auto XB_cpu = encode_cuts_cpu(X_cpu);
+        
+        // Now check if we can fit the RESULT on GPU (much smaller than input)
+        const size_t result_bytes = dXB_bytes;
+        const size_t result_with_margin = (size_t)(result_bytes * 1.1);
+        
+        // Re-query memory (may have changed)
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        
+        if (free_bytes >= result_with_margin) {
+            // Enough memory for result - upload to GPU
+            TORCH_WARN("Uploading CPU result to GPU (~", 
+                       result_bytes / (1024*1024), " MB)");
+            return XB_cpu.to(target_device);
+        } else {
+            // Not even enough for result - return on CPU
+            TORCH_WARN("Keeping result on CPU (insufficient GPU memory: need ~",
+                       result_with_margin / (1024*1024), " MB, have ",
+                       free_bytes / (1024*1024), " MB)");
+            return XB_cpu;
+        }
     }
     
-    // Sufficient GPU memory - proceed with CUDA path
-    // NOW it's safe to call .contiguous() since we verified memory availability
+    // Sufficient GPU memory - proceed with normal CUDA path
     auto X_contig = X.contiguous();
     auto dX = X_contig.transpose(0, 1).contiguous();
     
