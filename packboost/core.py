@@ -352,7 +352,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
     def encode_cuts(self, X: torch.Tensor) -> torch.Tensor:
         # X: [N, F], int8 expected
         if X.device.type != 'cpu' and torch.cuda.is_available():
-            return kernels.encode_cuts(X.contiguous())
+            return kernels.encode_cuts(X)
 
         N, F = X.shape
         M = (N + 31) // 32
