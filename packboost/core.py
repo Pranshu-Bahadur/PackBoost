@@ -13,7 +13,7 @@ print('kernels successfully Installed!')
 
 
 class PackBoost(BaseEstimator, RegressorMixin):
-    def __init__(self, device='cuda',comment="",tail_weight_power=0.5):
+    def __init__(self, device='cuda',comment="",tail_weight_power=0.0):
         self.device = device
         self.nfeatsets = 32
         self.feature_name = None
@@ -28,7 +28,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             max_depth: int = 7,
             callbacks: list = None,
             feature_name: list[str] | str = 'auto',
-            tail_weight_power: float = 0.5, 
+            tail_weight_power: float = 0.0, 
             *,
             lr: float = 0.07,
             L2: float = 100_000.0,
@@ -385,29 +385,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
         Fs = Fsch[round].view(nfeatsets, 32).to(dtype=torch.long, device=X.device)
         return X.to(torch.int32)[Fs, :].transpose(1, 2).contiguous().view(nfeatsets, M*32).to(torch.uint32)
 
-    def prep_vars_old(self, L: torch.Tensor, Y: torch.Tensor, P: torch.Tensor,tail_weight_power: float = 0.5):
-        if L.is_cuda and torch.cuda.is_available():
-            return kernels.prep_vars(L.contiguous(), Y.contiguous(), P.contiguous())
-
-        K, Dm, N = L.shape
-        max_depth = Dm + 1
-        LE = torch.zeros((K, N), dtype=torch.int64, device=L.device)
-
-        for d in range(1, max_depth):
-            off = (d*(d-1)) // 2
-            field = (L[:, d-1].to(torch.int64) & ((1 << d) - 1))
-            LE |= (field << off)
-
-        out_dtype = torch.uint64 if Dm>8 else (torch.uint32 if Dm>6 else torch.uint16)
-        LE = LE.to(out_dtype)
-
-        g = (Y.to(torch.int32) - P.to(torch.int32)) >> 20
-        G = g.clamp_(-32767, 32767).to(torch.int16)
-
-        return LE.contiguous(), G.contiguous()
-
+    
     def prep_vars(self, L: torch.Tensor, Y: torch.Tensor, P: torch.Tensor, 
-              tail_weight_power: float = 0.5):
+              tail_weight_power: float = 0.0):
         """
         Prepare leaf encodings and gradients with optional tail weighting.
         
