@@ -108,14 +108,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
         XB  = self.encode_cuts(X_t).contiguous()              # [4F, M] uint32
         bF, M = XB.shape
         Np = 32 * M
-        # Handle case where XB might be on CPU
-        if XB.device != device:
-            import warnings
-            warnings.warn(f"XB is on {XB.device}, operations will be slower. "
-                  f"Consider reducing dataset size or using CPU device.")
-            # Keep on CPU and switch all operations to CPU for this run
-            device = XB.device
-            
         del X_t
         if device.type == "cuda":
             torch.cuda.empty_cache()
