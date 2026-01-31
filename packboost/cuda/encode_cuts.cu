@@ -56,36 +56,37 @@ __global__ void _encode_cuts(
 }
 
 torch::Tensor encode_cuts_cpu(const torch::Tensor& X) {
+    // X: [N, F] int8
     const int64_t N = X.size(0);
     const int64_t F = X.size(1);
     const int64_t M = (N + 31) / 32;
+    const int64_t Np = M * 32;
 
-    auto XB = torch::zeros({4 * F, M}, 
-                           torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
-    
-    auto X_acc = X.accessor<int8_t, 2>();
-    auto XB_acc = XB.accessor<uint32_t, 2>();
-
-    for (int64_t f = 0; f < F; ++f) {
-        for (int64_t w = 0; w < M; ++w) {
-            uint32_t bits[4] = {0, 0, 0, 0};
-            
-            for (int64_t k = 0; k < 32; ++k) {
-                int64_t sample_idx = w * 32 + k;
-                if (sample_idx < N) {
-                    uint8_t val = (uint8_t)X_acc[sample_idx][f];
-                    bits[0] |= ((val > 0) ? 1u : 0u) << k;
-                    bits[1] |= ((val > 1) ? 1u : 0u) << k;
-                    bits[2] |= ((val > 2) ? 1u : 0u) << k;
-                    bits[3] |= ((val > 3) ? 1u : 0u) << k;
-                }
-            }
-            
-            for (int t = 0; t < 4; ++t) {
-                XB_acc[4*f + t][w] = bits[t];
-            }
-        }
+    // Pad to multiple of 32
+    auto X_padded = X;
+    if (Np != N) {
+        auto pad = torch::zeros({Np - N, F}, torch::TensorOptions().dtype(torch::kInt8));
+        X_padded = torch::cat({X, pad}, 0);  // [Np, F]
     }
+
+    // Transpose and reshape for broadcasting
+    auto X_t = X_padded.t().contiguous();  // [F, Np]
+    X_t = X_t.view({F, M, 32});  // [F, M, 32]
+
+    // Thresholds: [4]
+    auto thresholds = torch::tensor({0, 1, 2, 3}, torch::kInt8);
+    
+    // Compare: [F, M, 32, 4]
+    auto bits = X_t.unsqueeze(3) > thresholds.view({1, 1, 1, 4});
+    
+    // Pack bits: multiply by powers of 2 and sum
+    auto powers = torch::pow(2, torch::arange(32, torch::kInt64)).to(torch::kUInt32);
+    powers = powers.view({1, 1, 32, 1});
+    
+    auto words = (bits.to(torch::kUInt32) * powers).sum(2);  // [F, M, 4]
+    
+    // Reshape to [4*F, M]
+    auto XB = words.permute({0, 2, 1}).contiguous().view({4 * F, M});
     
     return XB;
 }
