@@ -3,12 +3,13 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
-// GPU kernel with stride support for non-contiguous input
+using at::Tensor;
+
+// GPU kernel (original, assumes contiguous [F, N] layout after transpose)
 __global__ void _encode_cuts(
-    const int8_t* __restrict__ X,  // Input pointer
+    const int8_t* __restrict__ X,  // [F, N]
     uint32_t* __restrict__ XB,     // [4*F, M]
-    int F, int N, int stride,      
-    int64_t stride_n, int64_t stride_f)  // Strides for non-contiguous X
+    int F, int N, int stride)
 {
     const int f  = blockIdx.x;
     const int bi = blockIdx.y;
@@ -25,11 +26,10 @@ __global__ void _encode_cuts(
         uint32_t v0 = 0u, v1 = 0u, v2 = 0u, v3 = 0u;
 
         for (int k = 0; k < 32; ++k) {
-            const int col = 32*k + i_in;  // sample index (N dimension)
+            const int col = 32*k + i_in;
             uint32_t v = 0u;
             if (col < N) {
-                // Use strides for non-contiguous access: X[col, f]
-                const int64_t idx = (int64_t)col * stride_n + (int64_t)f * stride_f;
+                const size_t idx = (size_t)f * (size_t)N + (size_t)col;
                 v = (uint32_t)(uint8_t)X[idx];
             }
             sm[wi][(k + wi) & 31] = v;
@@ -62,15 +62,19 @@ torch::Tensor encode_cuts_cpu(const torch::Tensor& X) {
     const int64_t F = X.size(1);
     const int64_t M = (N + 31) / 32;
 
-    auto XB = torch::zeros({4 * F, M}, torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
+    auto XB = torch::zeros({4 * F, M}, 
+                           torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
     
     auto X_acc = X.accessor<int8_t, 2>();
     auto XB_acc = XB.accessor<uint32_t, 2>();
 
+    // Process each feature
     for (int64_t f = 0; f < F; ++f) {
+        // Process each 32-sample word
         for (int64_t w = 0; w < M; ++w) {
             uint32_t bits[4] = {0, 0, 0, 0};
             
+            // Pack 32 samples into 4 bit-planes
             for (int64_t k = 0; k < 32; ++k) {
                 int64_t sample_idx = w * 32 + k;
                 if (sample_idx < N) {
@@ -82,6 +86,7 @@ torch::Tensor encode_cuts_cpu(const torch::Tensor& X) {
                 }
             }
             
+            // Write out the 4 bit-planes
             for (int t = 0; t < 4; ++t) {
                 XB_acc[4*f + t][w] = bits[t];
             }
@@ -91,28 +96,36 @@ torch::Tensor encode_cuts_cpu(const torch::Tensor& X) {
     return XB;
 }
 
-// Main host API with memory check
+// Main host API with memory check and fallback
 torch::Tensor encode_cuts(torch::Tensor X /* [N,F] int8 */) {
+    // Check if input is on CUDA
     const bool input_on_cuda = X.is_cuda();
     
     if (!input_on_cuda) {
+        // Input is on CPU, use CPU path
         return encode_cuts_cpu(X);
     }
 
-    // Get dimensions and strides
+    // Input is on CUDA - check available memory before allocating
     const int64_t N = X.size(0);
     const int64_t F = X.size(1);
     const int64_t M = (N + 31) >> 5;
-    const int64_t stride_n = X.stride(0);  // Stride for N dimension
-    const int64_t stride_f = X.stride(1);  // Stride for F dimension
     
-    // Calculate required memory
-    // For non-contiguous input, we DON'T need to make it contiguous
-    // We just read with strides, so we only need output memory
+    // Calculate required memory:
+    // 1. Make X contiguous (if needed): N * F * sizeof(int8_t)
+    // 2. Transpose to dX [F, N]: F * N * sizeof(int8_t)
+    // 3. Output dXB [4*F, M]: 4 * F * M * sizeof(uint32_t)
+    const size_t X_bytes = (size_t)N * (size_t)F * sizeof(int8_t);
+    const size_t dX_bytes = (size_t)F * (size_t)N * sizeof(int8_t);
     const size_t dXB_bytes = (size_t)4 * (size_t)F * (size_t)M * sizeof(uint32_t);
     
-    // Add 20% safety margin
-    const size_t required_with_margin = (size_t)(dXB_bytes * 1.2);
+    size_t total_required = dX_bytes + dXB_bytes;
+    if (!X.is_contiguous()) {
+        total_required += X_bytes;  // Need space for contiguous copy
+    }
+    
+    // Add 20% safety margin for CUDA allocator overhead
+    const size_t required_with_margin = (size_t)(total_required * 1.2);
     
     // Query available GPU memory
     size_t free_bytes = 0;
@@ -120,32 +133,40 @@ torch::Tensor encode_cuts(torch::Tensor X /* [N,F] int8 */) {
     cudaError_t err = cudaMemGetInfo(&free_bytes, &total_bytes);
     
     if (err != cudaSuccess || free_bytes < required_with_margin) {
+        // Not enough GPU memory - fall back to CPU
         TORCH_WARN("Insufficient GPU memory for encode_cuts (need ~",
                    required_with_margin / (1024*1024), " MB, have ",
                    free_bytes / (1024*1024), " MB). Falling back to CPU.");
         
+        // Move to CPU, process, and return result on CPU
         auto X_cpu = X.cpu();
         return encode_cuts_cpu(X_cpu);
     }
     
-    // Allocate output on GPU
+    // Sufficient GPU memory - proceed with CUDA path
+    // NOW it's safe to call .contiguous() since we verified memory availability
+    auto X_contig = X.contiguous();
+    auto dX = X_contig.transpose(0, 1).contiguous();
+    
+    const int F_i = (int)F;
+    const int N_i = (int)N;
+    const int M_i = (int)M;
+
     auto dXB = torch::empty({(int64_t)4 * F, M},
-                             X.options().dtype(torch::kUInt32));
+                             dX.options().dtype(torch::kUInt32));
 
     const int strides = 64;
-    int stride = ((int)N + (32*32*strides) - 1) / (32*32*strides);
+    int stride = (N_i + (32*32*strides) - 1) / (32*32*strides);
     if (stride < 1) stride = 1;
 
-    dim3 grid((int)F, strides, 1);
+    dim3 grid(F_i, strides, 1);
     dim3 block(32, 1, 1);
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    // Launch kernel with stride parameters (no need to make X contiguous!)
     _encode_cuts<<<grid, block, 0, stream.stream()>>>(
-        X.data_ptr<int8_t>(), 
+        dX.data_ptr<int8_t>(), 
         dXB.data_ptr<uint32_t>(), 
-        (int)F, (int)N, stride,
-        stride_n, stride_f);
+        F_i, N_i, stride);
 
     return dXB;
 }
