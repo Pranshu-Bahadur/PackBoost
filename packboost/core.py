@@ -13,11 +13,12 @@ print('kernels successfully Installed!')
 
 
 class PackBoost(BaseEstimator, RegressorMixin):
-    def __init__(self, device='cuda',comment=""):
+    def __init__(self, device='cuda',comment="",tail_weight_power=0.5):
         self.device = device
         self.nfeatsets = 32
         self.feature_name = None
         self.comment = comment
+        self.tail_weight_power = tail_weight_power  
 
     def fit(self,
             X: np.ndarray, y: np.ndarray,
@@ -27,6 +28,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             max_depth: int = 7,
             callbacks: list = None,
             feature_name: list[str] | str = 'auto',
+            tail_weight_power: float = 0.5, 
             *,
             lr: float = 0.07,
             L2: float = 100_000.0,
@@ -201,7 +203,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 XS = self.et_sample_1b(XB, Fsch_cpu, t).to(device)
 
             # (b) pack leaves & gradients (length N)
-            LE, G = self.prep_vars(L_old, Y_i32, P)  # LE: u16/u32/u64 ; G: int16
+            # Training path
+            LE, G = self.prep_vars(L_old, Y_i32, P, tail_weight_power=tail_weight_power)
+          #  LE, G = self.prep_vars(L_old, Y_i32, P)  # LE: u16/u32/u64 ; G: int16
 
             # (c) repack by feature schedule -> LF [nfeatsets, N]
             LF = self.repack(FST, LE, t).contiguous()
@@ -381,7 +385,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         Fs = Fsch[round].view(nfeatsets, 32).to(dtype=torch.long, device=X.device)
         return X.to(torch.int32)[Fs, :].transpose(1, 2).contiguous().view(nfeatsets, M*32).to(torch.uint32)
 
-    def prep_vars(self, L: torch.Tensor, Y: torch.Tensor, P: torch.Tensor):
+    def prep_vars_old(self, L: torch.Tensor, Y: torch.Tensor, P: torch.Tensor,tail_weight_power: float = 0.5):
         if L.is_cuda and torch.cuda.is_available():
             return kernels.prep_vars(L.contiguous(), Y.contiguous(), P.contiguous())
 
@@ -402,6 +406,91 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         return LE.contiguous(), G.contiguous()
 
+    def prep_vars(self, L: torch.Tensor, Y: torch.Tensor, P: torch.Tensor, 
+              tail_weight_power: float = 0.5):
+        """
+        Prepare leaf encodings and gradients with optional tail weighting.
+        
+        Args:
+            L: [K, Dm, N] leaf history tensor
+            Y: [N] target values (int32, quantized to 30-bit fixed-point)
+            P: [N] current predictions (int32, quantized to 30-bit fixed-point)
+            tail_weight_power: float, power for tail emphasis (0.0 = no weighting)
+        
+        Returns:
+            LE: [K, N] packed leaf encodings (uint16/uint32/uint64)
+            G: [N] weighted gradients (int16)
+        """
+        if L.is_cuda and torch.cuda.is_available():
+            # Use existing CUDA kernel that does both packing and gradient computation
+            # But we need to add tail weighting, so we'll do it in two steps
+            LE_base, G_base = kernels.prep_vars(L.contiguous(), Y.contiguous(), P.contiguous())
+            
+            if tail_weight_power > 0.0:
+                # Recompute gradients with tail weighting
+                residual = (Y.to(torch.int32) - P.to(torch.int32))
+                
+                # Convert to float for weight calculation
+                Y_float = Y.float() / (1 << 30)
+                Y_median = Y_float.median()
+                
+                # Weight = |y - median|^tail_weight_power
+                tail_weights = torch.abs(Y_float - Y_median).pow(tail_weight_power)
+                
+                # Normalize to preserve gradient scale
+                tail_weights = tail_weights / (tail_weights.mean() + 1e-8)
+                
+                # Apply weights
+                weighted_residual = (residual.float() * tail_weights).to(torch.int32)
+                
+                # Shift and clamp
+                g = weighted_residual >> 20
+                G = g.clamp_(-32767, 32767).to(torch.int16)
+                
+                return LE_base.contiguous(), G.contiguous()
+            else:
+                # Use original CUDA kernel output
+                return LE_base, G_base
+    
+        # CPU path
+        K, Dm, N = L.shape
+        max_depth = Dm + 1
+        LE = torch.zeros((K, N), dtype=torch.int64, device=L.device)
+    
+        # Pack leaf paths using Murky parity encoding
+        for d in range(1, max_depth):
+            off = (d * (d - 1)) // 2
+            field = (L[:, d - 1].to(torch.int64) & ((1 << d) - 1))
+            LE |= (field << off)
+
+        # Cast to appropriate output dtype
+        out_dtype = torch.uint64 if Dm > 8 else (torch.uint32 if Dm > 6 else torch.uint16)
+        LE = LE.to(out_dtype)
+    
+        # Compute tail-weighted gradients
+        residual = (Y.to(torch.int32) - P.to(torch.int32))
+        
+        if tail_weight_power > 0.0:
+            # Convert to float for weight calculation
+            Y_float = Y.float() / (1 << 30)
+            Y_median = Y_float.median()
+            
+            # Weight = |y - median|^tail_weight_power
+            tail_weights = torch.abs(Y_float - Y_median).pow(tail_weight_power)
+            
+            # Normalize to preserve gradient scale
+            tail_weights = tail_weights / (tail_weights.mean() + 1e-8)
+            
+            # Apply weights
+            weighted_residual = (residual.float() * tail_weights).to(torch.int32)
+        else:
+            weighted_residual = residual
+        
+        # Shift and clamp
+        g = weighted_residual >> 20
+        G = g.clamp_(-32767, 32767).to(torch.int16)
+    
+        return LE.contiguous(), G.contiguous()
 
     def h0(self, G: torch.Tensor, LE: torch.Tensor, max_depth: int) -> torch.Tensor:
         nfolds, N = LE.shape
