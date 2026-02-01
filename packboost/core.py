@@ -348,114 +348,32 @@ class PackBoost(BaseEstimator, RegressorMixin):
         return out
 
     
+    
     def encode_cuts(self, X: torch.Tensor) -> torch.Tensor:
-        """
-        Encode cuts with automatic fallback to NumPy.
-        X: [N, F], int8 expected
-        Returns: [4F, M] uint32
-        """
+        # X: [N, F], int8 expected
         if X.device.type != 'cpu' and torch.cuda.is_available():
-            try:
-                return kernels.encode_cuts(X.contiguous())
-            except RuntimeError as e:
-                error_msg = str(e)
-                if 'ENCODE_CUTS_FALLBACK_TO_NUMPY' in error_msg:
-                    import warnings
-                    warnings.warn("GPU OOM in encode_cuts, computing on CPU with NumPy...")
-                    
-                    # Use NumPy implementation
-                    X_cpu = X.cpu()
-                    XB_np = self._encode_cuts_numpy(X_cpu)
-                    
-                    # Try to upload result to GPU
-                    result_bytes = XB_np.element_size() * XB_np.numel()
-                    
-                    if torch.cuda.is_available():
-                        free_mem, total_mem = torch.cuda.mem_get_info()
-                        
-                        if free_mem > result_bytes * 1.1:
-                            warnings.warn(f"Uploading result to GPU (~{result_bytes/(1024**2):.1f} MB)")
-                            return XB_np.to(X.device)
-                        else:
-                            raise RuntimeError(
-                                f"Cannot fit encode_cuts result on GPU.\n"
-                                f"  Required: {result_bytes/(1024**2):.1f} MB\n"
-                                f"  Available: {free_mem/(1024**2):.1f} MB\n"
-                                f"  Total GPU: {total_mem/(1024**2):.1f} MB\n\n"
-                                f"Solutions:\n"
-                                f"  1. Reduce dataset size (N={X.shape[0]:,}, F={X.shape[1]:,})\n"
-                                f"  2. Use a GPU with more memory\n"
-                                f"  3. Split into multiple training runs\n"
-                                f"  4. Set device='cpu' for full CPU training (very slow)"
-                            )
-                            
-                elif 'ENCODE_CUTS_USE_NUMPY_CPU' in error_msg:
-                    # Input was already on CPU
-                    return self._encode_cuts_numpy(X)
-                else:
-                    raise
-        
-        # CPU path when device='cpu'
-        return self._encode_cuts_numpy(X)
-    
-    
-    def _encode_cuts_numpy(self, X: torch.Tensor) -> torch.Tensor:
-        """
-        Pure NumPy implementation using minimal memory.
-        Processes one feature at a time with explicit loops.
-        Peak memory: only output tensor (4*F*M*4 bytes)
-        """
-        import numpy as np
-        
+            return kernels.encode_cuts(X.contiguous())
+
         N, F = X.shape
         M = (N + 31) // 32
         Np = M * 32
-        
-        # Convert to NumPy
-        X_np = X.cpu().numpy() if X.is_cuda else X.numpy()
-        
-        # Pad if needed (in-place to save memory)
+
         if Np != N:
-            X_np = np.pad(X_np, ((0, Np - N), (0, 0)), mode='constant', constant_values=0)
-        
-        # Allocate output
-        XB_np = np.zeros((4 * F, M), dtype=np.uint32)
-        
-        # Process each feature independently
-        import warnings
-        if F > 500:
-            warnings.warn(f"Processing {F} features on CPU, this will take a few minutes...")
-        
-        for f in range(F):
-            # Extract feature column: [Np]
-            feat = X_np[:, f]  # View, no copy
-            
-            # Process each 32-sample word
-            for w in range(M):
-                base_idx = w * 32
-                
-                bits = [0, 0, 0, 0]
-                
-                # Pack 32 samples into 4 bit-planes
-                for k in range(32):
-                    sample_idx = base_idx + k
-                    if sample_idx < Np:
-                        val = feat[sample_idx]
-                        bits[0] |= (1 if val > 0 else 0) << k
-                        bits[1] |= (1 if val > 1 else 0) << k
-                        bits[2] |= (1 if val > 2 else 0) << k
-                        bits[3] |= (1 if val > 3 else 0) << k
-                
-                # Write to output
-                for t in range(4):
-                    XB_np[4*f + t, w] = bits[t]
-            
-            # Progress indicator every 500 features
-            if (f + 1) % 500 == 0:
-                print(f"  Processed {f+1}/{F} features on CPU...")
-        
-        # Convert back to PyTorch tensor
-        return torch.from_numpy(XB_np)
+            pad = torch.zeros((Np - N, F), dtype=torch.int8, device=X.device)
+            X = torch.cat([X, pad], dim=0)
+
+        # Pack 32-sample bitplanes per (feature, 4 thresholds)
+        X = X.t().contiguous()  # [F, Np]
+        thresholds = torch.arange(4, dtype=torch.int8, device=X.device).view(1, 1, 1, 4)  # [1,1,1,4]
+        bitplanes = (X.view(F, M, 32, 1) > thresholds).to(torch.uint32)                  # [F, M, 32, 4]
+
+        # weights: 2^0..2^31 as uint32
+        weights = (1 << torch.arange(32, dtype=torch.int64, device=X.device)).to(torch.uint32)  # [32]
+        weights = weights.view(1, 1, 32, 1)
+
+        words = (bitplanes * weights).sum(dim=2, dtype=torch.int64).to(torch.uint32)    # [F, M, 4]
+        XB = words.permute(0, 2, 1).contiguous().reshape(4 * F, M)                       # [4F, M]
+        return XB
 
 
     def et_sample_1b(self, X : Tensor, Fsch : Tensor, round : int) -> Tensor:
