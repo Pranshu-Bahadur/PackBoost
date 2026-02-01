@@ -57,13 +57,15 @@ __global__ void _encode_cuts(
 
 torch::Tensor encode_cuts(torch::Tensor X) {
     if (!X.is_cuda()) {
-        throw std::runtime_error("ENCODE_CUTS_USE_PYTHON_CPU");
+        // Signal Python to use NumPy implementation
+        throw std::runtime_error("ENCODE_CUTS_USE_NUMPY_CPU");
     }
 
     const int64_t N = X.size(0);
     const int64_t F = X.size(1);
     const int64_t M = (N + 31) >> 5;
     
+    // Calculate memory requirements
     const size_t dX_bytes = (size_t)F * (size_t)N * sizeof(int8_t);
     const size_t dXB_bytes = (size_t)4 * (size_t)F * (size_t)M * sizeof(uint32_t);
     size_t total_required = dX_bytes + dXB_bytes;
@@ -71,13 +73,20 @@ torch::Tensor encode_cuts(torch::Tensor X) {
         total_required += (size_t)N * (size_t)F * sizeof(int8_t);
     }
     
+    // Check available GPU memory
     size_t free_bytes = 0;
-    cudaError_t err = cudaMemGetInfo(&free_bytes, nullptr);
+    size_t total_bytes = 0;
+    cudaError_t err = cudaMemGetInfo(&free_bytes, &total_bytes);
     
     if (err != cudaSuccess || free_bytes < (size_t)(total_required * 1.2)) {
-        throw std::runtime_error("ENCODE_CUTS_FALLBACK_TO_CPU");
+        // Not enough GPU memory - signal to use NumPy fallback
+        TORCH_WARN("Insufficient GPU memory for encode_cuts (need ~",
+                   (total_required * 1.2) / (1024*1024), " MB, have ",
+                   free_bytes / (1024*1024), " MB)");
+        throw std::runtime_error("ENCODE_CUTS_FALLBACK_TO_NUMPY");
     }
     
+    // Proceed with GPU path
     auto X_contig = X.contiguous();
     auto dX = X_contig.transpose(0, 1).contiguous();
     auto dXB = torch::empty({(int64_t)4 * F, M}, dX.options().dtype(torch::kUInt32));
@@ -88,9 +97,11 @@ torch::Tensor encode_cuts(torch::Tensor X) {
 
     dim3 grid((int)F, strides, 1);
     dim3 block(32, 1, 1);
+    auto stream = at::cuda::getCurrentCUDAStream();
 
-    _encode_cuts<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        dX.data_ptr<int8_t>(), dXB.data_ptr<uint32_t>(), 
+    _encode_cuts<<<grid, block, 0, stream.stream()>>>(
+        dX.data_ptr<int8_t>(), 
+        dXB.data_ptr<uint32_t>(), 
         (int)F, (int)N, stride);
 
     return dXB;
