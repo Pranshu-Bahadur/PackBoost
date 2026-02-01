@@ -399,9 +399,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
         
         # CPU path when device='cpu'
         return self._encode_cuts_cpu(X)
-
+        
     def _encode_cuts_cpu(self, X: torch.Tensor) -> torch.Tensor:
-        """Existing CPU implementation from core.py"""
+        """Memory-efficient CPU implementation with adaptive chunking"""
         N, F = X.shape
         M = (N + 31) // 32
         Np = M * 32
@@ -411,14 +411,33 @@ class PackBoost(BaseEstimator, RegressorMixin):
             X = torch.cat([X, pad], dim=0)
     
         X = X.t().contiguous()  # [F, Np]
+        XB = torch.zeros((4 * F, M), dtype=torch.uint32, device=X.device)
+        
+        # Calculate chunk size based on available memory
+        # Target: use at most 10 GB for intermediate tensor
+        target_bytes = 10 * 1024**3  # 10 GB
+        bytes_per_feature = 592 * M  # From formula above
+        chunk_size = max(1, int(target_bytes / bytes_per_feature))
+        chunk_size = min(chunk_size, F)  # Don't exceed F
+        
+        import warnings
+        if chunk_size < F:
+            warnings.warn(f"Processing features in chunks of {chunk_size} to limit memory usage")
+        
         thresholds = torch.arange(4, dtype=torch.int8, device=X.device).view(1, 1, 1, 4)
-        bitplanes = (X.view(F, M, 32, 1) > thresholds).to(torch.uint32)
-    
         weights = (1 << torch.arange(32, dtype=torch.int64, device=X.device)).to(torch.uint32)
         weights = weights.view(1, 1, 32, 1)
-    
-        words = (bitplanes * weights).sum(dim=2, dtype=torch.int64).to(torch.uint32)
-        XB = words.permute(0, 2, 1).contiguous().reshape(4 * F, M)
+        
+        for f_start in range(0, F, chunk_size):
+            f_end = min(f_start + chunk_size, F)
+            f_count = f_end - f_start
+            
+            X_chunk = X[f_start:f_end]
+            bitplanes = (X_chunk.view(f_count, M, 32, 1) > thresholds).to(torch.uint32)
+            words = (bitplanes * weights).sum(dim=2, dtype=torch.int64).to(torch.uint32)
+            words_reshaped = words.permute(0, 2, 1).contiguous().reshape(4 * f_count, M)
+            XB[4*f_start:4*f_end] = words_reshaped
+        
         return XB
 
 
