@@ -347,32 +347,78 @@ class PackBoost(BaseEstimator, RegressorMixin):
             return out.detach().cpu().numpy()
         return out
 
-
-    
     def encode_cuts(self, X: torch.Tensor) -> torch.Tensor:
-        # X: [N, F], int8 expected
+        """
+        Encode cuts with automatic fallback.
+        X: [N, F], int8 expected
+        Returns: [4F, M] uint32 on same device as X (or fails)
+        """
         if X.device.type != 'cpu' and torch.cuda.is_available():
-            return kernels.encode_cuts(X.contiguous())
+            try:
+                return kernels.encode_cuts(X.contiguous())
+            except RuntimeError as e:
+                error_msg = str(e)
+                if 'ENCODE_CUTS_FALLBACK_TO_CPU' in error_msg:
+                    import warnings
+                    warnings.warn("GPU OOM in encode_cuts, computing on CPU...")
+                    
+                    # Use existing CPU implementation
+                    X_cpu = X.cpu()
+                    XB_cpu = self._encode_cuts_cpu(X_cpu)
+                    
+                    # Check if we can upload result to GPU
+                    result_bytes = XB_cpu.element_size() * XB_cpu.numel()
+                    
+                    if torch.cuda.is_available():
+                        free_mem, total_mem = torch.cuda.mem_get_info()
+                        
+                        if free_mem > result_bytes * 1.1:
+                            warnings.warn(f"Uploading result to GPU (~{result_bytes/(1024**2):.1f} MB)")
+                            return XB_cpu.to(X.device)
+                        else:
+                            # FAIL FAST: Cannot proceed with GPU training
+                            raise RuntimeError(
+                                f"Cannot fit encode_cuts result on GPU.\n"
+                                f"  Required: {result_bytes/(1024**2):.1f} MB\n"
+                                f"  Available: {free_mem/(1024**2):.1f} MB\n"
+                                f"  Total GPU: {total_mem/(1024**2):.1f} MB\n\n"
+                                f"Solutions:\n"
+                                f"  1. Reduce dataset size (N={X.shape[0]:,}, F={X.shape[1]:,})\n"
+                                f"  2. Use a GPU with more memory\n"
+                                f"  3. Split into multiple training runs\n"
+                                f"  4. Set device='cpu' for full CPU training (very slow)"
+                            )
+                    else:
+                        raise RuntimeError("CUDA not available for result upload")
+                        
+                elif 'ENCODE_CUTS_USE_PYTHON_CPU' in error_msg:
+                    # Input was already on CPU
+                    return self._encode_cuts_cpu(X)
+                else:
+                    raise
+        
+        # CPU path when device='cpu'
+        return self._encode_cuts_cpu(X)
 
+    def _encode_cuts_cpu(self, X: torch.Tensor) -> torch.Tensor:
+        """Existing CPU implementation from core.py"""
         N, F = X.shape
         M = (N + 31) // 32
         Np = M * 32
-
+    
         if Np != N:
             pad = torch.zeros((Np - N, F), dtype=torch.int8, device=X.device)
             X = torch.cat([X, pad], dim=0)
-
-        # Pack 32-sample bitplanes per (feature, 4 thresholds)
+    
         X = X.t().contiguous()  # [F, Np]
-        thresholds = torch.arange(4, dtype=torch.int8, device=X.device).view(1, 1, 1, 4)  # [1,1,1,4]
-        bitplanes = (X.view(F, M, 32, 1) > thresholds).to(torch.uint32)                  # [F, M, 32, 4]
-
-        # weights: 2^0..2^31 as uint32
-        weights = (1 << torch.arange(32, dtype=torch.int64, device=X.device)).to(torch.uint32)  # [32]
+        thresholds = torch.arange(4, dtype=torch.int8, device=X.device).view(1, 1, 1, 4)
+        bitplanes = (X.view(F, M, 32, 1) > thresholds).to(torch.uint32)
+    
+        weights = (1 << torch.arange(32, dtype=torch.int64, device=X.device)).to(torch.uint32)
         weights = weights.view(1, 1, 32, 1)
-
-        words = (bitplanes * weights).sum(dim=2, dtype=torch.int64).to(torch.uint32)    # [F, M, 4]
-        XB = words.permute(0, 2, 1).contiguous().reshape(4 * F, M)                       # [4F, M]
+    
+        words = (bitplanes * weights).sum(dim=2, dtype=torch.int64).to(torch.uint32)
+        XB = words.permute(0, 2, 1).contiguous().reshape(4 * F, M)
         return XB
 
 
