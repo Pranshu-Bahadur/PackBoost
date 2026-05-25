@@ -1317,6 +1317,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                             
     def save(self, path):
         """Save with PyTorch's native ZIP compression."""
+        path = str(path)
         if not path.endswith('.pth'):
             path = path + '.pth'
         
@@ -1340,11 +1341,12 @@ class PackBoost(BaseEstimator, RegressorMixin):
     
     def load(self, path, device=None):
         """Load PyTorch compressed format."""
+        path = str(path)
         if not path.endswith('.pth') and os.path.exists(path + '.pth'):
             path = path + '.pth'
         
         device = device or self.device
-        state = torch.load(path, map_location=device)
+        state = torch.load(path, map_location=device, weights_only=False)
         
         self.V         = state["V"]
         self.I         = state["I"]
