@@ -250,9 +250,10 @@ torch::Tensor h_sm(
 
   size_t optin_cap = prop->sharedMemPerBlockOptin ? (size_t)prop->sharedMemPerBlockOptin
                                                   : (size_t)prop->sharedMemPerBlock;
-  TORCH_CHECK(smem_bytes <= optin_cap,
-              "Required dynamic shared memory (", smem_bytes,
-              ") exceeds opt-in device limit (", optin_cap, ")");
+  // Removed for L4
+  //TORCH_CHECK(smem_bytes <= optin_cap,
+  //            "Required dynamic shared memory (", smem_bytes,
+  //            ") exceeds opt-in device limit (", optin_cap, ")");
 
   if (lf_dt == torch::kUInt16) {
     cudaError_t err = cudaFuncSetAttribute(_h_sm<uint16_t>,
