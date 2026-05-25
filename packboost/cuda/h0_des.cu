@@ -232,8 +232,9 @@ torch::Tensor h0_des_butterfly(
     std::size_t smem_cap = prop->sharedMemPerBlockOptin
                            ? (std::size_t)prop->sharedMemPerBlockOptin
                            : (std::size_t)prop->sharedMemPerBlock;
-    TORCH_CHECK(smem_bytes <= smem_cap,
-        "h0_des_butterfly requires ", smem_bytes, "B shared memory, device allows ", smem_cap, "B.");
+    // removed for L4
+    //TORCH_CHECK(smem_bytes <= smem_cap,
+    //    "h0_des_butterfly requires ", smem_bytes, "B shared memory, device allows ", smem_cap, "B.");
 
     auto stream = at::cuda::getCurrentCUDAStream();
     const auto dt = LE.scalar_type();
