@@ -697,4 +697,3 @@ torch::Tensor h_sm(
   }
   return H;
 }
- 
